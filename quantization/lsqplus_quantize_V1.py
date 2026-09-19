@@ -1,0 +1,507 @@
+import copy
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Function
+from quantization.lsqquantize_V1 import Round
+from quantization.constants import INIT_STATE_FROZEN, INIT_STATE_UNINIT
+
+class ALSQPlus(Function):
+    @staticmethod
+    def forward(ctx, weight, alpha, g, Qn, Qp, beta):
+        # assert alpha > 0, "alpha={}".format(alpha)
+        ctx.save_for_backward(weight, alpha, beta)
+        ctx.other = g, Qn, Qp
+        w_q = Round.apply(torch.div((weight - beta), alpha).clamp(Qn, Qp))
+        w_q = w_q * alpha + beta
+        return w_q
+
+    @staticmethod
+    def backward(ctx, grad_weight):
+        weight, alpha, beta = ctx.saved_tensors
+        g, Qn, Qp = ctx.other
+        q_w = (weight - beta) / alpha
+        smaller = (q_w < Qn).float() #bool值转浮点值，1.0或者0.0
+        bigger = (q_w > Qp).float() #bool值转浮点值，1.0或者0.0
+        between = 1.0 - smaller -bigger #得到位于量化区间的index
+        grad_alpha = ((smaller * Qn + bigger * Qp + 
+            between * Round.apply(q_w) - between * q_w)*grad_weight * g).sum().unsqueeze(dim=0)
+        grad_beta = ((smaller + bigger) * grad_weight * g).sum().unsqueeze(dim=0)
+        #在量化区间之外的值都是常数，故导数也是0
+        grad_weight = between * grad_weight
+        #返回的梯度要和forward的参数对应起来
+        return grad_weight, grad_alpha,  None, None, None, grad_beta
+
+class WLSQPlus(Function):
+    @staticmethod
+    def forward(ctx, weight, alpha, g, Qn, Qp, per_channel):
+        # assert alpha > 0, "alpha={}".format(alpha)
+        ctx.save_for_backward(weight, alpha)
+        ctx.other = g, Qn, Qp, per_channel
+        if per_channel:
+            sizes = weight.size()
+            weight = weight.contiguous().view(weight.size()[0], -1)
+            weight = torch.transpose(weight, 0, 1)
+            alpha = torch.broadcast_to(alpha, weight.size())
+            w_q = Round.apply(torch.div(weight, alpha).clamp(Qn, Qp))
+            w_q = w_q * alpha
+            w_q = torch.transpose(w_q, 0, 1)
+            w_q = w_q.contiguous().view(sizes)
+        else:
+            w_q = Round.apply(torch.div(weight, alpha).clamp(Qn, Qp))
+            w_q = w_q * alpha 
+        return w_q
+
+    @staticmethod
+    def backward(ctx, grad_weight):
+        weight, alpha = ctx.saved_tensors
+        g, Qn, Qp, per_channel = ctx.other
+        if per_channel:
+            sizes = weight.size()
+            weight = weight.contiguous().view(weight.size()[0], -1)
+            weight = torch.transpose(weight, 0, 1)
+            alpha = torch.broadcast_to(alpha, weight.size())
+            q_w = weight / alpha
+            q_w = torch.transpose(q_w, 0, 1)
+            q_w = q_w.contiguous().view(sizes)
+        else:
+            q_w = weight / alpha
+        smaller = (q_w < Qn).float() #bool值转浮点值，1.0或者0.0
+        bigger = (q_w > Qp).float() #bool值转浮点值，1.0或者0.0
+        between = 1.0 - smaller -bigger #得到位于量化区间的index
+        if per_channel:
+            grad_alpha = ((smaller * Qn + bigger * Qp + 
+                between * Round.apply(q_w) - between * q_w)*grad_weight * g)
+            grad_alpha = grad_alpha.contiguous().view(grad_alpha.size()[0], -1).sum(dim=1)
+        else:
+            grad_alpha = ((smaller * Qn + bigger * Qp + 
+                between * Round.apply(q_w) - between * q_w)*grad_weight * g).sum().unsqueeze(dim=0)
+        #在量化区间之外的值都是常数，故导数也是0
+        grad_weight = between * grad_weight
+        return grad_weight, grad_alpha, None, None, None, None
+
+def grad_scale(x, scale):
+    y = x
+    y_grad = x * scale
+    return (y - y_grad).detach() + y_grad
+
+def round_pass(x):
+    y = x.round()
+    y_grad = x
+    return (y - y_grad).detach() + y_grad
+
+def get_percentile_min_max(input, lower_percentile, uppper_percentile, output_tensor):
+    batch_size = input.shape[0]
+    lower_index = round(batch_size * (1 - lower_percentile*0.01))
+    upper_index = round(batch_size * (1 - uppper_percentile*0.01))
+
+    upper_bound = torch.kthvalue(input, k=upper_index).values
+
+    if lower_percentile==0:
+        lower_bound = upper_bound * 0
+    else:
+        low_bound = -torch.kthvalue(-input, k=lower_index).values
+    
+
+# A(特征)量化
+class LSQPlusActivationQuantizer(nn.Module):
+    def __init__(self, a_bits, all_positive=False,batch_init = 20):
+        #activations 没有per-channel这个选项的
+        super(LSQPlusActivationQuantizer, self).__init__()
+        self.a_bits = a_bits
+        self.all_positive = all_positive
+        self.batch_init = batch_init
+        if self.all_positive:
+            # unsigned activation is quantized to [0, 2^b-1]
+            self.Qn = 0
+            self.Qp = 2 ** self.a_bits - 1
+        else:
+            # signed weight/activation is quantized to [-2^(b-1), 2^(b-1)-1]
+            self.Qn = - 2 ** (self.a_bits - 1)
+            self.Qp = 2 ** (self.a_bits - 1) - 1
+        self.s = torch.nn.Parameter(torch.ones(1), requires_grad=True)
+        # self.beta = torch.nn.Parameter(torch.tensor([float(0)]))
+        self.beta = torch.nn.Parameter(torch.tensor([float(-1e-9)]), requires_grad=True)
+        self.init_state = INIT_STATE_UNINIT
+
+    # 量化/反量化
+    def forward(self, activation):
+        if self.a_bits == 32:
+            q_a = activation
+        elif self.a_bits == 1:
+            print('！Binary quantization is not supported ！')
+            assert self.a_bits != 1
+        else:
+            if not hasattr(self, "g"):
+                self.g = 1.0/math.sqrt(activation.numel() * self.Qp)
+            if self.init_state < self.batch_init:
+                with torch.no_grad():
+                    x = activation.detach()
+                    cur_min = torch.min(x)
+                    cur_max = torch.max(x)
+                    eps = torch.finfo(x.dtype).eps
+                    cur_s = torch.clamp(cur_max - cur_min, min=eps) / (self.Qp - self.Qn)
+                    cur_beta = cur_min - cur_s * self.Qn
+                    if self.init_state == INIT_STATE_UNINIT:
+                        self.s.data.copy_(cur_s.to(self.s))
+                        self.beta.data.copy_(cur_beta.to(self.beta))
+                    else:
+                        self.s.data.mul_(0.9).add_(cur_s.to(self.s), alpha=0.1)
+                        self.beta.data.mul_(0.9).add_(cur_beta.to(self.beta), alpha=0.1)
+                self.init_state += 1
+            elif self.init_state == self.batch_init:
+                self.init_state += 1
+            q_a = ALSQPlus.apply(activation, self.s, self.g, self.Qn, self.Qp, self.beta)
+        return q_a
+
+# W(权重)量化
+class LSQPlusWeightQuantizer(nn.Module):
+    def __init__(self, w_bits, all_positive=False, per_channel=False,batch_init = 20, num_channels=None):
+        super(LSQPlusWeightQuantizer, self).__init__()
+        self.w_bits = w_bits
+        self.all_positive = all_positive
+        self.batch_init = batch_init
+        if self.all_positive:
+            # unsigned activation is quantized to [0, 2^b-1]
+            self.Qn = 0
+            self.Qp = 2 ** w_bits - 1
+        else:
+            # signed weight/activation is quantized to [-2^(b-1), 2^(b-1)-1]
+            self.Qn = - 2 ** (w_bits - 1)
+            self.Qp = 2 ** (w_bits - 1) - 1
+        self.per_channel = per_channel
+        self.init_state = INIT_STATE_UNINIT
+        scale_shape = (num_channels,) if per_channel and num_channels is not None else (1,)
+        self.s = torch.nn.Parameter(torch.ones(scale_shape), requires_grad=True)
+        # self.beta = torch.nn.Parameter(torch.ones(0), requires_grad=True)
+
+    # 量化/反量化
+    def forward(self, weight):
+        if not hasattr(self, "g"):
+            self.g = 1.0/math.sqrt(weight.numel() * self.Qp)
+        if self.init_state==INIT_STATE_UNINIT:
+            self.div = 2**self.w_bits - 1
+            if self.per_channel:
+                weight_tmp = weight.detach().contiguous().view(weight.size()[0], -1)
+                mean = torch.mean(weight_tmp, dim=1)
+                std = torch.std(weight_tmp, dim=1)
+                cur_s, _ = torch.max(torch.stack([torch.abs(mean-3*std), torch.abs(mean + 3*std)]), dim=0)
+                cur_s = cur_s/self.div
+                self.s.data.copy_(cur_s)
+            else:
+                mean = torch.mean(weight.detach())
+                std = torch.std(weight.detach())
+                cur_s = max([torch.abs(mean-3*std), torch.abs(mean + 3*std)])/self.div
+                self.s.data.copy_(cur_s.to(self.s))
+            self.init_state += 1
+        elif self.init_state<self.batch_init:
+            self.div = 2**self.w_bits-1
+            if self.per_channel:
+                weight_tmp = weight.detach().contiguous().view(weight.size()[0], -1)
+                mean = torch.mean(weight_tmp, dim=1)
+                std = torch.std(weight_tmp, dim=1)
+                cur_s, _ = torch.max(torch.stack([torch.abs(mean-3*std), torch.abs(mean + 3*std)]), dim=0)
+                cur_s = cur_s/self.div
+                self.s.data.mul_(0.9).add_(cur_s, alpha=0.1)
+            else:
+                mean = torch.mean(weight.detach())
+                std = torch.std(weight.detach())
+                cur_s = max([torch.abs(mean-3*std), torch.abs(mean + 3*std)])/self.div
+                self.s.data.mul_(0.9).add_(cur_s.to(self.s), alpha=0.1)
+            self.init_state += 1
+        elif self.init_state==self.batch_init:
+            # self.s = torch.nn.Parameter(self.s)
+            self.init_state += 1
+
+        if self.w_bits == 32:
+            output = weight
+        elif self.w_bits == 1:
+            print('！Binary quantization is not supported ！')
+            assert self.w_bits != 1
+        else:
+            w_q = WLSQPlus.apply(weight, self.s, self.g, self.Qn, self.Qp, self.per_channel)
+
+            # alpha = grad_scale(self.s, g)
+            # w_q = Round.apply((weight/alpha).clamp(Qn, Qp)) * alpha
+        return w_q
+
+def update_LSQplus_activation_Scalebeta(model):
+    for name, child in model.named_children():
+        if isinstance(child, (QuantConv2d, QuantConvTranspose2d, QuantLinear)):
+            #weight = child.weight.data
+            s = child.activation_quantizer.s.data
+            beta = child.activation_quantizer.beta.data
+            Qn = child.activation_quantizer.Qn
+            Qp = child.activation_quantizer.Qp
+            g = child.activation_quantizer.g
+            # print('before: ', name, child.activation_quantizer.s.grad.data, child.activation_quantizer.beta.grad.data, s, beta)
+            q_input = (child.input - beta) / s  # 论文第3页公式(3)
+            # print(q_input)
+            smaller = (q_input < Qn).float() #bool值转浮点值，1.0或者0.0
+            bigger = (q_input > Qp).float() #bool值转浮点值，1.0或者0.0
+            between = 1.0 - smaller -bigger #得到位于量化区间的index
+            grad_alpha = ((smaller * Qn + bigger * Qp + 
+                           between * Round.apply(q_input) - between * q_input) * g).sum().unsqueeze(dim=0)
+            grad_beta = ((smaller + bigger) * g).sum().unsqueeze(dim=0)
+            # print('grad_beta: ',grad_beta,g, smaller.sum(), bigger.sum(), between.sum(),Qn, Qp)
+            child.activation_quantizer.s.grad.data.add_(g*(2*(child.quant_input-child.input)*grad_alpha).sum().unsqueeze(dim=0))
+            child.activation_quantizer.beta.grad.data.add_(g*(2*(child.quant_input-child.input)*grad_beta).sum().unsqueeze(dim=0))
+
+            model._modules[name] = child
+            # print('after: ', model._modules[name].activation_quantizer.s.grad.data, model._modules[name].activation_quantizer.beta.grad.data, s, beta,
+                # torch.square(child.quant_input-child.input).sum())
+        else:
+            child = update_LSQplus_activation_Scalebeta(child)
+            model._modules[name] = child
+    return model
+    
+
+
+class QuantConv2d(nn.Conv2d):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 padding=0,
+                 dilation=1,
+                 groups=1,
+                 bias=True,
+                 padding_mode='zeros',
+                 a_bits=8,
+                 w_bits=8,
+                 quant_inference=False,
+                 all_positive=False, 
+                 per_channel=False,
+                 batch_init = 20):
+        super(QuantConv2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups,
+                                          bias, padding_mode)
+        self.quant_inference = quant_inference
+        self.activation_quantizer = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+        self.weight_quantizer = LSQPlusWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel,batch_init = batch_init, num_channels=out_channels)
+
+    def forward(self, input):
+        self.input = input
+        self.quant_input = self.activation_quantizer(self.input)
+        if not self.quant_inference:
+            self.quant_weight = self.weight_quantizer(self.weight)
+        else:
+            self.quant_weight = self.weight
+
+        output = F.conv2d(self.quant_input, self.quant_weight, self.bias, self.stride, self.padding, self.dilation,
+                          self.groups)
+        return output
+
+
+class QuantConvTranspose2d(nn.ConvTranspose2d):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 padding=0,
+                 output_padding=0,
+                 dilation=1,
+                 groups=1,
+                 bias=True,
+                 padding_mode='zeros',
+                 a_bits=8,
+                 w_bits=8,
+                 quant_inference=False, 
+                 all_positive=False, 
+                 per_channel=False,
+                 batch_init = 20):
+        super(QuantConvTranspose2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, output_padding,
+                                                   groups, bias, dilation, padding_mode)
+        self.quant_inference = quant_inference
+        self.activation_quantizer = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+        self.weight_quantizer = LSQPlusWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel,batch_init = batch_init, num_channels=in_channels)
+
+    def forward(self, input):
+        self.input = input
+        self.quant_input = self.activation_quantizer(self.input)
+        if not self.quant_inference:
+            self.quant_weight = self.weight_quantizer(self.weight)
+        else:
+            self.quant_weight = self.weight
+        output = F.conv_transpose2d(self.quant_input, self.quant_weight, self.bias, self.stride, self.padding, self.output_padding,
+                                    self.groups, self.dilation)
+        return output
+
+
+class QuantLinear(nn.Linear):
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 bias=True,
+                 a_bits=8,
+                 w_bits=8,
+                 quant_inference=False, 
+                 all_positive=False, 
+                 per_channel=False,
+                 batch_init = 20):
+        super(QuantLinear, self).__init__(in_features, out_features, bias)
+        self.quant_inference = quant_inference
+        self.activation_quantizer = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+        self.weight_quantizer = LSQPlusWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel,batch_init = batch_init, num_channels=out_features)
+
+    def forward(self, input):
+        self.input = input
+        self.quant_input = self.activation_quantizer(self.input)
+        if not self.quant_inference:
+            self.quant_weight = self.weight_quantizer(self.weight)
+        else:
+            self.quant_weight = self.weight
+        output = F.linear(self.quant_input, self.quant_weight, self.bias)
+        return output
+
+class QuantAdd(nn.Module):
+    def __init__(self,
+                 a_bits=8,
+                 quant_inference=False,
+                 all_positive=False,
+                 per_channel=False,
+                 batch_init=20):
+        super(QuantAdd, self).__init__()
+        self.quant_inference = quant_inference
+        self.activation_quantizer0 = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+        self.activation_quantizer1 = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+
+    def forward(self, A, C):
+        if not self.quant_inference:
+            return A + C
+        else:
+            Q_A = self.activation_quantizer0(A)
+            Q_C = self.activation_quantizer1(C)
+            return Q_A + Q_C
+
+class QuantSub(nn.Module):
+    def __init__(self,
+                 a_bits=8,
+                 quant_inference=False,
+                 all_positive=False,
+                 per_channel=False,
+                 batch_init=20):
+        super(QuantSub, self).__init__()
+        self.quant_inference = quant_inference
+        self.activation_quantizer0 = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+        self.activation_quantizer1 = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+
+    def forward(self, A, C):
+        if not self.quant_inference:
+            return A - C
+        else:
+            Q_A = self.activation_quantizer0(A)
+            Q_C = self.activation_quantizer1(C)
+            return Q_A - Q_C
+
+class QuantMultiply(nn.Module):
+    def __init__(self,
+                 a_bits=8,
+                 quant_inference=False,
+                 all_positive=False,
+                 per_channel=False,
+                 batch_init=20):
+        super(QuantMultiply, self).__init__()
+        self.quant_inference = quant_inference
+        self.activation_quantizer0 = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+        self.activation_quantizer1 = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+
+    def forward(self, A, C):
+        if not self.quant_inference:
+            return A * C
+        else:
+            Q_A = self.activation_quantizer0(A)
+            Q_C = self.activation_quantizer1(C)
+            return Q_A * Q_C
+
+class QuantDiv(nn.Module):
+    def __init__(self,
+                 a_bits=8,
+                 quant_inference=False, 
+                 all_positive=False, 
+                 per_channel=False,
+                 batch_init = 20):
+        super(QuantDiv, self).__init__()
+        self.quant_inference = quant_inference
+        self.activation_quantizer0 = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+        self.activation_quantizer1 = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+
+    def forward(self, A, C):
+        if not self.quant_inference:
+            return A / C
+        else:
+            Q_A = self.activation_quantizer0(A)
+            Q_C = self.activation_quantizer1(C)
+            # 分母反量化网格可能恰好落在 0，钳到小正数防止 0/0 产生 NaN
+            return Q_A / torch.clamp(Q_C, min=1e-6)
+
+class QuantConcat(nn.Module):
+    def __init__(self,
+                 a_bits=8,
+                 quant_inference=False, 
+                 all_positive=False, 
+                 per_channel=False,
+                 batch_init = 20):
+        super(QuantConcat, self).__init__()
+        self.quant_inference = quant_inference
+        self.activation_quantizer0 = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+        self.activation_quantizer1 = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+
+    def forward(self, A, C, dim):
+        if not self.quant_inference:
+            return torch.concat([A, C], dim = dim)
+        else:
+            Q_A = self.activation_quantizer0(A)
+            Q_C = self.activation_quantizer1(C)
+            return torch.concat([Q_A, Q_C], dim = dim)
+
+class QuantMaxPool(nn.Module):
+    def __init__(self,
+                kernel_size: any,
+                stride = None,
+                padding = 0,
+                dilation = 1,
+                return_indices: bool = False,
+                ceil_mode: bool = False,
+                a_bits=8,
+                quant_inference=False, 
+                all_positive=False, 
+                per_channel=False,
+                batch_init = 20
+                ):
+        super(QuantMaxPool, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+        self.return_indices = return_indices
+        self.ceil_mode = ceil_mode
+        self.quant_inference = quant_inference
+        self.activation_quantizer = LSQPlusActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
+
+    def forward(self, x):
+        if not self.quant_inference:
+            Q_A = x
+        else:
+            Q_A = self.activation_quantizer(x)
+        return nn.functional.max_pool2d(Q_A, kernel_size=self.kernel_size, stride=self.stride, 
+                                            padding=self.padding, dilation=self.dilation, 
+                                            return_indices=self.return_indices, ceil_mode=self.ceil_mode)
+class QuantCat(nn.Module):
+    """对多个输入张量分别做激活伪量化后再 concat。
+
+    QuantConcat 只支持两个输入，而 C2f/SPPF 会拼接多个张量，因此这里实现
+    一个支持任意路输入的量化 concat，每一路各持有一个激活量化器。
+    """
+
+    def __init__(self, num_inputs, a_bits=8, batch_init=20):
+        super().__init__()
+        self.quant_inference = True
+        self.quantizers = nn.ModuleList(
+            [LSQPlusActivationQuantizer(a_bits=a_bits, batch_init=batch_init) for _ in range(num_inputs)]
+        )
+
+    def forward(self, tensors, dim=1):
+        return torch.cat([q(t) for q, t in zip(self.quantizers, tensors)], dim=dim)

@@ -1,0 +1,12 @@
+# QAT_training dependencies
+# Install with:  pip install -r requirements.txt
+#
+# torch / torchvision are CUDA 12.6 builds; replace +cu126 with +cpu for a
+# CPU-only installation or remove the suffix to use the default PyPI wheel.
+
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+numpy==2.4.4
+torch==2.11.0+cu126
+torchvision==0.26.0+cu126
+ultralytics==8.4.155

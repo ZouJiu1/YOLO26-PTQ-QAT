@@ -1,0 +1,1051 @@
+import argparse
+import importlib
+import json
+import os
+import sys
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+import quantization as quant_pkg
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "datas")
+MODEL_DIR = os.path.join(BASE_DIR, "model")
+CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
+CIFAR_STD = (0.2470, 0.2435, 0.2616)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------------------------------------------------------------------------
+# 量化后端可切换：dorefa / lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / pact
+# 每个后端文件都实现了同一套算子；set_quant_method() 切换后再实例化量化模型即可。
+# ---------------------------------------------------------------------------
+DEFAULT_QUANT_METHOD = "lsqplus_v1"
+QUANT_METHOD = DEFAULT_QUANT_METHOD
+Q = quant_pkg.load_quant_backend(DEFAULT_QUANT_METHOD)
+
+QuantAdd = Q.QuantAdd
+QuantConcat = Q.QuantConcat
+QuantConv2d = Q.QuantConv2d
+QuantConvTranspose2d = Q.QuantConvTranspose2d
+QuantDiv = Q.QuantDiv
+QuantLinear = Q.QuantLinear
+QuantMaxPool = Q.QuantMaxPool
+QuantMultiply = Q.QuantMultiply
+QuantSub = Q.QuantSub
+
+
+def set_quant_method(method):
+    """切换量化后端（必须在构建 QuantMobileNetV3 之前调用）。"""
+    global Q, QUANT_METHOD
+    global QuantAdd, QuantConcat, QuantConv2d, QuantConvTranspose2d
+    global QuantDiv, QuantLinear, QuantMaxPool, QuantMultiply, QuantSub
+
+    Q = quant_pkg.load_quant_backend(method)
+    QUANT_METHOD = method
+    QuantAdd = Q.QuantAdd
+    QuantConcat = Q.QuantConcat
+    QuantConv2d = Q.QuantConv2d
+    QuantConvTranspose2d = Q.QuantConvTranspose2d
+    QuantDiv = Q.QuantDiv
+    QuantLinear = Q.QuantLinear
+    QuantMaxPool = Q.QuantMaxPool
+    QuantMultiply = Q.QuantMultiply
+    QuantSub = Q.QuantSub
+    return Q
+
+
+def _make_divisible(v, divisor=8, min_value=None):
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+
+
+def hswish(x, inplace=True):
+    return F.relu6(x + 3.0, inplace=inplace) / 6.0 * x
+
+
+def hsigmoid(x, inplace=True):
+    return F.relu6(x + 3.0, inplace=inplace) / 6.0
+
+
+class HSwish(nn.Module):
+    def __init__(self, inplace=True):
+        super().__init__()
+        self.inplace = inplace
+
+    def forward(self, x):
+        return hswish(x, self.inplace)
+
+
+class HSigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super().__init__()
+        self.inplace = inplace
+
+    def forward(self, x):
+        return hsigmoid(x, self.inplace)
+
+
+def _activation(name):
+    if name == "RE":
+        return nn.ReLU(inplace=True)
+    if name == "HS":
+        return HSwish(inplace=True)
+    if name == "HE":
+        return HSigmoid(inplace=True)
+    if name in (None, "None"):
+        return nn.Identity()
+    raise ValueError(f"未知激活函数: {name}")
+
+
+# ----------------------------------------------------------------------------
+# 浮点版 MobileNetV3-Small（CIFAR stem stride=1），全部手写
+# ----------------------------------------------------------------------------
+class FloatConvBNReLU(nn.Sequential):
+    def __init__(self, in_planes, out_planes, kernel_size=3, stride=1, groups=1, activation="RE"):
+        padding = (kernel_size - 1) // 2
+        super().__init__(
+            nn.Conv2d(
+                in_planes,
+                out_planes,
+                kernel_size,
+                stride,
+                padding,
+                groups=groups,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_planes),
+            _activation(activation),
+        )
+
+
+class FloatSqueezeExcitation(nn.Module):
+    def __init__(self, input_channels, squeeze_channels):
+        super().__init__()
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Conv2d(input_channels, squeeze_channels, 1)
+        self.act1 = nn.ReLU(inplace=True)
+        self.fc2 = nn.Conv2d(squeeze_channels, input_channels, 1)
+        self.act2 = HSigmoid(inplace=True)
+
+    def forward(self, x):
+        scale = self.avgpool(x)
+        scale = self.fc1(scale)
+        scale = self.act1(scale)
+        scale = self.fc2(scale)
+        scale = self.act2(scale)
+        return x * scale
+
+
+class FloatInvertedResidual(nn.Module):
+    def __init__(self, inp, exp, oup, kernel, stride, use_se, activation, use_res_connect):
+        super().__init__()
+        self.use_res_connect = use_res_connect
+        layers = []
+        if exp != inp:
+            layers.append(FloatConvBNReLU(inp, exp, kernel_size=1, stride=1, activation=activation))
+        layers.append(
+            FloatConvBNReLU(
+                exp,
+                exp,
+                kernel_size=kernel,
+                stride=stride,
+                groups=exp,
+                activation=activation,
+            )
+        )
+        if use_se:
+            squeeze = _make_divisible(_make_divisible(exp, 8) / 4, 8)
+            layers.append(FloatSqueezeExcitation(exp, squeeze))
+        layers.append(FloatConvBNReLU(exp, oup, kernel_size=1, stride=1, activation=None))
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        result = self.block(x)
+        if self.use_res_connect:
+            result = result + x
+        return result
+
+
+class FloatHeadFusion(nn.Module):
+    def __init__(self, in_channels, hidden_channels, num_classes):
+        super().__init__()
+        self.fc1 = nn.Linear(in_channels, hidden_channels)
+        self.act = HSwish(inplace=True)
+        self.fc_aux = nn.Linear(in_channels, hidden_channels)
+        self.fc_out = nn.Linear(2 * hidden_channels, num_classes)
+
+    def forward(self, x):
+        a = self.act(self.fc1(x))
+        b = self.fc_aux(x)
+        fused = torch.cat([a, b], dim=1)
+        return self.fc_out(fused)
+
+
+class FloatMobileNetV3(nn.Module):
+    # (in_placeholder, expansion, out, kernel, stride, use_se, activation)
+    # in 通道由上一层输出自动推导；仅 stem 改为 stride=1 以适配 CIFAR 32x32
+    CFGS = [
+        [16, 16, 16, 3, 2, True, "RE"],
+        [16, 72, 24, 3, 2, False, "RE"],
+        [24, 88, 24, 3, 1, False, "RE"],
+        [24, 96, 40, 5, 2, True, "HS"],
+        [40, 240, 40, 5, 1, True, "HS"],
+        [40, 240, 40, 5, 1, True, "HS"],
+        [40, 120, 48, 5, 1, True, "HS"],
+        [48, 144, 48, 5, 1, True, "HS"],
+        [48, 288, 96, 5, 2, True, "HS"],
+        [96, 576, 96, 5, 1, True, "HS"],
+        [96, 576, 96, 5, 1, True, "HS"],
+    ]
+
+    def __init__(self, num_classes=10, width_mult=1.0):
+        super().__init__()
+        first_output = _make_divisible(16 * width_mult, 8)
+        self.stem = FloatConvBNReLU(3, first_output, kernel_size=3, stride=1, activation="HS")
+
+        blocks = []
+        inp = first_output
+        for c in self.CFGS:
+            _, exp, oup, kernel, stride, use_se, activation = c
+            output_channel = _make_divisible(oup * width_mult, 8)
+            exp_size = _make_divisible(exp * width_mult, 8)
+            use_res_connect = stride == 1 and inp == output_channel
+            blocks.append(
+                FloatInvertedResidual(
+                    inp, exp_size, output_channel, kernel, stride,
+                    use_se, activation, use_res_connect,
+                )
+            )
+            inp = output_channel
+        self.blocks = nn.Sequential(*blocks)
+
+        last_conv_input = inp
+        last_conv_output = _make_divisible(576 * width_mult, 8)
+        self.final_conv = FloatConvBNReLU(
+            last_conv_input, last_conv_output, kernel_size=1, stride=1, activation="HS"
+        )
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        hidden_channels = 1024
+        self.classifier = FloatHeadFusion(last_conv_output, hidden_channels, num_classes)
+        self._initialize_weights()
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.final_conv(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
+
+    def _initialize_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                nn.init.kaiming_normal_(module.weight, mode="fan_out")
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, 0, 0.01)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+
+# ----------------------------------------------------------------------------
+# 量化版 MobileNetV3-Small：Conv2d->QuantConv2d，Linear->QuantLinear，
+# 残差->QuantAdd，头部融合->QuantConcat
+# ----------------------------------------------------------------------------
+class QuantConvBNReLU(nn.Sequential):
+    def __init__(self, in_planes, out_planes, kernel_size=3, stride=1, groups=1, activation="RE"):
+        padding = (kernel_size - 1) // 2
+        super().__init__(
+            QuantConv2d(
+                in_planes,
+                out_planes,
+                kernel_size,
+                stride,
+                padding,
+                groups=groups,
+                bias=False,
+                a_bits=8,
+                w_bits=8,
+                per_channel=True,
+            ),
+            nn.BatchNorm2d(out_planes),
+            _activation(activation),
+        )
+
+
+class QuantSqueezeExcitation(nn.Module):
+    def __init__(self, input_channels, squeeze_channels):
+        super().__init__()
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = QuantConv2d(
+            input_channels, squeeze_channels, 1, a_bits=8, w_bits=8, per_channel=True
+        )
+        self.act1 = nn.ReLU(inplace=True)
+        self.fc2 = QuantConv2d(
+            squeeze_channels, input_channels, 1, a_bits=8, w_bits=8, per_channel=True
+        )
+        self.act2 = HSigmoid(inplace=True)
+
+    def forward(self, x):
+        scale = self.avgpool(x)
+        scale = self.fc1(scale)
+        scale = self.act1(scale)
+        scale = self.fc2(scale)
+        scale = self.act2(scale)
+        return x * scale
+
+
+class QuantInvertedResidual(nn.Module):
+    def __init__(self, inp, exp, oup, kernel, stride, use_se, activation, use_res_connect):
+        super().__init__()
+        self.use_res_connect = use_res_connect
+        layers = []
+        if exp != inp:
+            layers.append(QuantConvBNReLU(inp, exp, kernel_size=1, stride=1, activation=activation))
+        layers.append(
+            QuantConvBNReLU(
+                exp,
+                exp,
+                kernel_size=kernel,
+                stride=stride,
+                groups=exp,
+                activation=activation,
+            )
+        )
+        if use_se:
+            squeeze = _make_divisible(_make_divisible(exp, 8) / 4, 8)
+            layers.append(QuantSqueezeExcitation(exp, squeeze))
+        layers.append(QuantConvBNReLU(exp, oup, kernel_size=1, stride=1, activation=None))
+        self.block = nn.Sequential(*layers)
+        if use_res_connect:
+            self.residual_add = QuantAdd(a_bits=8, quant_inference=True)
+
+    def forward(self, x):
+        result = self.block(x)
+        if self.use_res_connect:
+            result = self.residual_add(result, x)
+        return result
+
+
+class QuantHeadFusion(nn.Module):
+    def __init__(self, in_channels, hidden_channels, num_classes):
+        super().__init__()
+        self.fc1 = QuantLinear(in_channels, hidden_channels, a_bits=8, w_bits=8, per_channel=True)
+        self.act = HSwish(inplace=True)
+        self.fc_aux = QuantLinear(in_channels, hidden_channels, a_bits=8, w_bits=8, per_channel=True)
+        self.concat = QuantConcat(a_bits=8, quant_inference=True)
+        self.fc_out = QuantLinear(2 * hidden_channels, num_classes, a_bits=8, w_bits=8, per_channel=True)
+
+    def forward(self, x):
+        a = self.act(self.fc1(x))
+        b = self.fc_aux(x)
+        fused = self.concat(a, b, dim=1)
+        return self.fc_out(fused)
+
+
+class QuantMobileNetV3(nn.Module):
+    CFGS = FloatMobileNetV3.CFGS
+
+    def __init__(self, num_classes=10, width_mult=1.0):
+        super().__init__()
+        first_output = _make_divisible(16 * width_mult, 8)
+        self.stem = QuantConvBNReLU(3, first_output, kernel_size=3, stride=1, activation="HS")
+
+        blocks = []
+        inp = first_output
+        for c in self.CFGS:
+            _, exp, oup, kernel, stride, use_se, activation = c
+            output_channel = _make_divisible(oup * width_mult, 8)
+            exp_size = _make_divisible(exp * width_mult, 8)
+            use_res_connect = stride == 1 and inp == output_channel
+            blocks.append(
+                QuantInvertedResidual(
+                    inp, exp_size, output_channel, kernel, stride,
+                    use_se, activation, use_res_connect,
+                )
+            )
+            inp = output_channel
+        self.blocks = nn.Sequential(*blocks)
+
+        last_conv_input = inp
+        last_conv_output = _make_divisible(576 * width_mult, 8)
+        self.final_conv = QuantConvBNReLU(
+            last_conv_input, last_conv_output, kernel_size=1, stride=1, activation="HS"
+        )
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        hidden_channels = 1024
+        self.classifier = QuantHeadFusion(last_conv_output, hidden_channels, num_classes)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.blocks(x)
+        x = self.final_conv(x)
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
+
+
+
+def get_dataloaders(batch_size=128, num_workers=2, calibration=False):
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+        ]
+    )
+    eval_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(CIFAR_MEAN, CIFAR_STD),
+        ]
+    )
+
+    train_set = datasets.CIFAR10(
+        root=DATA_DIR,
+        train=True,
+        download=True,
+        transform=eval_transform if calibration else train_transform,
+    )
+    test_set = datasets.CIFAR10(
+        root=DATA_DIR,
+        train=False,
+        download=True,
+        transform=eval_transform,
+    )
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=not calibration,
+        num_workers=num_workers,
+    )
+    test_loader = DataLoader(
+        test_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+    return train_loader, test_loader
+
+
+def train_one_epoch(model, loader, criterion, optimizer, max_batches=None):
+    model.train()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for batch_index, (images, labels) in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+        images = images.to(device)
+        labels = labels.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * images.size(0)
+        _, predicted = outputs.max(dim=1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+    return total_loss / total, correct / total
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, max_batches=None):
+    model.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+
+    for batch_index, (images, labels) in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+
+        total_loss += loss.item() * images.size(0)
+        _, predicted = outputs.max(dim=1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+
+    return total_loss / total, correct / total
+
+
+def load_checkpoint(model, path, return_meta=False):
+    checkpoint = torch.load(path, map_location=device)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+        meta = checkpoint.get("meta", {})
+    else:
+        state_dict = checkpoint
+        meta = {}
+    model.load_state_dict(state_dict)
+    if return_meta:
+        return model, meta
+    return model
+
+
+def save_checkpoint(model, path, **metadata):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if metadata:
+        torch.save({"state_dict": model.state_dict(), "meta": metadata}, path)
+    else:
+        torch.save(model.state_dict(), path)
+
+
+def copy_float_to_quant(float_model, quant_model):
+    float_state = float_model.state_dict()
+    quant_state = quant_model.state_dict()
+
+    for key, value in float_state.items():
+        if key in quant_state and quant_state[key].shape == value.shape:
+            quant_state[key] = value.detach().clone().to(device=quant_state[key].device)
+
+    quant_model.load_state_dict(quant_state)
+    # 灌入新权重后，让各后端的量化器从第 0 批重新统计
+    quant_pkg.reset_quantizer_states(quant_model)
+    return quant_model
+
+
+def build_float_model(quant_model, num_classes=10):
+    quant_pkg.freeze_batch_init(quant_model)
+    quant_model.eval()
+
+    quant_state = quant_model.state_dict()
+    for name, module in quant_model.named_modules():
+        if quant_pkg.is_weight_quant_module(module):
+            quant_state[f"{name}.weight"] = quant_pkg.dequantized_weight(module)
+
+    float_model = FloatMobileNetV3(num_classes=num_classes)
+    float_state = float_model.state_dict()
+    missing = []
+
+    for key in float_state:
+        if key in quant_state and quant_state[key].shape == float_state[key].shape:
+            float_state[key] = quant_state[key].detach().cpu().clone()
+        else:
+            missing.append(key)
+
+    if missing:
+        raise RuntimeError(f"浮点模型缺少对应参数: {missing}")
+
+    float_model.load_state_dict(float_state)
+    return float_model
+
+
+def collect_quant_params(quant_model):
+    return quant_pkg.collect_quant_params(quant_model)
+
+
+def export_onnx(float_model, onnx_path, opset=16):
+    os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+    float_model.eval()
+    model_device = next(float_model.parameters()).device
+    dummy = torch.randn(1, 3, 32, 32, device=model_device)
+
+    torch.onnx.export(
+        float_model,
+        dummy,
+        onnx_path,
+        export_params=True,
+        opset_version=opset,
+        do_constant_folding=True,
+        dynamo=False,
+        input_names=["input"],
+        output_names=["logits"],
+        dynamic_axes={
+            "input": {0: "batch_size"},
+            "logits": {0: "batch_size"},
+        },
+    )
+
+
+def verify(float_model, quant_model, onnx_path, quant_params):
+    try:
+        import onnx
+
+        onnx_model = onnx.load(onnx_path)
+        onnx.checker.check_model(onnx_model)
+        op_types = {node.op_type for node in onnx_model.graph.node}
+        quant_nodes = op_types & {"QuantizeLinear", "DequantizeLinear"}
+        assert not quant_nodes, f"ONNX 中仍存在量化节点: {sorted(quant_nodes)}"
+        print(f"      ONNX checker 通过，算子集合: {sorted(op_types)}")
+    except ImportError:
+        print("      [skip] 未安装 onnx，跳过结构检查")
+
+    try:
+        import numpy as np
+
+        ort = importlib.import_module("onnxruntime")
+        session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        torch.manual_seed(0)
+        float_model.cpu().eval()
+        x = torch.randn(4, 3, 32, 32)
+        with torch.no_grad():
+            y_torch = float_model(x).numpy()
+        y_onnx = session.run(["logits"], {"input": x.numpy()})[0]
+        max_diff = float(np.abs(y_torch - y_onnx).max())
+        print(f"      onnxruntime vs PyTorch 最大绝对误差: {max_diff:.3e}")
+        assert max_diff < 1e-4, f"ONNX 数值误差过大: {max_diff}"
+    except ImportError:
+        print("      [skip] 未安装 onnxruntime，跳过数值比对")
+
+    required_keys = quant_pkg.required_quant_keys(quant_model)
+    missing = [key for key in required_keys if key not in quant_params]
+
+    assert not missing, f"以下量化参数不完整: {missing}"
+    print(f"      量化参数完整性检查通过（{len(quant_params)} 个张量）")
+
+
+def save_quant_outputs(quant_model, prefix, num_classes=10, meta=None):
+    quant_pkg.freeze_batch_init(quant_model)
+    quant_model.eval()
+
+    quant_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_mobilenetv3_cifar10.pth")
+    save_checkpoint(quant_model, quant_checkpoint, **(meta or {}))
+
+    quant_params = collect_quant_params(quant_model)
+    json_path = os.path.join(MODEL_DIR, f"{prefix}_quant_params.json")
+    pth_path = os.path.join(MODEL_DIR, f"{prefix}_quant_params.pth")
+
+    with open(json_path, "w", encoding="utf-8") as file:
+        json.dump(quant_params, file, indent=2, ensure_ascii=False)
+
+    torch.save(
+        {
+            key: {
+                "scale": torch.tensor(value["scale"], dtype=torch.float64),
+                "zero_point": torch.tensor(value["zero_point"], dtype=torch.int64),
+            }
+            for key, value in quant_params.items()
+        },
+        pth_path,
+    )
+    print(f"[2/5] 量化参数已写出: {json_path} / {pth_path}")
+    print(f"      共 {len(quant_params)} 个张量的 scale/zero_point")
+
+    float_model = build_float_model(quant_model, num_classes=num_classes)
+    float_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_mobilenetv3_cifar10_float.pth")
+    save_checkpoint(float_model, float_checkpoint)
+    print(f"[3/5] 正常 PyTorch 浮点权重已写出: {float_checkpoint}")
+
+    onnx_path = os.path.join(MODEL_DIR, f"{prefix}_mobilenetv3_cifar10_float.onnx")
+    export_onnx(float_model, onnx_path, opset=16)
+    print(f"[4/5] 干净浮点 ONNX 已写出: {onnx_path}")
+
+    verify(float_model, quant_model, onnx_path, quant_params)
+    print("[5/5] 完成。")
+    return quant_checkpoint, json_path, pth_path, float_checkpoint, onnx_path
+
+
+def float_train(batch_size=128, lr=1e-3, epochs=100, num_classes=10, num_workers=2,
+                max_train_batches=None, max_eval_batches=None):
+    print("========== Float training ==========")
+    print(f"Device: {device}")
+
+    train_loader, test_loader = get_dataloaders(
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+
+    float_model = FloatMobileNetV3(num_classes=num_classes).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(float_model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    best_acc = 0.0
+    best_epoch = -1
+    best_meta = {}
+    checkpoint_path = os.path.join(MODEL_DIR, "mobilenetv3_cifar10.pth")
+    last_checkpoint = os.path.join(MODEL_DIR, "mobilenetv3_cifar10_last.pth")
+
+    for epoch in range(epochs):
+        train_loss, train_acc = train_one_epoch(
+            float_model,
+            train_loader,
+            criterion,
+            optimizer,
+            max_batches=max_train_batches,
+        )
+        test_loss, test_acc = evaluate(
+            float_model, test_loader, criterion, max_batches=max_eval_batches
+        )
+        scheduler.step()
+
+        epoch_meta = {
+            "stage": "float",
+            "epoch": epoch + 1,
+            "total_epochs": epochs,
+            "lr": lr,
+            "train_loss": float(train_loss),
+            "train_acc": float(train_acc),
+            "test_loss": float(test_loss),
+            "test_acc": float(test_acc),
+        }
+        save_checkpoint(float_model, last_checkpoint, **epoch_meta)
+
+        if test_acc > best_acc:
+            best_acc = test_acc
+            best_epoch = epoch + 1
+            best_meta = epoch_meta
+            save_checkpoint(float_model, checkpoint_path, **best_meta)
+
+        print(
+            f"[Float] Epoch [{epoch + 1}/{epochs}] | "
+            f"Train loss:{train_loss:.4f} acc:{train_acc:.4f} | "
+            f"Test loss:{test_loss:.4f} acc:{test_acc:.4f}"
+        )
+
+    load_checkpoint(float_model, checkpoint_path)
+    final_loss, final_acc = evaluate(
+        float_model, test_loader, criterion, max_batches=max_eval_batches
+    )
+    print(f"[Float] Best checkpoint: {checkpoint_path}")
+    print(f"[Float] Last checkpoint: {last_checkpoint}")
+    print(
+        f"[Float] Final validation | "
+        f"Best epoch:{best_epoch}/{epochs} | "
+        f"Test loss:{final_loss:.4f} acc:{final_acc:.4f} | "
+        f"Best epoch acc:{best_acc:.4f}"
+    )
+    return checkpoint_path, final_acc, best_meta
+
+
+@torch.no_grad()
+def calibrate_quantizer(quant_model, calibration_loader, calibration_batches=20):
+    quant_model.eval()
+    for batch_index, (images, _) in enumerate(calibration_loader):
+        quant_model(images.to(device))
+        if batch_index + 1 >= calibration_batches:
+            break
+    quant_pkg.freeze_batch_init(quant_model)
+
+
+def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, num_classes=10,
+                    calibration_batches=20, num_workers=2, max_eval_batches=None):
+    set_quant_method(quant_method)
+    tag = quant_method
+    print(f"========== PTQ calibration [{tag}] ==========")
+    print(f"Device: {device}")
+
+    calibration_loader, test_loader = get_dataloaders(
+        batch_size=batch_size,
+        num_workers=num_workers,
+        calibration=True,
+    )
+
+    float_checkpoint = os.path.join(MODEL_DIR, "mobilenetv3_cifar10.pth")
+    if not os.path.exists(float_checkpoint):
+        raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
+
+    float_model = FloatMobileNetV3(num_classes=num_classes).to(device)
+    load_checkpoint(float_model, float_checkpoint)
+
+    ptq_model = QuantMobileNetV3(num_classes=num_classes).to(device)
+    copy_float_to_quant(float_model, ptq_model)
+
+    calibrate_quantizer(
+        ptq_model,
+        calibration_loader,
+        calibration_batches=calibration_batches,
+    )
+
+    criterion = nn.CrossEntropyLoss()
+    test_loss, test_acc = evaluate(
+        ptq_model, test_loader, criterion, max_batches=max_eval_batches
+    )
+    print(f"[PTQ-{tag}] Test loss:{test_loss:.4f} acc:{test_acc:.4f}")
+
+    ptq_meta = {
+        "stage": "ptq",
+        "quant_method": tag,
+        "epoch": 0,
+        "total_epochs": 0,
+        "lr": None,
+        "calibration_batches": calibration_batches,
+        "train_loss": None,
+        "train_acc": None,
+        "test_loss": float(test_loss),
+        "test_acc": float(test_acc),
+    }
+    ptq_checkpoint = save_quant_outputs(
+        ptq_model, f"ptq_{tag}", num_classes=num_classes, meta=ptq_meta
+    )[0]
+
+    load_checkpoint(ptq_model, ptq_checkpoint)
+    final_loss, final_acc = evaluate(
+        ptq_model, test_loader, criterion, max_batches=max_eval_batches
+    )
+    print(
+        f"[PTQ] Final validation | "
+        f"Test loss:{final_loss:.4f} acc:{final_acc:.4f} | "
+        f"Checkpoint: {ptq_checkpoint}"
+    )
+
+    return ptq_checkpoint
+
+
+def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, lr=1e-4, epochs=20,
+                 num_classes=10, num_workers=2,
+                 max_train_batches=None, max_eval_batches=None):
+    set_quant_method(quant_method)
+    tag = quant_method
+    print(f"========== QAT training [{tag}] ==========")
+    print(f"Device: {device}")
+    print(f"QAT LR: {lr:g} (float LR x 0.1)")
+
+    train_loader, test_loader = get_dataloaders(
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+
+    ptq_checkpoint = os.path.join(MODEL_DIR, f"ptq_{tag}_mobilenetv3_cifar10.pth")
+    if not os.path.exists(ptq_checkpoint):
+        raise FileNotFoundError(
+            f"找不到 {tag} 的 PTQ 权重，请先运行 PTQ_calibration('{tag}'): {ptq_checkpoint}"
+        )
+
+    qat_model = QuantMobileNetV3(num_classes=num_classes).to(device)
+    _, ptq_meta = load_checkpoint(qat_model, ptq_checkpoint, return_meta=True)
+    saved_method = ptq_meta.get("quant_method")
+    if saved_method is not None and saved_method != tag:
+        print(f"      [warn] PTQ checkpoint 记录的方法为 {saved_method}，当前为 {tag}")
+    quant_pkg.freeze_batch_init(qat_model)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(qat_model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    best_acc = 0.0
+    best_epoch = -1
+    best_meta = {}
+    best_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_mobilenetv3_cifar10_best.pth")
+    last_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_mobilenetv3_cifar10_last.pth")
+
+    for epoch in range(epochs):
+        train_loss, train_acc = train_one_epoch(
+            qat_model,
+            train_loader,
+            criterion,
+            optimizer,
+            max_batches=max_train_batches,
+        )
+        test_loss, test_acc = evaluate(
+            qat_model, test_loader, criterion, max_batches=max_eval_batches
+        )
+        scheduler.step()
+
+        epoch_meta = {
+            "stage": "qat",
+            "quant_method": tag,
+            "epoch": epoch + 1,
+            "total_epochs": epochs,
+            "lr": lr,
+            "train_loss": float(train_loss),
+            "train_acc": float(train_acc),
+            "test_loss": float(test_loss),
+            "test_acc": float(test_acc),
+        }
+        save_checkpoint(qat_model, last_checkpoint, **epoch_meta)
+
+        if test_acc > best_acc:
+            best_acc = test_acc
+            best_epoch = epoch + 1
+            best_meta = epoch_meta
+            save_checkpoint(qat_model, best_checkpoint, **best_meta)
+
+        print(
+            f"[QAT-{tag}] Epoch [{epoch + 1}/{epochs}] | "
+            f"Train loss:{train_loss:.4f} acc:{train_acc:.4f} | "
+            f"Test loss:{test_loss:.4f} acc:{test_acc:.4f}"
+        )
+
+    load_checkpoint(qat_model, best_checkpoint)
+    final_loss, final_acc = evaluate(
+        qat_model, test_loader, criterion, max_batches=max_eval_batches
+    )
+    print(
+        f"[QAT-{tag}] Final validation | "
+        f"Best epoch:{best_epoch}/{epochs} | "
+        f"Test loss:{final_loss:.4f} acc:{final_acc:.4f} | "
+        f"Best epoch acc:{best_acc:.4f} | "
+        f"Best: {best_checkpoint} | Last: {last_checkpoint}"
+    )
+    qat_checkpoint = save_quant_outputs(
+        qat_model, f"qat_{tag}", num_classes=num_classes, meta=best_meta
+    )[0]
+    return qat_checkpoint, final_acc, best_meta
+
+
+def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, num_classes=10,
+                      num_workers=2, max_eval_batches=None):
+    set_quant_method(quant_method)
+    tag = quant_method
+    print(f"========== Float vs QAT precision [{tag}] ==========")
+    print(f"Device: {device}")
+
+    float_checkpoint = os.path.join(MODEL_DIR, "mobilenetv3_cifar10.pth")
+    qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_mobilenetv3_cifar10.pth")
+    if not os.path.exists(float_checkpoint):
+        raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
+    if not os.path.exists(qat_checkpoint):
+        raise FileNotFoundError(
+            f"找不到 {tag} 的 QAT 权重，请先运行 QAT_training('{tag}'): {qat_checkpoint}"
+        )
+
+    _, test_loader = get_dataloaders(
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+    criterion = nn.CrossEntropyLoss()
+
+    float_model = FloatMobileNetV3(num_classes=num_classes).to(device)
+    float_model, float_meta = load_checkpoint(
+        float_model, float_checkpoint, return_meta=True
+    )
+    float_loss, float_acc = evaluate(
+        float_model, test_loader, criterion, max_batches=max_eval_batches
+    )
+
+    qat_model = QuantMobileNetV3(num_classes=num_classes).to(device)
+    qat_model, qat_meta = load_checkpoint(
+        qat_model, qat_checkpoint, return_meta=True
+    )
+    saved_method = qat_meta.get("quant_method")
+    if saved_method is not None and saved_method != tag:
+        print(f"      [warn] QAT checkpoint 记录的方法为 {saved_method}，当前为 {tag}")
+    quant_pkg.freeze_batch_init(qat_model)
+    qat_loss, qat_acc = evaluate(
+        qat_model, test_loader, criterion, max_batches=max_eval_batches
+    )
+
+    delta = qat_acc - float_acc
+    print(
+        f"[Compare] Float | best epoch:{float_meta.get('epoch', '-')}/"
+        f"{float_meta.get('total_epochs', '-')} lr:{float_meta.get('lr', '-')} | "
+        f"Test loss:{float_loss:.4f} acc:{float_acc:.4f}"
+    )
+    print(
+        f"[Compare] QAT   | best epoch:{qat_meta.get('epoch', '-')}/"
+        f"{qat_meta.get('total_epochs', '-')} lr:{qat_meta.get('lr', '-')} | "
+        f"Test loss:{qat_loss:.4f} acc:{qat_acc:.4f}"
+    )
+    print(f"[Compare] QAT - Float acc delta: {delta:+.4f}")
+
+    return {
+        "float_acc": float_acc,
+        "qat_acc": qat_acc,
+        "delta": delta,
+        "float_loss": float_loss,
+        "qat_loss": qat_loss,
+        "float_meta": float_meta,
+        "qat_meta": qat_meta,
+    }
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(
+        description="MobileNetV3-Small(CIFAR): 浮点训练 -> PTQ -> QAT -> 精度对比，量化方法可选"
+    )
+    parser.add_argument(
+        "--quant",
+        choices=quant_pkg.QUANT_METHODS,
+        default=DEFAULT_QUANT_METHOD,
+        help="量化方法（默认 lsqplus_v1）",
+    )
+    parser.add_argument(
+        "--stage",
+        choices=("all", "float", "ptq", "qat", "compare"),
+        default="all",
+        help="只跑指定阶段（默认全流程）",
+    )
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--float-epochs", type=int, default=100)
+    parser.add_argument("--qat-epochs", type=int, default=None,
+                        help="默认 max(1, float-epochs*0.2)")
+    parser.add_argument("--float-lr", type=float, default=1e-3)
+    parser.add_argument("--qat-lr", type=float, default=None,
+                        help="默认 float-lr x 0.1")
+    parser.add_argument("--calibration-batches", type=int, default=20)
+    # 冒烟/快速验证用：每个 epoch / 评估最多跑多少个 batch，默认不限制（完整训练）
+    parser.add_argument("--max-train-batches", type=int, default=None)
+    parser.add_argument("--max-eval-batches", type=int, default=None)
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_arg_parser().parse_args()
+    print(f"Python: {sys.executable}")
+    print(f"torch: {torch.__version__} | Device: {device}")
+    print(f"量化方法: {args.quant} | 阶段: {args.stage}")
+
+    tag = args.quant
+    qat_lr = args.qat_lr if args.qat_lr is not None else args.float_lr * 0.1
+    qat_epochs = (
+        args.qat_epochs
+        if args.qat_epochs is not None
+        else max(1, int(round(args.float_epochs * 0.2)))
+    )
+
+    common = dict(
+        batch_size=args.batch_size,
+        num_classes=10,
+        num_workers=args.num_workers,
+    )
+
+    if args.stage in ("all", "float"):
+        float_train(
+            lr=args.float_lr,
+            epochs=args.float_epochs,
+            max_train_batches=args.max_train_batches,
+            max_eval_batches=args.max_eval_batches,
+            **common,
+        )
+
+    if args.stage in ("all", "ptq"):
+        PTQ_calibration(
+            quant_method=tag,
+            calibration_batches=args.calibration_batches,
+            max_eval_batches=args.max_eval_batches,
+            **common,
+        )
+
+    if args.stage in ("all", "qat"):
+        QAT_training(
+            quant_method=tag,
+            lr=qat_lr,
+            epochs=qat_epochs,
+            max_train_batches=args.max_train_batches,
+            max_eval_batches=args.max_eval_batches,
+            **common,
+        )
+
+    if args.stage in ("all", "compare"):
+        compare_precision(
+            quant_method=tag,
+            max_eval_batches=args.max_eval_batches,
+            **common,
+        )
