@@ -34,10 +34,10 @@ import torch.nn as nn
 import quantization as quant_pkg
 
 # 复用检测网络的 backbone 组件与训练基础设施
-# （文件名 networks_yolov26n-detect.py 含 '-'，不能直接 import，用文件路径加载）
+# （文件名 networks_yolo26n-detect.py 含 '-'，不能直接 import，用文件路径加载）
 det_spec = importlib.util.spec_from_file_location(
-    "networks_yolov26n_detect",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "networks_yolov26n-detect.py"),
+    "networks_yolo26n_detect",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "networks_yolo26n-detect.py"),
 )
 det = importlib.util.module_from_spec(det_spec)
 det_spec.loader.exec_module(det)
@@ -47,6 +47,7 @@ from ultralytics.cfg import get_cfg
 from ultralytics.utils import DEFAULT_CFG
 from ultralytics.data.utils import check_cls_dataset
 from ultralytics.data import ClassificationDataset, build_dataloader
+from ultralytics.utils.torch_utils import model_info
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "model")
@@ -132,26 +133,32 @@ class YOLO26Cls(nn.Module):
     （imagenet10 为 10 类）被跳过。
     """
 
-    def __init__(self, nc=NUM_CLASSES, quant=False):
+    def __init__(self, nc=NUM_CLASSES, quant=False, scale=det.DEFAULT_SCALE):
         super().__init__()
         self.quant = quant
         self.nc = nc
+        self.scale = det.get_scale(scale)
+        s = self.scale
+        C = lambda c: det.scaled_channels(c, s)   # 通道缩放
+        N = lambda r: det.scaled_repeats(r, s)    # 层重复次数缩放
+        # ultralytics parse_model 特殊规则：M/L/X 尺度所有 C3k2 强制 c3k=True
+        c3k_all = s in ("m", "l", "x")
         layers = []
 
         # ---------------- backbone（与 yolo26-cls.yaml 对齐，无 SPPF） ----------------
-        layers += [det._tag(det.Conv(3, 16, 3, 2, quant=quant), 0, -1)]       # P1/2
-        layers += [det._tag(det.Conv(16, 32, 3, 2, quant=quant), 1, -1)]      # P2/4
-        layers += [det._tag(det.C3k2(32, 64, n=1, c3k=False, e=0.25, quant=quant), 2, -1)]
-        layers += [det._tag(det.Conv(64, 64, 3, 2, quant=quant), 3, -1)]      # P3/8
-        layers += [det._tag(det.C3k2(64, 128, n=1, c3k=False, e=0.25, quant=quant), 4, -1)]
-        layers += [det._tag(det.Conv(128, 128, 3, 2, quant=quant), 5, -1)]    # P4/16
-        layers += [det._tag(det.C3k2(128, 128, n=1, c3k=True, quant=quant), 6, -1)]
-        layers += [det._tag(det.Conv(128, 256, 3, 2, quant=quant), 7, -1)]    # P5/32
-        layers += [det._tag(det.C3k2(256, 256, n=1, c3k=True, quant=quant), 8, -1)]
-        layers += [det._tag(det.C2PSA(256, 256, n=1, quant=quant), 9, -1)]
+        layers += [det._tag(det.Conv(3, C(64), 3, 2, quant=quant), 0, -1)]               # P1/2
+        layers += [det._tag(det.Conv(C(64), C(128), 3, 2, quant=quant), 1, -1)]          # P2/4
+        layers += [det._tag(det.C3k2(C(128), C(256), n=N(2), c3k=c3k_all, e=0.25, quant=quant), 2, -1)]
+        layers += [det._tag(det.Conv(C(256), C(256), 3, 2, quant=quant), 3, -1)]         # P3/8
+        layers += [det._tag(det.C3k2(C(256), C(512), n=N(2), c3k=c3k_all, e=0.25, quant=quant), 4, -1)]
+        layers += [det._tag(det.Conv(C(512), C(512), 3, 2, quant=quant), 5, -1)]          # P4/16
+        layers += [det._tag(det.C3k2(C(512), C(512), n=N(2), c3k=True, quant=quant), 6, -1)]
+        layers += [det._tag(det.Conv(C(512), C(1024), 3, 2, quant=quant), 7, -1)]         # P5/32
+        layers += [det._tag(det.C3k2(C(1024), C(1024), n=N(2), c3k=True, quant=quant), 8, -1)]
+        layers += [det._tag(det.C2PSA(C(1024), C(1024), n=N(2), quant=quant), 9, -1)]
 
         # ---------------- 分类头 ----------------
-        layers += [det._tag(Classify(256, nc, quant=quant), 10, -1)]
+        layers += [det._tag(Classify(C(1024), nc, quant=quant), 10, -1)]
 
         self.model = nn.ModuleList(layers)
         self._register_quantizer_buffers()
@@ -173,13 +180,13 @@ class YOLO26Cls(nn.Module):
 
 
 class FloatYOLO26Cls(YOLO26Cls):
-    def __init__(self, nc=NUM_CLASSES):
-        super().__init__(nc=nc, quant=False)
+    def __init__(self, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
+        super().__init__(nc=nc, quant=False, scale=scale)
 
 
 class QuantYOLO26Cls(YOLO26Cls):
-    def __init__(self, nc=NUM_CLASSES):
-        super().__init__(nc=nc, quant=True)
+    def __init__(self, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
+        super().__init__(nc=nc, quant=True, scale=scale)
 
 
 # ============================== 数据 / 评估 ==============================
@@ -253,8 +260,16 @@ def save_checkpoint(model, path, **metadata):
     det.save_checkpoint(model, path, **metadata)
 
 
-def load_pretrained(model, path=PRETRAINED_WEIGHTS):
-    """加载官方 yolo26n-cls.pt（nc=1000）；末端 Linear 与 imagenet10(nc=10) 不匹配，跳过。"""
+def load_pretrained(model, path=None, scale=det.DEFAULT_SCALE):
+    """加载官方 yolo26{scale}-cls.pt（nc=1000）；末端 Linear 与 imagenet10(nc=10) 不匹配，跳过。
+
+    仓库仅随附 yolo26n-cls.pt；s/m/l/x 缺失时跳过加载，模型随机初始化从头训练。
+    """
+    if path is None:
+        path = os.path.join(ULTRA_DIR, f"{det.base_name(scale, 'cls')}.pt")
+    if not os.path.exists(path):
+        print(f"[Pretrain] [warn] 未找到预训练权重 {path}，{det.model_name(scale)}-cls 将从头训练")
+        return model
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     state_dict = checkpoint["model"].float().state_dict()
     model_state = model.state_dict()
@@ -284,7 +299,7 @@ def copy_float_to_quant(float_model, quant_model):
     return det.copy_float_to_quant(float_model, quant_model)
 
 
-def build_float_model(quant_model, nc=NUM_CLASSES):
+def build_float_model(quant_model, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
     """把量化模型的反量化权重灌进同结构的干净浮点模型（用于导出纯浮点 ONNX）。"""
     quant_pkg.freeze_batch_init(quant_model)
     quant_model.eval()
@@ -294,7 +309,7 @@ def build_float_model(quant_model, nc=NUM_CLASSES):
         if quant_pkg.is_weight_quant_module(module):
             quant_state[f"{name}.weight"] = quant_pkg.dequantized_weight(module)
 
-    float_model = FloatYOLO26Cls(nc=nc)
+    float_model = FloatYOLO26Cls(nc=nc, scale=scale)
     float_state = float_model.state_dict()
     missing = []
     for key in float_state:
@@ -357,8 +372,10 @@ def verify(float_model, quant_model, onnx_path, quant_params):
             y_torch = float_model(x)
         y_onnx = session.run(["preds"], {"images": x.numpy()})[0]
         max_diff = float(np.abs(y_torch.numpy() - y_onnx).max())
-        print(f"      onnxruntime vs PyTorch 最大绝对误差: preds {max_diff:.3e}")
-        assert max_diff < 1e-3, "ONNX 数值误差过大"
+        ref_mag = float(np.abs(y_torch.numpy()).max())
+        print(f"      onnxruntime vs PyTorch 最大绝对误差: preds {max_diff:.3e}（参考幅度 {ref_mag:.3e}）")
+        # 输出含大数量级解码坐标，纯绝对阈值过严：max(1e-3 绝对, 1e-5 相对)
+        assert max_diff < max(1e-3, 1e-5 * ref_mag), "ONNX 数值误差过大"
     except ImportError:
         print("      [skip] 未安装 onnxruntime，跳过数值比对")
 
@@ -368,16 +385,17 @@ def verify(float_model, quant_model, onnx_path, quant_params):
     print(f"      量化参数完整性检查通过（{len(quant_params)} 个张量）")
 
 
-def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None):
+def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None, scale=det.DEFAULT_SCALE):
     quant_pkg.freeze_batch_init(quant_model)
     quant_model.eval()
 
-    quant_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_yolo26ncls.pth")
+    base = det.base_name(scale, "cls")
+    quant_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_{base}.pth")
     save_checkpoint(quant_model, quant_checkpoint, **(meta or {}))
 
     quant_params = collect_quant_params(quant_model)
-    json_path = os.path.join(MODEL_DIR, f"{prefix}_yolo26ncls_quant_params.json")
-    pth_path = os.path.join(MODEL_DIR, f"{prefix}_yolo26ncls_quant_params.pth")
+    json_path = os.path.join(MODEL_DIR, f"{prefix}_{base}_quant_params.json")
+    pth_path = os.path.join(MODEL_DIR, f"{prefix}_{base}_quant_params.pth")
     with open(json_path, "w", encoding="utf-8") as file:
         json.dump(quant_params, file, indent=2, ensure_ascii=False)
     torch.save(
@@ -392,12 +410,12 @@ def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None):
     )
     print(f"[2/5] 量化参数已写出: {json_path} / {pth_path}（{len(quant_params)} 个张量）")
 
-    float_model = build_float_model(quant_model, nc=nc)
-    float_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_yolo26ncls_float.pth")
+    float_model = build_float_model(quant_model, nc=nc, scale=scale)
+    float_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_{base}_float.pth")
     save_checkpoint(float_model, float_checkpoint)
     print(f"[3/5] 干净浮点权重已写出: {float_checkpoint}")
 
-    onnx_path = os.path.join(MODEL_DIR, f"{prefix}_yolo26ncls_float.onnx")
+    onnx_path = os.path.join(MODEL_DIR, f"{prefix}_{base}_float.onnx")
     export_onnx(float_model, onnx_path, opset=16)
     print(f"[4/5] 干净浮点 ONNX 已写出: {onnx_path}")
 
@@ -426,21 +444,22 @@ def train_one_epoch(model, loader, criterion, optimizer, max_batches=None):
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        total_loss += float(loss)
+        total_loss += float(loss.detach())
         num_steps += 1
     return total_loss / max(num_steps, 1)
 
 
 def float_train(batch_size=64, lr=1e-3, epochs=100, num_classes=NUM_CLASSES, num_workers=2,
-                max_train_batches=None, max_eval_batches=None):
-    print("========== Float training (YOLO26n-cls / imagenet10) ==========")
+                max_train_batches=None, max_eval_batches=None, scale=det.DEFAULT_SCALE):
+    print(f"========== Float training ({det.model_name(scale)}-cls / imagenet10) ==========")
     print(f"Device: {device}")
     print(f"Optimizer: Adam(lr={lr:g}) | loss: CrossEntropy | metric: top-1/top-5")
 
     train_loader, val_loader, data = get_dataloaders(batch_size, num_workers)
 
-    float_model = FloatYOLO26Cls(num_classes).to(device)
-    load_pretrained(float_model, PRETRAINED_WEIGHTS)
+    float_model = FloatYOLO26Cls(num_classes, scale=scale).to(device)
+    det.model_info(float_model, imgsz=IMGSZ)
+    load_pretrained(float_model, scale=scale)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(float_model.parameters(), lr=lr)
@@ -448,8 +467,8 @@ def float_train(batch_size=64, lr=1e-3, epochs=100, num_classes=NUM_CLASSES, num
     best_fitness = -1.0
     best_epoch = -1
     best_meta = {}
-    checkpoint_path = os.path.join(MODEL_DIR, "yolo26n-cls.pth")
-    last_checkpoint = os.path.join(MODEL_DIR, "yolo26n-cls_last.pth")
+    checkpoint_path = os.path.join(MODEL_DIR, f"{det.base_name(scale, 'cls')}.pth")
+    last_checkpoint = os.path.join(MODEL_DIR, f"{det.base_name(scale, 'cls')}_last.pth")
 
     for epoch in range(epochs):
         train_loss = train_one_epoch(
@@ -460,6 +479,7 @@ def float_train(batch_size=64, lr=1e-3, epochs=100, num_classes=NUM_CLASSES, num
 
         epoch_meta = {
             "stage": "float",
+            "scale": det.get_scale(scale),
             "epoch": epoch + 1,
             "total_epochs": epochs,
             "lr": lr,
@@ -487,42 +507,45 @@ def float_train(batch_size=64, lr=1e-3, epochs=100, num_classes=NUM_CLASSES, num
 
 
 @torch.no_grad()
-def calibrate_quantizer(quant_model, calibration_loader, calibration_batches=20):
-    quant_model.eval()
-    for batch_index, batch in enumerate(calibration_loader):
-        quant_model(batch["img"].float().to(device))
-        if batch_index + 1 >= calibration_batches:
-            break
-    quant_pkg.freeze_batch_init(quant_model)
+def calibrate_quantizer(quant_model, calibration_loader, calibration_batches=20,
+                         float_model=None):
+    """校准量化器（委托给 detect 模块，注意 cls 不需要 /255 归一化）。"""
+    return det.calibrate_quantizer(quant_model, calibration_loader,
+                                    calibration_batches, float_model=float_model,
+                                    normalize_img=False)
 
 
 def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=64, num_classes=NUM_CLASSES,
-                    calibration_batches=20, num_workers=2, max_eval_batches=None):
+                    calibration_batches=20, num_workers=2, max_eval_batches=None,
+                    scale=det.DEFAULT_SCALE):
     set_quant_method(quant_method)
     tag = quant_method
-    print(f"========== PTQ calibration (YOLO26n-cls / {tag}) ==========")
+    print(f"========== PTQ calibration ({det.model_name(scale)}-cls / {tag}) ==========")
     print(f"Device: {device}")
 
     calibration_loader, data = get_dataloaders(batch_size, num_workers, calibration=True)
     _, val_loader, _ = get_dataloaders(batch_size, num_workers)
 
-    float_checkpoint = os.path.join(MODEL_DIR, "yolo26n-cls.pth")
+    float_checkpoint = os.path.join(MODEL_DIR, f"{det.base_name(scale, 'cls')}.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
 
-    float_model = FloatYOLO26Cls(num_classes).to(device)
+    float_model = FloatYOLO26Cls(num_classes, scale=scale).to(device)
     load_checkpoint(float_model, float_checkpoint)
 
-    ptq_model = QuantYOLO26Cls(num_classes).to(device)
+    ptq_model = QuantYOLO26Cls(num_classes, scale=scale).to(device)
+    det.model_info(ptq_model, imgsz=IMGSZ)
     copy_float_to_quant(float_model, ptq_model)
 
-    calibrate_quantizer(ptq_model, calibration_loader, calibration_batches)
+    calibrate_quantizer(ptq_model, calibration_loader, calibration_batches,
+                         float_model=float_model)
 
     metrics = evaluate(ptq_model, val_loader, max_batches=max_eval_batches)
     print(f"[PTQ-{tag}] Test loss:{metrics['test_loss']:.4f} top1:{metrics['top1']:.4f} top5:{metrics['top5']:.4f}")
 
     ptq_meta = {
         "stage": "ptq",
+        "scale": det.get_scale(scale),
         "quant_method": tag,
         "epoch": 0,
         "total_epochs": 0,
@@ -531,7 +554,7 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=64, num_classe
         **metrics,
     }
     ptq_checkpoint = save_quant_outputs(
-        ptq_model, f"ptq_{tag}", nc=num_classes, meta=ptq_meta
+        ptq_model, f"ptq_{tag}", nc=num_classes, meta=ptq_meta, scale=scale
     )[0]
 
     load_checkpoint(ptq_model, ptq_checkpoint)
@@ -543,26 +566,30 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=64, num_classe
 
 def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=64, lr=1e-4, epochs=20,
                  num_classes=NUM_CLASSES, num_workers=2,
-                 max_train_batches=None, max_eval_batches=None):
+                 max_train_batches=None, max_eval_batches=None, scale=det.DEFAULT_SCALE):
     set_quant_method(quant_method)
     tag = quant_method
-    print(f"========== QAT training (YOLO26n-cls / {tag}) ==========")
+    print(f"========== QAT training ({det.model_name(scale)}-cls / {tag}) ==========")
     print(f"Device: {device}")
     print(f"Optimizer: Adam(lr={lr:g}) | loss: CrossEntropy | metric: top-1/top-5")
 
     train_loader, val_loader, data = get_dataloaders(batch_size, num_workers)
 
-    ptq_checkpoint = os.path.join(MODEL_DIR, f"ptq_{tag}_yolo26ncls.pth")
+    ptq_checkpoint = os.path.join(MODEL_DIR, f"ptq_{tag}_{det.base_name(scale, 'cls')}.pth")
     if not os.path.exists(ptq_checkpoint):
         raise FileNotFoundError(
             f"找不到 {tag} 的 PTQ 权重，请先运行 PTQ_calibration('{tag}'): {ptq_checkpoint}"
         )
 
-    qat_model = QuantYOLO26Cls(num_classes).to(device)
+    qat_model = QuantYOLO26Cls(num_classes, scale=scale).to(device)
+    det.model_info(qat_model, imgsz=IMGSZ)
     _, ptq_meta = load_checkpoint(qat_model, ptq_checkpoint, return_meta=True)
     saved_method = ptq_meta.get("quant_method")
     if saved_method is not None and saved_method != tag:
         print(f"      [warn] PTQ checkpoint 记录的方法为 {saved_method}，当前为 {tag}")
+    saved_scale = ptq_meta.get("scale")
+    if saved_scale is not None and saved_scale != det.get_scale(scale):
+        print(f"      [warn] PTQ checkpoint 记录的尺度为 yolo26{saved_scale}，当前为 yolo26{det.get_scale(scale)}")
     quant_pkg.freeze_batch_init(qat_model)
 
     criterion = nn.CrossEntropyLoss()
@@ -571,8 +598,9 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=64, lr=1e-4, epoc
     best_fitness = -1.0
     best_epoch = -1
     best_meta = {}
-    best_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_yolo26ncls_best.pth")
-    last_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_yolo26ncls_last.pth")
+    base = det.base_name(scale, "cls")
+    best_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base}_best.pth")
+    last_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base}_last.pth")
 
     for epoch in range(epochs):
         train_loss = train_one_epoch(
@@ -583,6 +611,7 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=64, lr=1e-4, epoc
 
         epoch_meta = {
             "stage": "qat",
+            "scale": det.get_scale(scale),
             "quant_method": tag,
             "epoch": epoch + 1,
             "total_epochs": epochs,
@@ -610,20 +639,21 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=64, lr=1e-4, epoc
         f"top1:{best_metrics['top1']:.4f} top5:{best_metrics['top5']:.4f} | Best: {best_checkpoint}"
     )
     qat_checkpoint = save_quant_outputs(
-        qat_model, f"qat_{tag}", nc=num_classes, meta=best_meta
+        qat_model, f"qat_{tag}", nc=num_classes, meta=best_meta, scale=scale
     )[0]
     return qat_checkpoint, best_fitness, best_meta
 
 
 def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=64, num_classes=NUM_CLASSES,
-                      num_workers=2, max_eval_batches=None):
+                      num_workers=2, max_eval_batches=None, scale=det.DEFAULT_SCALE):
     set_quant_method(quant_method)
     tag = quant_method
-    print(f"========== Float vs QAT precision (YOLO26n-cls / imagenet10 / {tag}) ==========")
+    print(f"========== Float vs QAT precision ({det.model_name(scale)}-cls / imagenet10 / {tag}) ==========")
     print(f"Device: {device}")
 
-    float_checkpoint = os.path.join(MODEL_DIR, "yolo26n-cls.pth")
-    qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_yolo26ncls.pth")
+    base = det.base_name(scale, "cls")
+    float_checkpoint = os.path.join(MODEL_DIR, f"{base}.pth")
+    qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base}.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
     if not os.path.exists(qat_checkpoint):
@@ -633,15 +663,18 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=64, num_clas
 
     _, val_loader, data = get_dataloaders(batch_size, num_workers)
 
-    float_model = FloatYOLO26Cls(num_classes).to(device)
+    float_model = FloatYOLO26Cls(num_classes, scale=scale).to(device)
     float_model, float_meta = load_checkpoint(float_model, float_checkpoint, return_meta=True)
     float_metrics = evaluate(float_model, val_loader, max_batches=max_eval_batches)
 
-    qat_model = QuantYOLO26Cls(num_classes).to(device)
+    qat_model = QuantYOLO26Cls(num_classes, scale=scale).to(device)
     qat_model, qat_meta = load_checkpoint(qat_model, qat_checkpoint, return_meta=True)
     saved_method = qat_meta.get("quant_method")
     if saved_method is not None and saved_method != tag:
         print(f"      [warn] QAT checkpoint 记录的方法为 {saved_method}，当前为 {tag}")
+    saved_scale = qat_meta.get("scale")
+    if saved_scale is not None and saved_scale != det.get_scale(scale):
+        print(f"      [warn] QAT checkpoint 记录的尺度为 yolo26{saved_scale}，当前为 yolo26{det.get_scale(scale)}")
     quant_pkg.freeze_batch_init(qat_model)
     qat_metrics = evaluate(qat_model, val_loader, max_batches=max_eval_batches)
 
@@ -666,7 +699,13 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=64, num_clas
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="YOLO26n-cls: 浮点训练(加载 yolo26n-cls.pt) -> PTQ -> QAT -> top1/top5 对比，量化方法可选"
+        description="YOLO26-cls: 浮点训练(加载 yolo26{scale}-cls.pt) -> PTQ -> QAT -> top1/top5 对比，模型尺度与量化方法可选"
+    )
+    parser.add_argument(
+        "--model",
+        choices=det.MODEL_CHOICES,
+        default=f"yolo26{det.DEFAULT_SCALE}",
+        help="模型尺度（默认 yolo26n；仅 yolo26n 随仓库提供 .pt 预训练权重）",
     )
     parser.add_argument(
         "--quant",
@@ -697,9 +736,10 @@ def build_arg_parser():
 
 if __name__ == "__main__":
     args = build_arg_parser().parse_args()
+    scale = det.get_scale(args.model)
     print(f"Python: {sys.executable}")
     print(f"torch: {torch.__version__} | Device: {device}")
-    print(f"量化方法: {args.quant} | 阶段: {args.stage}")
+    print(f"模型: {det.model_name(scale)}-cls | 量化方法: {args.quant} | 阶段: {args.stage}")
 
     tag = args.quant
     qat_epochs = (
@@ -717,6 +757,7 @@ if __name__ == "__main__":
             num_workers=args.num_workers,
             max_train_batches=args.max_train_batches,
             max_eval_batches=args.max_eval_batches,
+            scale=scale,
         )
 
     if args.stage in ("all", "ptq"):
@@ -727,6 +768,7 @@ if __name__ == "__main__":
             calibration_batches=args.calibration_batches,
             num_workers=args.num_workers,
             max_eval_batches=args.max_eval_batches,
+            scale=scale,
         )
 
     if args.stage in ("all", "qat"):
@@ -739,6 +781,7 @@ if __name__ == "__main__":
             num_workers=args.num_workers,
             max_train_batches=args.max_train_batches,
             max_eval_batches=args.max_eval_batches,
+            scale=scale,
         )
 
     if args.stage in ("all", "compare"):
@@ -748,4 +791,5 @@ if __name__ == "__main__":
             num_classes=NUM_CLASSES,
             num_workers=args.num_workers,
             max_eval_batches=args.max_eval_batches,
+            scale=scale,
         )

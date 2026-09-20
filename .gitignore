@@ -10,6 +10,7 @@ Desktop.ini
 # Recycle Bin used on file shares
 $RECYCLE.BIN/
 *.tar.gz
+debug_*
 *.onnx
 *cifar-10-batches-py
 cifar-10-batches-py
