@@ -7,7 +7,7 @@
     compare_precision()                             # 浮点 vs QAT 的 box/mask mAP 对比
 
 模型尺度用 --model yolo26n|yolo26s|yolo26m|yolo26l|yolo26x 选择（默认 yolo26n）。
-backbone / neck（层 0-22）与 networks_yolo26n-detect.py 完全一致，直接复用；
+backbone / neck（层 0-22）与 networks_yolo26-detect.py 完全一致，直接复用；
 分割头为 ultralytics yolo26-seg.yaml 的 Segment26（层 23）：
     cv2/cv3 检测框/分类支路与检测模型相同；额外的 cv4 输出 32 个 mask 系数；
     Proto26 融合 P3/P4/P5 多尺度特征，生成 (B,32,160,160) mask prototypes，
@@ -34,10 +34,10 @@ import torch.nn.functional as F
 import quantization as quant_pkg
 
 # 复用检测网络的 backbone/neck 组件、尺度缩放助手与训练基础设施
-# （文件名 networks_yolo26n-detect.py 含 '-'，不能直接 import，用文件路径加载）
+# （文件名 networks_yolo26-detect.py 含 '-'，不能直接 import，用文件路径加载）
 det_spec = importlib.util.spec_from_file_location(
-    "networks_yolo26n_detect",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "networks_yolo26n-detect.py"),
+    "networks_yolo26_detect",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "networks_yolo26-detect.py"),
 )
 det = importlib.util.module_from_spec(det_spec)
 det_spec.loader.exec_module(det)
@@ -83,12 +83,15 @@ QuantConcat = Q.QuantConcat
 QuantConv2d = Q.QuantConv2d
 QuantConvTranspose2d = Q.QuantConvTranspose2d
 QuantMaxPool = Q.QuantMaxPool
+QuantSiLU = getattr(Q, 'QuantSiLU', None)
+QuantSigmoid = getattr(Q, 'QuantSigmoid', None)
+QuantMatMul = getattr(Q, 'QuantMatMul', None)
 
 
 def set_quant_method(method):
     """切换量化后端（必须在构建 QuantYOLO26Seg 之前调用）。"""
-    global Q, QUANT_METHOD
-    global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantConvTranspose2d, QuantMaxPool
+    global Q, QUANT_METHOD, QuantSiLU, QuantSigmoid, QuantMatMul
+    global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantConvTranspose2d, QuantMaxPool, QuantSiLU, QuantSigmoid, QuantMatMul
 
     # 复用的 backbone/neck block 类内部引用的是 det 模块的全局算子，必须先同步切换
     det.set_quant_method(method)
@@ -99,7 +102,13 @@ def set_quant_method(method):
     QuantConcat = det.QuantConcat
     QuantConv2d = det.QuantConv2d
     QuantConvTranspose2d = Q.QuantConvTranspose2d
+    QuantSiLU = getattr(Q, 'QuantSiLU', None)
+    QuantSigmoid = getattr(Q, 'QuantSigmoid', None)
+    QuantMatMul = getattr(Q, 'QuantMatMul', None)
     QuantMaxPool = det.QuantMaxPool
+    QuantSiLU = getattr(Q, 'QuantSiLU', None)
+    QuantSigmoid = getattr(Q, 'QuantSigmoid', None)
+    QuantMatMul = getattr(Q, 'QuantMatMul', None)
     return Q
 
 

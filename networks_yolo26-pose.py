@@ -40,10 +40,10 @@ import torch.nn as nn
 import quantization as quant_pkg
 
 # 复用检测网络的 backbone/neck 组件与训练基础设施
-# （文件名 networks_yolo26n-detect.py 含 '-'，不能直接 import，用文件路径加载）
+# （文件名 networks_yolo26-detect.py 含 '-'，不能直接 import，用文件路径加载）
 det_spec = importlib.util.spec_from_file_location(
-    "networks_yolo26n_detect",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "networks_yolo26n-detect.py"),
+    "networks_yolo26_detect",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "networks_yolo26-detect.py"),
 )
 det = importlib.util.module_from_spec(det_spec)
 det_spec.loader.exec_module(det)
@@ -92,12 +92,15 @@ QuantCat = Q.QuantCat
 QuantConcat = Q.QuantConcat
 QuantConv2d = Q.QuantConv2d
 QuantMaxPool = Q.QuantMaxPool
+QuantSiLU = getattr(Q, 'QuantSiLU', None)
+QuantSigmoid = getattr(Q, 'QuantSigmoid', None)
+QuantMatMul = getattr(Q, 'QuantMatMul', None)
 
 
 def set_quant_method(method):
     """切换量化后端（必须在构建 QuantYOLO26Pose 之前调用）。"""
-    global Q, QUANT_METHOD
-    global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantMaxPool
+    global Q, QUANT_METHOD, QuantSiLU, QuantSigmoid, QuantMatMul
+    global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantMaxPool, QuantSiLU, QuantSigmoid, QuantMatMul
 
     # 复用的 backbone/neck block 类内部引用的是 det 模块的全局算子，必须先同步切换
     det.set_quant_method(method)
@@ -108,6 +111,9 @@ def set_quant_method(method):
     QuantConcat = det.QuantConcat
     QuantConv2d = det.QuantConv2d
     QuantMaxPool = det.QuantMaxPool
+    QuantSiLU = getattr(Q, 'QuantSiLU', None)
+    QuantSigmoid = getattr(Q, 'QuantSigmoid', None)
+    QuantMatMul = getattr(Q, 'QuantMatMul', None)
     return Q
 
 

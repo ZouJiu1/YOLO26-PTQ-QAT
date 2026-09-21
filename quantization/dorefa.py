@@ -444,3 +444,82 @@ def prepare(model, inplace=False, a_bits=8, w_bits=8, quant_inference=False,
     add_quant_op(model, layer_counter, a_bits=a_bits, w_bits=w_bits,
                  quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel)
     return model
+
+class QuantSiLU(nn.Module):
+    """量化 SiLU (x * sigmoid(x)) — 单输入, 只有 input quantizer。"""
+    def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
+                 per_channel=False, batch_init=20):
+        super(QuantSiLU, self).__init__()
+        self.quant_inference = quant_inference
+        self.activation_quantizer = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
+
+    def forward(self, x):
+        if not self.quant_inference:
+            return F.silu(x)
+        else:
+            return F.silu(self.activation_quantizer(x))
+
+
+
+class QuantSigmoid(nn.Module):
+    """量化 Sigmoid — 单输入, 只有 input quantizer。"""
+    def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
+                 per_channel=False, batch_init=20):
+        super(QuantSigmoid, self).__init__()
+        self.quant_inference = quant_inference
+        self.activation_quantizer = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
+
+    def forward(self, x):
+        if not self.quant_inference:
+            return torch.sigmoid(x)
+        else:
+            return torch.sigmoid(self.activation_quantizer(x))
+
+
+
+class QuantReLU(nn.Module):
+    """量化 ReLU — 单输入, 只有 input quantizer。all_positive=True 更合理。"""
+    def __init__(self, a_bits=8, quant_inference=False, all_positive=True,
+                 per_channel=False, batch_init=20):
+        super(QuantReLU, self).__init__()
+        self.quant_inference = quant_inference
+        self.activation_quantizer = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
+
+    def forward(self, x):
+        if not self.quant_inference:
+            return F.relu(x)
+        else:
+            return F.relu(self.activation_quantizer(x))
+
+
+
+class QuantSoftmax(nn.Module):
+    """量化 Softmax — 单输入, 只有 input quantizer。逐行量化/反量化后做 softmax。"""
+    def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
+                 per_channel=False, batch_init=20):
+        super(QuantSoftmax, self).__init__()
+        self.quant_inference = quant_inference
+        self.activation_quantizer = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
+
+    def forward(self, x, dim=-1):
+        if not self.quant_inference:
+            return torch.softmax(x, dim=dim)
+        else:
+            return torch.softmax(self.activation_quantizer(x), dim=dim)
+
+class QuantMatMul(nn.Module):
+    """量化矩阵乘法 — 两个输入 (A, B)。"""
+    def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
+                 per_channel=False, batch_init=20):
+        super(QuantMatMul, self).__init__()
+        self.quant_inference = quant_inference
+        self.activation_quantizer0 = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
+        self.activation_quantizer1 = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
+
+    def forward(self, A, B):
+        if not self.quant_inference:
+            return torch.matmul(A, B)
+        else:
+            Q_A = self.activation_quantizer0(A)
+            Q_B = self.activation_quantizer1(B)
+            return torch.matmul(Q_A, Q_B)

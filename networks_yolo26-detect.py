@@ -130,12 +130,16 @@ QuantCat = Q.QuantCat
 QuantConcat = Q.QuantConcat
 QuantConv2d = Q.QuantConv2d
 QuantMaxPool = Q.QuantMaxPool
+QuantSiLU = getattr(Q, 'QuantSiLU', None)
+QuantSigmoid = getattr(Q, 'QuantSigmoid', None)
+QuantReLU = getattr(Q, 'QuantReLU', None)
 
 
 def set_quant_method(method):
     """切换量化后端（必须在构建 QuantYOLO26 之前调用）。"""
-    global Q, QUANT_METHOD
-    global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantMaxPool
+    global Q, QUANT_METHOD, QuantSiLU, QuantSigmoid, QuantMatMul
+    global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantMaxPool, QuantSiLU, QuantSigmoid, QuantMatMul
+    global QuantSiLU, QuantSigmoid, QuantReLU
 
     Q = quant_pkg.load_quant_backend(method)
     QUANT_METHOD = method
@@ -144,6 +148,9 @@ def set_quant_method(method):
     QuantConcat = Q.QuantConcat
     QuantConv2d = Q.QuantConv2d
     QuantMaxPool = Q.QuantMaxPool
+    QuantSiLU = getattr(Q, 'QuantSiLU', None)
+    QuantSigmoid = getattr(Q, 'QuantSigmoid', None)
+    QuantReLU = getattr(Q, 'QuantReLU', None)
     return Q
 
 
@@ -183,7 +190,10 @@ class Conv(nn.Module):
         else:
             self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=bias)
         self.bn = make_bn(c2)
-        self.act = nn.SiLU() if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        if quant and QuantSiLU is not None:
+            self.act = QuantSiLU(a_bits=8, quant_inference=False) if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        else:
+            self.act = nn.SiLU() if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
@@ -539,16 +549,20 @@ class YOLO26(nn.Module):
                 )
 
     def _initialize_head(self):
-        """用一次 dummy 前向推算 stride 并初始化 Detect 偏置（官方做法）。"""
+        """用一次 dummy 前向推算 stride 并初始化 Detect 偏置（官方做法）。
+
+        注意：dummy 输入不能用全零！LSQ v1 的 activation_quantizer 用全零
+        初始化 s=0，之后 torch.div(x, 0) → NaN。
+        用 randn 让每个 quantizer 得到合理的初始 s。
+        """
         was_training = self.training
         self.eval()
         with torch.no_grad():
-            feats = self._forward_features(torch.zeros(1, 3, IMGSZ, IMGSZ))
+            dummy = torch.randn(1, 3, IMGSZ, IMGSZ) * 0.1  # 小随机噪声，避免全零
+            feats = self._forward_features(dummy)
             head = self.model[-1]
             head.stride = torch.tensor([IMGSZ / f.shape[-2] for f in feats])
             head.bias_init()
-            # dummy 前向时 stride 还是 0，Detect 已缓存了零 stride_tensor，
-            # 必须令缓存失效，让首次真实前向用正确 stride 重建 anchors。
             head._feat_shape = None
         if was_training:
             self.train()
@@ -1129,35 +1143,75 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
 
 def _collect_float_ranges_full(float_model, calibration_loader, calibration_batches,
                                normalize_img=True):
-    """收集 float 模型中每个 Conv/Linear 输入的运行 min/max 范围。
+    """收集 float 模型中每个 Conv/Linear + eltwise 算子的运行 min/max 范围。
 
-    只 hook 模块输入（不 monkeypatch torch.cat/add 等算子，避免污染 DataLoader）。
-    每层范围跨 batch 做运行 min/max 合并，得到的是"该层在 float 前向中真实看到的
-    完整激活范围"，用它初始化量化器可以避免旧方案逐层累积的级联校准误差。
+    Hook 策略（全部是 named module 的 forward_pre_hook，不 monkeypatch torch.cat/add 等）：
+      - Conv2d/ConvTranspose2d/Linear: 输入 (单 tensor)
+      - FloatAdd: 两个输入 (A, C) — 同名 QuantAdd
+      - MaxPool2d: 输入 (单 tensor) — 同名 QuantMaxPool
+      - Concat: 输入列表 xs = [tensor, ...] — QuantConcat 在 {name}.op
+      - QuantCat: float 里是 torch.cat 函数调用 (C2f/C3k/SPPF/...)，无同名模块，
+        靠安全网处理
 
     Returns:
-        module_input_ranges: dict[name] = (min, max) — 每个 nn.Conv/Linear 的输入范围
+        module_input_ranges: dict[name] = list of [min, max]
+          - Conv/Linear: 1 个输入 → [[min, max]]
+          - FloatAdd: 2 个输入 → [[A_min, A_max], [C_min, C_max]]
+          - Concat: N 个输入 → [[xs[0]_min, xs[0]_max], ...]
+          - MaxPool2d: 1 个输入 → [[min, max]]
     """
     module_input_ranges = {}
 
-    def make_conv_input_hook(name):
+    def make_single_input_hook(name):
         def hook(module, inputs, output):
             if isinstance(inputs, tuple) and len(inputs) > 0 and isinstance(inputs[0], torch.Tensor):
                 x = inputs[0].detach()
                 cur_min, cur_max = x.min(), x.max()
                 if name not in module_input_ranges:
-                    module_input_ranges[name] = [cur_min, cur_max]
+                    module_input_ranges[name] = [[cur_min, cur_max]]
                 else:
-                    module_input_ranges[name][0] = torch.minimum(module_input_ranges[name][0], cur_min)
-                    module_input_ranges[name][1] = torch.maximum(module_input_ranges[name][1], cur_max)
+                    slot = module_input_ranges[name][0]
+                    slot[0] = torch.minimum(slot[0], cur_min)
+                    slot[1] = torch.maximum(slot[1], cur_max)
+        return hook
+
+    def make_multi_input_hook(name):
+        """展开 tuple/list 中的所有 tensor 输入。"""
+        def hook(module, inputs, output):
+            tensors = []
+            for a in inputs:
+                if isinstance(a, torch.Tensor):
+                    tensors.append(a)
+                elif isinstance(a, (list, tuple)):
+                    tensors.extend(t for t in a if isinstance(t, torch.Tensor))
+            if not tensors:
+                return
+            if name not in module_input_ranges:
+                module_input_ranges[name] = [[t.detach().min(), t.detach().max()] for t in tensors]
+            else:
+                slot = module_input_ranges[name]
+                for i, t in enumerate(tensors):
+                    if i < len(slot):
+                        slot[i][0] = torch.minimum(slot[i][0], t.detach().min())
+                        slot[i][1] = torch.maximum(slot[i][1], t.detach().max())
         return hook
 
     hooks = []
-    for name, module in float_model.named_modules():
-        if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
-            hooks.append(module.register_forward_hook(make_conv_input_hook(name)))
-
     float_model.eval()
+    for name, module in float_model.named_modules():
+        cls = type(module).__name__
+        if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+            hooks.append(module.register_forward_hook(make_single_input_hook(name)))
+        elif cls == 'FloatAdd':
+            hooks.append(module.register_forward_hook(make_multi_input_hook(name)))
+        elif cls == 'MaxPool2d':
+            hooks.append(module.register_forward_hook(make_single_input_hook(name)))
+        elif cls == 'Concat':
+            hooks.append(module.register_forward_hook(make_multi_input_hook(name)))
+        # 激活函数：单输入
+        elif isinstance(module, (nn.SiLU, nn.Sigmoid, nn.ReLU)):
+            hooks.append(module.register_forward_hook(make_single_input_hook(name)))
+
     with torch.no_grad():
         for batch_index, batch in enumerate(calibration_loader):
             img = batch["img"].float().to(device)
@@ -1170,7 +1224,11 @@ def _collect_float_ranges_full(float_model, calibration_loader, calibration_batc
     for h in hooks:
         h.remove()
 
-    print(f"[Calib] Collected float ranges: {len(module_input_ranges)} Conv/Linear inputs")
+    conv_count = sum(1 for k in module_input_ranges
+                     if any(k.endswith(s) for s in ('.conv', '.cv')))
+    eltwise_count = len(module_input_ranges) - conv_count
+    print(f"[Calib] Collected float ranges: {len(module_input_ranges)} modules "
+          f"({conv_count} Conv/Linear, {eltwise_count} eltwise)")
     return module_input_ranges
 
 
@@ -1263,16 +1321,17 @@ def _apply_minmax_to_quantizer(q, cur_min, cur_max, eps=1e-8):
 
 def _init_quantizers_from_float(float_model, quant_model, calibration_loader,
                                 calibration_batches=20, normalize_img=True):
-    """用 float 模型的激活范围 + 权重范围初始化 quant 模型中 Conv/Linear 的量化器。
+    """用 float 模型的激活范围 + 权重范围初始化 quant 模型的量化器。
 
-    覆盖两类量化点（都能按名字和 float 模型一一对应）：
-      1. Conv/Linear 的 activation_quantizer —— float forward 中同名卷积输入的
-         运行 min/max（每层独立校准，无级联误差）；
-      2. Conv/Linear 的 weight_quantizer —— 当前权重的 min-max（对称网格取最小
-         覆盖 scale，避免 LSQ+ 原生 3σ 初始化在 PTQ 无训练阶段的饱和）。
+    覆盖三类量化点（全部直接从 float 模型收集，无级联误差）：
+      1. Conv/Linear 的 activation_quantizer —— float forward 输入范围
+      2. Conv/Linear 的 weight_quantizer —— 当前权重的 min-max（避免 LSQ+ 3σ 饱和）
+      3. FloatAdd/MaxPool2d/Concat 的 eltwise 量化器：
+           - FloatAdd(name) → QuantAdd(name).activation_quantizer0/1
+           - MaxPool2d(name) → QuantMaxPool(name).activation_quantizer
+           - Concat(name) → QuantConcat(name.op).activation_quantizer0/1
 
-    其余量化点（QuantAdd/QuantCat/QuantConcat/QuantMaxPool 等 float 模型里没有
-    同名可 hook 的算子）交给 _safety_net_calibrate 处理。
+    QuantCat（torch.cat 函数调用）无同名 float 模块，交给安全网处理。
     """
     module_input_ranges = _collect_float_ranges_full(
         float_model, calibration_loader, calibration_batches, normalize_img=normalize_img
@@ -1281,46 +1340,92 @@ def _init_quantizers_from_float(float_model, quant_model, calibration_loader,
     eps = 1e-8
     aq_count = 0
     wq_count = 0
+    eltwise_count = 0
     quant_model_modules = dict(quant_model.named_modules())
 
-    for name, float_range in module_input_ranges.items():
+    for name, float_range_list in module_input_ranges.items():
+        # float_range_list: [[min0, max0], [min1, max1], ...]
+        # 统一处理成 list of tensors
+        ranges = [[torch.as_tensor(m, dtype=torch.float32),
+                   torch.as_tensor(x, dtype=torch.float32)]
+                  for m, x in float_range_list]
+
         if name not in quant_model_modules:
-            continue
-        qmodule = quant_model_modules[name]
+            # 可能是 Concat → QuantConcat 在 {name}.op
+            qname = name + '.op'
+            if qname not in quant_model_modules:
+                continue
+            qmodule = quant_model_modules[qname]
+        else:
+            qmodule = quant_model_modules[name]
 
-        # activation_quantizer
-        aq = getattr(qmodule, "activation_quantizer", None)
-        if aq is not None and _apply_minmax_to_quantizer(aq, float_range[0], float_range[1], eps):
-            aq_count += 1
+        cls_name = type(qmodule).__name__
 
-        # weight_quantizer —— 用 weight 的 min-max（对称网格最小覆盖）
-        wq = getattr(qmodule, "weight_quantizer", None)
-        if wq is not None and hasattr(wq, "s"):
-            weight = qmodule.weight.detach()
-            Qn, Qp = wq.Qn, wq.Qp
-            if getattr(wq, "per_channel", False) and weight.dim() >= 2:
-                w_flat = weight.contiguous().view(weight.size(0), -1)
-                w_min = w_flat.min(dim=1)[0]
-                w_max = w_flat.max(dim=1)[0]
-            else:
-                w_min, w_max = weight.min(), weight.max()
-            if hasattr(wq, "beta"):
-                cur_s = torch.clamp(w_max - w_min, min=eps) / (Qp - Qn)
-            else:
-                # 对称网格：取能覆盖 [w_min, w_max] 的最小 scale
-                if Qn < 0:
-                    cur_s = torch.maximum(w_max / Qp, w_min / Qn).clamp(min=eps)
+        # ── Conv/Linear: activation_quantizer + weight_quantizer ──
+        if cls_name in ('QuantConv2d', 'QuantConvTranspose2d', 'QuantLinear'):
+            aq = getattr(qmodule, "activation_quantizer", None)
+            if aq is not None and _apply_minmax_to_quantizer(aq, ranges[0][0], ranges[0][1], eps):
+                aq_count += 1
+
+            wq = getattr(qmodule, "weight_quantizer", None)
+            if wq is not None and hasattr(wq, "s"):
+                weight = qmodule.weight.detach()
+                Qn, Qp = wq.Qn, wq.Qp
+                if getattr(wq, "per_channel", False) and weight.dim() >= 2:
+                    w_flat = weight.contiguous().view(weight.size(0), -1)
+                    w_min = w_flat.min(dim=1)[0]
+                    w_max = w_flat.max(dim=1)[0]
                 else:
-                    cur_s = (w_max / Qp).clamp(min=eps)
-            wq.s.data.copy_(cur_s.reshape(wq.s.shape).to(wq.s.device))
-            if hasattr(wq, "beta"):
-                cur_beta = w_min - cur_s * Qn
-                wq.beta.data.copy_(cur_beta.reshape(wq.beta.shape).to(wq.beta.device))
-            _set_quantizer_frozen(wq)
-            wq_count += 1
+                    w_min, w_max = weight.min(), weight.max()
+                if hasattr(wq, "beta"):
+                    cur_s = torch.clamp(w_max - w_min, min=eps) / (Qp - Qn)
+                else:
+                    if Qn < 0:
+                        cur_s = torch.maximum(w_max / Qp, w_min / Qn).clamp(min=eps)
+                    else:
+                        cur_s = (w_max / Qp).clamp(min=eps)
+                wq.s.data.copy_(cur_s.reshape(wq.s.shape).to(wq.s.device))
+                if hasattr(wq, "beta"):
+                    cur_beta = w_min - cur_s * Qn
+                    wq.beta.data.copy_(cur_beta.reshape(wq.beta.shape).to(wq.beta.device))
+                _set_quantizer_frozen(wq)
+                wq_count += 1
+            continue
+
+        # ── QuantAdd: activation_quantizer0 (A), activation_quantizer1 (C) ──
+        if cls_name == 'QuantAdd':
+            for i, attr in enumerate(('activation_quantizer0', 'activation_quantizer1')):
+                if i < len(ranges):
+                    q = getattr(qmodule, attr, None)
+                    if q is not None and _apply_minmax_to_quantizer(q, ranges[i][0], ranges[i][1], eps):
+                        eltwise_count += 1
+            continue
+
+        # ── QuantMaxPool: activation_quantizer (单输入) ──
+        if cls_name == 'QuantMaxPool':
+            aq = getattr(qmodule, "activation_quantizer", None)
+            if aq is not None and len(ranges) >= 1:
+                if _apply_minmax_to_quantizer(aq, ranges[0][0], ranges[0][1], eps):
+                    eltwise_count += 1
+            continue
+
+        # ── QuantConcat: activation_quantizer0/1 ──
+        if cls_name == 'QuantConcat':
+            for i, attr in enumerate(('activation_quantizer0', 'activation_quantizer1')):
+                if i < len(ranges):
+                    q = getattr(qmodule, attr, None)
+                    if q is not None and _apply_minmax_to_quantizer(q, ranges[i][0], ranges[i][1], eps):
+                        eltwise_count += 1
+            continue
+
+        # ── 其他量化模块：通用 activation_quantizer ──
+        aq = getattr(qmodule, "activation_quantizer", None)
+        if aq is not None and len(ranges) >= 1:
+            if _apply_minmax_to_quantizer(aq, ranges[0][0], ranges[0][1], eps):
+                aq_count += 1
 
     print(f"[Calib] Initialized {aq_count} activation + {wq_count} weight "
-          f"quantizers from float ranges")
+          f"+ {eltwise_count} eltwise quantizers from float ranges")
     return aq_count, wq_count
 
 
@@ -1385,14 +1490,29 @@ def _safety_net_calibrate(quant_model, calibration_loader, calibration_batches=2
     for h in hooks:
         h.remove()
 
-    # 按记录的运行 min/max 统一赋值
+    # 按记录的运行 min/max 统一赋值 —— 只覆盖未初始化的
     quant_modules = dict(quant_model.named_modules())
     assigned = 0
+    skipped = 0
+
+    def _is_already_initialized(q):
+        """LSQ 家族 init_state=FROZEN; minmax/pact init=1 (已初始化标记)。"""
+        ist = getattr(q, 'init_state', None)
+        if isinstance(ist, torch.Tensor) and int(ist.flatten()[0]) >= quant_pkg.INIT_STATE_FROZEN:
+            return True
+        if isinstance(ist, int) and ist >= quant_pkg.INIT_STATE_FROZEN:
+            return True
+        if hasattr(q, 'init') and type(q.init) is int and q.init == 1:
+            return True
+        return False
 
     def _assign_recorded(q, mn, mx):
+        # 已由 float 范围初始化 → 跳过（不要覆盖更准确的 float 范围）
+        if _is_already_initialized(q):
+            return 'skip'
         # minmax 后端已在安全网前向中按原生 percentile 机制自收集，保留其结果
         if hasattr(q, "r_min"):
-            return False
+            return 'skip'
         return _apply_minmax_to_quantizer(q, mn, mx)
 
     for name, slot in records.items():
@@ -1402,23 +1522,31 @@ def _safety_net_calibrate(quant_model, calibration_loader, calibration_batches=2
         qlist = getattr(module, "quantizers", None)
         if qlist is not None and isinstance(qlist, nn.ModuleList):
             for i, q in enumerate(qlist):
-                if i < len(slot) and _assign_recorded(q, slot[i][0], slot[i][1]):
-                    assigned += 1
+                if i >= len(slot): continue
+                r = _assign_recorded(q, slot[i][0], slot[i][1])
+                if r == 'skip': skipped += 1
+                elif r: assigned += 1
             continue
         q0 = getattr(module, "activation_quantizer0", None)
         if q0 is not None:
-            if len(slot) >= 1 and _assign_recorded(q0, slot[0][0], slot[0][1]):
-                assigned += 1
+            if len(slot) >= 1:
+                r = _assign_recorded(q0, slot[0][0], slot[0][1])
+                if r == 'skip': skipped += 1
+                elif r: assigned += 1
             q1 = getattr(module, "activation_quantizer1", None)
-            if q1 is not None and len(slot) >= 2 and _assign_recorded(q1, slot[1][0], slot[1][1]):
-                assigned += 1
+            if q1 is not None and len(slot) >= 2:
+                r = _assign_recorded(q1, slot[1][0], slot[1][1])
+                if r == 'skip': skipped += 1
+                elif r: assigned += 1
             continue
         aq = getattr(module, "activation_quantizer", None)
-        if aq is not None and len(slot) >= 1 and _assign_recorded(aq, slot[0][0], slot[0][1]):
-            assigned += 1
+        if aq is not None and len(slot) >= 1:
+            r = _assign_recorded(aq, slot[0][0], slot[0][1])
+            if r == 'skip': skipped += 1
+            elif r: assigned += 1
 
     print(f"[Calib] Safety net: recorded {len(records)} eltwise/cat/pool ops, "
-          f"assigned {assigned} quantizers from running min/max")
+          f"assigned {assigned} / skipped {skipped} quantizers")
 
 
 @torch.no_grad()
