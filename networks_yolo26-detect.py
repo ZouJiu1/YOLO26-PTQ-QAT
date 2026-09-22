@@ -690,10 +690,10 @@ def _match_predictions(pred_labels, pred_bboxes, gt_labels, gt_bboxes, iou_vecto
 
 @torch.no_grad()
 def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres=0.001, iou_thres=0.7):
-    """在 coco128 验证集上计算 mAP50 / mAP50-95（NMS + ap_per_class，与官方一致）。"""
+    """在验证集上计算 mAP50 / mAP50-95（NMS + ap_per_class，与官方一致）。"""
     model.eval()
     stats_conf, stats_pcls, stats_tcls, stats_tp = [], [], [], []
-    names = data["names"]
+    names = data.names if hasattr(data, 'names') else data["names"]
     num_images = len(val_loader.dataset)
     steps = max_batches or math.ceil(num_images / batch_size)
 
@@ -759,7 +759,23 @@ def load_checkpoint(model, path, return_meta=False):
     else:
         state_dict = checkpoint
         meta = {}
-    model.load_state_dict(state_dict)
+
+    # 过滤 shape mismatch（不同数据集 nc 变化时 Detect head）
+    model_sd = model.state_dict()
+    filtered = {k: v for k, v in state_dict.items()
+                if k in model_sd and model_sd[k].shape == v.shape}
+    if len(filtered) < len(state_dict):
+        skipped = [k for k, v in state_dict.items()
+                   if k in model_sd and model_sd[k].shape != v.shape]
+        print(f"[load_checkpoint] 跳过 {len(skipped)} 个 shape mismatch 参数")
+    if len(filtered) < len(model_sd):
+        missing = set(model_sd.keys()) - set(filtered.keys())
+        # 只打印非 QuantCat 的 missing（QuantCat init_state=0 是正常的）
+        meaningful = [k for k in missing if 'QuantCat' not in k or 'init_state' not in k]
+        if meaningful:
+            print(f"[load_checkpoint] missing {len(meaningful)} 参数 (可能是 QuantCat init)")
+
+    model.load_state_dict(filtered, strict=False)
     return (model, meta) if return_meta else model
 
 
@@ -772,7 +788,7 @@ def save_checkpoint(model, path, **metadata):
 
 
 def load_pretrained(model, path=None, scale=DEFAULT_SCALE):
-    """加载官方 yolo26{scale}.pt 权重；单头模型会自动跳过 one2one_* 双头权重。
+    """加载官方 yolo26{scale}.pt 权重；自动跳过 one2one_* 双头权重和 shape mismatch（nc 变化）。
 
     仓库仅随附 yolo26n.pt；s/m/l/x 缺失时跳过加载，模型随机初始化从头训练。
     """
@@ -783,14 +799,22 @@ def load_pretrained(model, path=None, scale=DEFAULT_SCALE):
         return model
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     state_dict = checkpoint["model"].float().state_dict()
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    skipped = [k for k in unexpected if "one2one_" in k]
-    other_unexpected = [k for k in unexpected if "one2one_" not in k]
-    if other_unexpected:
-        print(f"[Pretrain] 警告：{len(other_unexpected)} 个未识别权重未加载: {other_unexpected[:3]}")
-    print(f"[Pretrain] 已加载 {path}（跳过 {len(skipped)} 个 one2one 双头参数，缺失 {len(missing)} 个）")
-    if missing:
-        print(f"[Pretrain] 缺失参数: {missing[:5]}")
+
+    # 过滤 shape mismatch 的 key（COCO 80类 → VOC 20类 时 Detect head 分类层）
+    model_sd = model.state_dict()
+    filtered = {k: v for k, v in state_dict.items()
+                if k in model_sd and model_sd[k].shape == v.shape}
+    skipped_shape = [k for k, v in state_dict.items()
+                     if k in model_sd and model_sd[k].shape != v.shape]
+    missing_unexpected = set(model_sd.keys()) - set(filtered.keys())
+
+    model.load_state_dict(filtered, strict=False)
+    print(f"[Pretrain] 已加载 {path}")
+    print(f"  ✓ 成功加载: {len(filtered)} 参数")
+    if skipped_shape:
+        print(f"  ⚠️  跳过 shape mismatch: {len(skipped_shape)} 参数 (Detect head nc 变化)")
+    if missing_unexpected:
+        print(f"  ⚠️  missing/unexpected: {len(missing_unexpected)} 参数")
     return model
 
 
@@ -1743,7 +1767,11 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_class
     print(f"Device: {device}")
 
     float_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}.pth")
-    qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base_name(scale)}.pth")
+    # 优先 _best.pth（最新训练保存的 best），fallback 到 .pth
+    qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base_name(scale)}_best.pth")
+    if not os.path.exists(qat_checkpoint):
+        qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base_name(scale)}.pth")
+    ptq_checkpoint = os.path.join(MODEL_DIR, f"ptq_{tag}_{base_name(scale)}.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
     if not os.path.exists(qat_checkpoint):
@@ -1828,11 +1856,26 @@ def build_arg_parser():
     # 冒烟/快速验证用：每个 epoch / 评估最多跑多少个 batch，默认不限制（完整训练）
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
+    parser.add_argument(
+        "--data",
+        default=COCO128_YAML,
+        help="数据集 yaml 路径（默认 coco128.yaml；VOC 可用 ultralytics/ultralytics/cfg/datasets/VOC.yaml）",
+    )
     return parser
 
 
 if __name__ == "__main__":
     args = build_arg_parser().parse_args()
+
+    # 根据 --data yaml 动态覆盖全局 NUM_CLASSES 和 COCO128_YAML
+    COCO128_YAML = args.data  # 复用变量名；函数内部引用它
+    try:
+        _tmp = check_det_dataset(args.data)
+        NUM_CLASSES = len(_tmp["names"])
+    except Exception:
+        pass  # yaml 解析失败则保留默认 80
+    print(f"数据集: {args.data} | 类别数: {NUM_CLASSES}")
+
     scale = get_scale(args.model)
     print(f"Python: {sys.executable}")
     print(f"torch: {torch.__version__} | Device: {device}")

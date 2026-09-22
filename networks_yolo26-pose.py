@@ -398,7 +398,7 @@ def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres
     model.eval()
     stats_conf, stats_pcls, stats_tcls = [], [], []
     stats_tp_box, stats_tp_pose = [], []
-    names = data["names"]
+    names = data.names if hasattr(data, "names") else data["names"]
     num_images = len(val_loader.dataset)
     steps = max_batches or math.ceil(num_images / batch_size)
     sigma = OKS_SIGMA if KPT_SHAPE == [17, 3] else np.ones(NKPT) / NKPT
