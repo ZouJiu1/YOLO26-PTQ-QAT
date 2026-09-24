@@ -479,6 +479,31 @@ def export_onnx(float_model, onnx_path, opset=16):
             "logits": {0: "batch_size"},
         },
     )
+    # onnxsim 简化（若已安装）
+    try:
+        import onnx
+        from onnxsim import simplify as onnxsim_simplify
+
+        model = onnx.load(onnx_path)
+        model_simplified, check = onnxsim_simplify(model)
+        if check:
+            onnx.save(model_simplified, onnx_path)
+            print(f"      ONNX simplify 成功: {len(model.graph.node)} → {len(model_simplified.graph.node)} nodes")
+        else:
+            print("      [skip] ONNX simplify check 失败，保留原图")
+    except ImportError:
+        print("      [skip] 未安装 onnxsim，跳过 simplify")
+    except Exception as e:
+        print(f"      [skip] ONNX simplify 失败: {e}")
+
+
+def _try_export_onnx(model, onnx_path):
+    """训练保存 best checkpoint 时同步导出 ONNX；失败仅告警，绝不影响训练。"""
+    try:
+        export_onnx(model, onnx_path)
+        print(f"      ONNX 已同步导出: {onnx_path}")
+    except Exception as e:
+        print(f"      [warn] ONNX 导出失败（不影响训练）: {e}")
 
 
 def verify(float_model, quant_model, onnx_path, quant_params):
@@ -610,6 +635,7 @@ def float_train(batch_size=128, lr=1e-3, epochs=100, num_classes=10, num_workers
             best_epoch = epoch + 1
             best_meta = epoch_meta
             save_checkpoint(float_model, checkpoint_path, **best_meta)
+            _try_export_onnx(float_model, os.path.splitext(checkpoint_path)[0] + ".onnx")
 
         print(
             f"[Float] Epoch [{epoch + 1}/{epochs}] | "
@@ -774,6 +800,7 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, lr=1e-4, epo
             best_epoch = epoch + 1
             best_meta = epoch_meta
             save_checkpoint(qat_model, best_checkpoint, **best_meta)
+            _try_export_onnx(qat_model, os.path.splitext(best_checkpoint)[0] + ".onnx")
 
         print(
             f"[QAT-{tag}] Epoch [{epoch + 1}/{epochs}] | "

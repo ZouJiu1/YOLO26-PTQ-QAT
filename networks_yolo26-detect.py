@@ -137,9 +137,8 @@ QuantReLU = getattr(Q, 'QuantReLU', None)
 
 def set_quant_method(method):
     """切换量化后端（必须在构建 QuantYOLO26 之前调用）。"""
-    global Q, QUANT_METHOD, QuantSiLU, QuantSigmoid, QuantMatMul
-    global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantMaxPool, QuantSiLU, QuantSigmoid, QuantMatMul
-    global QuantSiLU, QuantSigmoid, QuantReLU
+    global Q, QUANT_METHOD
+    global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantMaxPool, QuantSiLU, QuantSigmoid, QuantReLU
 
     Q = quant_pkg.load_quant_backend(method)
     QUANT_METHOD = method
@@ -878,6 +877,34 @@ def export_onnx(float_model, onnx_path, opset=16):
         output_names=["preds"],
         dynamic_axes={"images": {0: "batch_size"}, "preds": {0: "batch_size"}},
     )
+    # onnxsim 简化（若已安装）
+    try:
+        import onnx
+        from onnxsim import simplify as onnxsim_simplify
+
+        model = onnx.load(onnx_path)
+        model_simplified, check = onnxsim_simplify(model)
+        if check:
+            onnx.save(model_simplified, onnx_path)
+            print(f"      ONNX simplify 成功: {len(model.graph.node)} → {len(model_simplified.graph.node)} nodes")
+        else:
+            print("      [skip] ONNX simplify check 失败，保留原图")
+    except ImportError:
+        print("      [skip] 未安装 onnxsim，跳过 simplify")
+    except Exception as e:
+        print(f"      [skip] ONNX simplify 失败: {e}")
+
+
+def _try_export_onnx(model, onnx_path):
+    """训练保存 best checkpoint 时同步导出 ONNX；失败仅告警，绝不影响训练。
+
+    导出后模型被置为 eval，由下一轮 train_one_epoch 的 model.train() 恢复。
+    """
+    try:
+        export_onnx(model, onnx_path)
+        print(f"      ONNX 已同步导出: {onnx_path}")
+    except Exception as e:
+        print(f"      [warn] ONNX 导出失败（不影响训练）: {e}")
 
 
 def verify(float_model, quant_model, onnx_path, quant_params):
@@ -1086,7 +1113,8 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch, epochs, nb, ema=
 
 
 def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num_workers=2,
-                max_train_batches=None, max_eval_batches=None, scale=DEFAULT_SCALE):
+                max_train_batches=None, max_eval_batches=None, scale=DEFAULT_SCALE,
+                resume=False):
     print(f"========== Float training ({model_name(scale)} / coco128) ==========")
     print(f"Device: {device}")
     if lr is None:
@@ -1112,13 +1140,28 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
     best_fitness = -1.0
     best_epoch = -1
     best_meta = {}
-    checkpoint_path = os.path.join(MODEL_DIR, f"{base_name(scale)}.pth")
+    # best checkpoint 加 _best 后缀，与 PTQ/QAT 命名一致
+    checkpoint_path = os.path.join(MODEL_DIR, f"{base_name(scale)}_best.pth")
     last_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}_last.pth")
 
-    for epoch in range(epochs):
+    # resume：从 _last.pth 恢复，接续训练
+    start_epoch = 0
+    if resume and os.path.exists(last_checkpoint):
+        print(f"[Float] Resume from {last_checkpoint}")
+        _, meta = load_checkpoint(float_model, last_checkpoint, return_meta=True)
+        ema.ema.load_state_dict(float_model.state_dict())
+        start_epoch = meta.get("epoch", 0)
+        best_fitness = meta.get("fitness", -1.0)
+        best_meta = meta
+        best_epoch = start_epoch
+        print(f"[Float] 从 epoch {start_epoch} 接续训练，当前 best mAP50={meta.get('map50', 0):.4f}")
+    elif resume:
+        print(f"[Float] Resume 开启但找不到 {last_checkpoint}，从头训练")
+
+    for epoch in range(start_epoch, epochs):
         if epoch == epochs - close_mosaic:
             print("[Float] 关闭 dataloader mosaic（最后 10 个 epoch）")
-            train_set.close_mosaic(copy(cfg))
+            train_set.close_mosaic(copy.copy(cfg))
             train_loader.reset()
 
         train_loss, (box_loss, cls_loss, l1_loss) = train_one_epoch(
@@ -1140,6 +1183,7 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
             "box_loss": float(box_loss),
             "cls_loss": float(cls_loss),
             "l1_loss": float(l1_loss),
+            "fitness": float(fitness),
             **metrics,
         }
         save_checkpoint(ema.ema, last_checkpoint, **epoch_meta)
@@ -1149,6 +1193,7 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
             best_epoch = epoch + 1
             best_meta = epoch_meta
             save_checkpoint(ema.ema, checkpoint_path, **best_meta)
+            _try_export_onnx(ema.ema, os.path.splitext(checkpoint_path)[0] + ".onnx")
 
         print(
             f"[Float] Epoch [{epoch + 1}/{epochs}] | loss:{train_loss:.4f} "
@@ -1625,7 +1670,10 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
     calibration_loader, data = get_dataloaders(batch_size, num_workers, calibration=True)
     _, val_loader, _ = get_dataloaders(batch_size, num_workers)
 
-    float_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}.pth")
+    # 优先 _best.pth（与 QAT 命名一致），fallback 到旧版无后缀 .pth
+    float_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}_best.pth")
+    if not os.path.exists(float_checkpoint):
+        float_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
 
@@ -1669,7 +1717,8 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
 
 def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epochs=20,
                  num_classes=NUM_CLASSES, num_workers=2,
-                 max_train_batches=None, max_eval_batches=None, scale=DEFAULT_SCALE):
+                 max_train_batches=None, max_eval_batches=None, scale=DEFAULT_SCALE,
+                 resume=False):
     set_quant_method(quant_method)
     tag = quant_method
     print(f"========== QAT training ({model_name(scale)} / {tag}) ==========")
@@ -1707,7 +1756,20 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
     best_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base_name(scale)}_best.pth")
     last_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base_name(scale)}_last.pth")
 
-    for epoch in range(epochs):
+    # resume：从 _last.pth 恢复，接续训练
+    start_epoch = 0
+    if resume and os.path.exists(last_checkpoint):
+        print(f"[QAT-{tag}] Resume from {last_checkpoint}")
+        _, meta = load_checkpoint(qat_model, last_checkpoint, return_meta=True)
+        start_epoch = meta.get("epoch", 0)
+        best_fitness = meta.get("fitness", -1.0)
+        best_meta = meta
+        best_epoch = start_epoch
+        print(f"[QAT-{tag}] 从 epoch {start_epoch} 接续训练，当前 best mAP50={meta.get('map50', 0):.4f}")
+    elif resume:
+        print(f"[QAT-{tag}] Resume 开启但找不到 {last_checkpoint}，从头训练")
+
+    for epoch in range(start_epoch, epochs):
         train_loss, (box_loss, cls_loss, l1_loss) = train_one_epoch(
             qat_model, train_loader, criterion, optimizer, epoch, epochs, nb,
             max_batches=max_train_batches,
@@ -1728,6 +1790,7 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
             "box_loss": float(box_loss),
             "cls_loss": float(cls_loss),
             "l1_loss": float(l1_loss),
+            "fitness": float(fitness),
             **metrics,
         }
         save_checkpoint(qat_model, last_checkpoint, **epoch_meta)
@@ -1737,6 +1800,7 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
             best_epoch = epoch + 1
             best_meta = epoch_meta
             save_checkpoint(qat_model, best_checkpoint, **best_meta)
+            _try_export_onnx(qat_model, os.path.splitext(best_checkpoint)[0] + ".onnx")
 
         print(
             f"[QAT-{tag}] Epoch [{epoch + 1}/{epochs}] | loss:{train_loss:.4f} "
@@ -1766,12 +1830,13 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_class
     print(f"========== Float vs QAT precision ({model_name(scale)} / coco128 / {tag}) ==========")
     print(f"Device: {device}")
 
-    float_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}.pth")
-    # 优先 _best.pth（最新训练保存的 best），fallback 到 .pth
+    # 优先 _best.pth，fallback 到无后缀
+    float_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}_best.pth")
+    if not os.path.exists(float_checkpoint):
+        float_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}.pth")
     qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base_name(scale)}_best.pth")
     if not os.path.exists(qat_checkpoint):
         qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base_name(scale)}.pth")
-    ptq_checkpoint = os.path.join(MODEL_DIR, f"ptq_{tag}_{base_name(scale)}.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
     if not os.path.exists(qat_checkpoint):
@@ -1861,6 +1926,8 @@ def build_arg_parser():
         default=COCO128_YAML,
         help="数据集 yaml 路径（默认 coco128.yaml；VOC 可用 ultralytics/ultralytics/cfg/datasets/VOC.yaml）",
     )
+    parser.add_argument("--resume", action="store_true",
+                        help="从 _last.pth checkpoint 接续训练")
     return parser
 
 
@@ -1899,6 +1966,7 @@ if __name__ == "__main__":
             max_train_batches=args.max_train_batches,
             max_eval_batches=args.max_eval_batches,
             scale=scale,
+            resume=args.resume,
         )
 
     if args.stage in ("all", "ptq"):
@@ -1923,6 +1991,7 @@ if __name__ == "__main__":
             max_train_batches=args.max_train_batches,
             max_eval_batches=args.max_eval_batches,
             scale=scale,
+            resume=args.resume,
         )
 
     if args.stage in ("all", "compare"):
