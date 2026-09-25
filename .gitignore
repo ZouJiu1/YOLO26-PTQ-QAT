@@ -7,6 +7,18 @@ ehthumbs.db
 __pycache__
 # Folder config file
 Desktop.ini
+dataset/coco8
+dataset/coco8-pose
+dataset/coco8-seg
+fvisualize
+*/fvisualize/*
+model/*/*/fvisualize
+dataset/depth8-png
+model
+dataset/detect
+dataset/dota8-multispectral
+dataset/pose
+dataset/seg
 # Recycle Bin used on file shares
 $RECYCLE.BIN/
 *.tar.gz
@@ -17,6 +29,8 @@ cifar-10-batches-py
 cifar-10-python.tar.gz
 model/*.pth
 model/*.json
+# auto-downloaded datasets (coco8 / depth8-png / dota8-multispectral ...) / 自动下载的数据集
+dataset/
 ultralytics
 *.log
 _smoke*

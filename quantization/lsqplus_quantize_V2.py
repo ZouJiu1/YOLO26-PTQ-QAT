@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
 from quantization.lsqquantize_V1 import Round
-from quantization.constants import INIT_STATE_FROZEN, INIT_STATE_UNINIT
+from quantization.constants import INIT_STATE_UNINIT
 
 class ALSQPlus(Function):
     @staticmethod
@@ -22,15 +22,15 @@ class ALSQPlus(Function):
         weight, alpha, beta = ctx.saved_tensors
         g, Qn, Qp = ctx.other
         q_w = (weight - beta) / alpha
-        smaller = (q_w < Qn).float() #bool值转浮点值，1.0或者0.0
-        bigger = (q_w > Qp).float() #bool值转浮点值，1.0或者0.0
-        between = 1.0 - smaller -bigger #得到位于量化区间的index
+        smaller = (q_w < Qn).float()  # bool 值转浮点值，1.0 或者 0.0 / cast bool to float, 1.0 or 0.0
+        bigger = (q_w > Qp).float()   # bool 值转浮点值，1.0 或者 0.0 / cast bool to float, 1.0 or 0.0
+        between = 1.0 - smaller -bigger  # 得到位于量化区间的 index / index of values within the quantization range
         grad_alpha = ((smaller * Qn + bigger * Qp + 
             between * Round.apply(q_w) - between * q_w)*grad_weight * g).sum().unsqueeze(dim=0)
         grad_beta = ((smaller + bigger) * grad_weight * g).sum().unsqueeze(dim=0)
-        #在量化区间之外的值都是常数，故导数也是0
+        # 在量化区间之外的值都是常数，故导数也是 0 / values outside the quantization range are constants, so their derivatives are 0
         grad_weight = between * grad_weight
-        #返回的梯度要和forward的参数对应起来
+        # 返回的梯度要和 forward 的参数对应起来 / returned gradients must correspond to forward parameters
         return grad_weight, grad_alpha,  None, None, None, grad_beta
 
 class WLSQPlus(Function):
@@ -67,9 +67,9 @@ class WLSQPlus(Function):
             q_w = q_w.contiguous().view(sizes)
         else:
             q_w = weight / alpha
-        smaller = (q_w < Qn).float() #bool值转浮点值，1.0或者0.0
-        bigger = (q_w > Qp).float() #bool值转浮点值，1.0或者0.0
-        between = 1.0 - smaller -bigger #得到位于量化区间的index
+        smaller = (q_w < Qn).float()  # bool 值转浮点值，1.0 或者 0.0 / cast bool to float, 1.0 or 0.0
+        bigger = (q_w > Qp).float()   # bool 值转浮点值，1.0 或者 0.0 / cast bool to float, 1.0 or 0.0
+        between = 1.0 - smaller -bigger  # 得到位于量化区间的 index / index of values within the quantization range
         if per_channel:
             grad_alpha = ((smaller * Qn + bigger * Qp + 
                 between * Round.apply(q_w) - between * q_w)*grad_weight * g)
@@ -77,7 +77,7 @@ class WLSQPlus(Function):
         else:
             grad_alpha = ((smaller * Qn + bigger * Qp + 
                 between * Round.apply(q_w) - between * q_w)*grad_weight * g).sum().unsqueeze(dim=0)
-        #在量化区间之外的值都是常数，故导数也是0
+        # 在量化区间之外的值都是常数，故导数也是 0 / values outside the quantization range are constants, so their derivatives are 0
         grad_weight = between * grad_weight
         return grad_weight, grad_alpha, None, None, None, None
 
@@ -91,26 +91,10 @@ def round_pass(x):
     y_grad = x
     return (y - y_grad).detach() + y_grad
 
-def get_percentile_min_max(input, lower_percentile, uppper_percentile, output_tensor):
-    batch_size = input.shape[0]
-    lower_index = round(batch_size * (1 - lower_percentile*0.01))
-    upper_index = round(batch_size * (1 - uppper_percentile*0.01))
-
-    upper_bound = torch.kthvalue(input, k=upper_index).values
-
-    if lower_percentile==0:
-        lower_bound = upper_bound * 0
-    else:
-        low_bound = -torch.kthvalue(-input, k=lower_index).values
-
-# def update_scale_betas():
-#     for m in model.modules():
-#         if isinstance(m, nn.)
-
-# A(特征)量化
+# A(特征)量化 / A(activation) quantization
 class LSQPlusActivationQuantizer(nn.Module):
     def __init__(self, a_bits, all_positive=False,batch_init = 20):
-        #activations 没有per-channel这个选项的
+        # activations 没有 per-channel 这个选项 / activations do not have the per-channel option
         super(LSQPlusActivationQuantizer, self).__init__()
         self.a_bits = a_bits
         self.all_positive = all_positive
@@ -127,10 +111,11 @@ class LSQPlusActivationQuantizer(nn.Module):
         self.beta = torch.nn.Parameter(torch.tensor([float(-1e-9)]), requires_grad=True)
         self.init_state = INIT_STATE_UNINIT
 
-    # 量化/反量化
+    # 量化/反量化 / quantize/dequantize
     def forward(self, activation):
         if not hasattr(self, "g"):
             # g 只依赖张量大小，载入 checkpoint 后 init_state 被冻结时也要可用
+            # / g depends only on tensor size; must be available even when init_state is frozen after checkpoint load
             self.g = 1.0/math.sqrt(activation.numel() * self.Qp)
         if self.init_state==INIT_STATE_UNINIT:
             x = activation.detach()
@@ -138,9 +123,12 @@ class LSQPlusActivationQuantizer(nn.Module):
             eps = torch.finfo(x.dtype).eps
             # eps 兜底：常量输入（max==min，例如 broadcast 的常量 eps 张量）
             # 不能给出 scale=0，否则量化时除 0 产生 NaN
+            # / eps fallback: constant input (max==min, e.g. broadcast constant tensor)
+            #   must not yield scale=0, otherwise division by zero during quantization produces NaN
             cur_s = torch.clamp(torch.max(x) - mina, min=eps)/(self.Qp-self.Qn)
             cur_beta = mina - cur_s*self.Qn
             # 用 copy_ 保持 s/beta 的 (1,) 形状，便于 state_dict 重载
+            # / use copy_ to preserve (1,) shape of s/beta for state_dict compatibility
             self.s.data.copy_(cur_s.to(self.s))
             self.beta.data.copy_(cur_beta.to(self.beta))
             self.init_state += 1
@@ -168,7 +156,7 @@ class LSQPlusActivationQuantizer(nn.Module):
             q_a = ALSQPlus.apply(activation, self.s, self.g, self.Qn, self.Qp, self.beta)
         return q_a
 
-# W(权重)量化
+# W(权重)量化 / W(weight) quantization
 class LSQPlusWeightQuantizer(nn.Module):
     def __init__(self, w_bits, all_positive=False, per_channel=False,batch_init = 20, num_channels=None):
         super(LSQPlusWeightQuantizer, self).__init__()
@@ -188,7 +176,7 @@ class LSQPlusWeightQuantizer(nn.Module):
         scale_shape = (num_channels,) if per_channel and num_channels is not None else (1,)
         self.s = torch.nn.Parameter(torch.ones(scale_shape), requires_grad=True)
 
-    # 量化/反量化
+    # 量化/反量化 / quantize/dequantize
     def forward(self, weight):
         '''
         For this work, each layer of weights and each layer of activations has a distinct step size, represented
@@ -231,7 +219,7 @@ batch of activations, respectively
 
 
         if self.w_bits == 32:
-            output = weight
+            return weight
         elif self.w_bits == 1:
             print('！Binary quantization is not supported ！')
             assert self.w_bits != 1
@@ -295,7 +283,8 @@ class QuantConvTranspose2d(nn.ConvTranspose2d):
                  all_positive=False, 
                  per_channel=False,
                  batch_init = 20):
-        # 注意: ConvTranspose2d的参数顺序为(..., output_padding, groups, bias, dilation, padding_mode)
+        # 注意: ConvTranspose2d 的参数顺序为 (..., output_padding, groups, bias, dilation, padding_mode)
+        # / Note: ConvTranspose2d parameter order is (..., output_padding, groups, bias, dilation, padding_mode)
         super(QuantConvTranspose2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, output_padding,
                                                    groups, bias, dilation, padding_mode)
         self.quant_inference = quant_inference
@@ -418,6 +407,7 @@ class QuantDiv(nn.Module):
             Q_A = self.activation_quantizer0(A)
             Q_C = self.activation_quantizer1(C)
             # 分母反量化网格可能恰好落在 0，钳到小正数防止 0/0 产生 NaN
+            # / Dequantized denominator grid may land exactly on 0; clamp to a small positive number to avoid 0/0 → NaN
             return Q_A / torch.clamp(Q_C, min=1e-6)
 
 class QuantConcat(nn.Module):
@@ -473,7 +463,9 @@ class QuantMaxPool(nn.Module):
                                             return_indices=self.return_indices, ceil_mode=self.ceil_mode)
 
 class QuantCat(nn.Module):
-    """对多个输入张量分别做激活伪量化后再 concat（每一路各持有一个激活量化器）。"""
+    """对多个输入张量分别做激活伪量化后再 concat（每一路各持有一个激活量化器）。
+    / Apply activation pseudo-quantization to each input tensor separately, then concat (each input has its own activation quantizer).
+    """
 
     def __init__(self, num_inputs, a_bits=8, batch_init=20):
         super().__init__()
@@ -491,7 +483,7 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8,
     for name, child in module.named_children():
         if isinstance(child, nn.Conv2d):
             layer_counter[0] += 1
-            if layer_counter[0] >= 1: #第一层也量化
+            if layer_counter[0] >= 1:  # 第一层也量化 / quantize the first layer too
                 if child.bias is not None:
                     quant_conv = QuantConv2d(child.in_channels, child.out_channels,
                                              child.kernel_size, stride=child.stride,
@@ -511,7 +503,7 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8,
                 module._modules[name] = quant_conv
         elif isinstance(child, nn.ConvTranspose2d):
             layer_counter[0] += 1
-            if layer_counter[0] >= 1: #第一层也量化
+            if layer_counter[0] >= 1:  # 第一层也量化 / quantize the first layer too
                 if child.bias is not None:
                     quant_conv_transpose = QuantConvTranspose2d(child.in_channels,
                                                                 child.out_channels,
@@ -546,7 +538,7 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8,
                 module._modules[name] = quant_conv_transpose
         elif isinstance(child, nn.Linear):
             layer_counter[0] += 1
-            if layer_counter[0] >= 1: #第一层也量化
+            if layer_counter[0] >= 1:  # 第一层也量化 / quantize the first layer too
                 if child.bias is not None:
                     quant_linear = QuantLinear(child.in_features, child.out_features,
                                                bias=True, a_bits=a_bits, w_bits=w_bits,
@@ -579,7 +571,9 @@ def prepare(model, inplace=False, a_bits=8, w_bits=8, quant_inference=False,
     return model
 
 class QuantSiLU(nn.Module):
-    """量化 SiLU (x * sigmoid(x)) — 单输入, 只有 input quantizer。"""
+    """量化 SiLU (x * sigmoid(x)) — 单输入, 只有 input quantizer。
+    / Quantized SiLU (x * sigmoid(x)) — single input, only input quantizer.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantSiLU, self).__init__()
@@ -596,7 +590,9 @@ class QuantSiLU(nn.Module):
 
 
 class QuantSigmoid(nn.Module):
-    """量化 Sigmoid — 单输入, 只有 input quantizer。"""
+    """量化 Sigmoid — 单输入, 只有 input quantizer。
+    / Quantized Sigmoid — single input, only input quantizer.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantSigmoid, self).__init__()
@@ -613,7 +609,9 @@ class QuantSigmoid(nn.Module):
 
 
 class QuantReLU(nn.Module):
-    """量化 ReLU — 单输入, 只有 input quantizer。all_positive=True 更合理。"""
+    """量化 ReLU — 单输入, 只有 input quantizer。all_positive=True 更合理。
+    / Quantized ReLU — single input, only input quantizer. all_positive=True is more appropriate.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=True,
                  per_channel=False, batch_init=20):
         super(QuantReLU, self).__init__()
@@ -630,7 +628,9 @@ class QuantReLU(nn.Module):
 
 
 class QuantSoftmax(nn.Module):
-    """量化 Softmax — 单输入, 只有 input quantizer。逐行量化/反量化后做 softmax。"""
+    """量化 Softmax — 单输入, 只有 input quantizer。逐行量化/反量化后做 softmax。
+    / Quantized Softmax — single input, only input quantizer. Softmax applied after row-wise quantize/dequantize.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantSoftmax, self).__init__()
@@ -645,7 +645,9 @@ class QuantSoftmax(nn.Module):
             return torch.softmax(self.activation_quantizer(x), dim=dim)
 
 class QuantMatMul(nn.Module):
-    """量化矩阵乘法 — 两个输入 (A, B)。"""
+    """量化矩阵乘法 — 两个输入 (A, B)。
+    / Quantized matrix multiplication — two inputs (A, B).
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantMatMul, self).__init__()

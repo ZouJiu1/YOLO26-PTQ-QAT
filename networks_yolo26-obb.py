@@ -1,20 +1,40 @@
-"""YOLO26-seg 实例分割网络的量化感知训练流程（coco128-seg，nc=80，尺度可选 n/s/m/l/x） / Quantization-aware training pipeline for YOLO26-seg instance segmentation network (coco128-seg, nc=80, scales selectable n/s/m/l/x).
+"""YOLO26 OBB 旋转框检测网络的 aLSQ+ 量化感知训练流程（dota8-multispectral，尺度可选 n/s/m/l/x） /
+aLSQ+ Quantization-Aware Training pipeline for YOLO26 OBB (oriented bounding box) network
+(dota8-multispectral, scales n/s/m/l/x optional).
 
 流程 / Pipeline:
-    float_train(lr=float_lr, epochs=float_epochs)   # 浮点训练 / float training（默认加载 / default load yolo26{scale}-seg.pt 预训练权重 / pretrained weights）
+    float_train(lr=float_lr, epochs=float_epochs)   # 浮点训练 / float training（默认加载 yolo26{scale}-obb.pt 预训练权重 / loads yolo26{scale}-obb.pt pretrained weights by default）
     PTQ_calibration()                               # 训练后量化校准 / post-training quantization calibration
     QAT_training(lr=qat_lr, epochs=qat_epochs)      # 量化感知训练 / quantization-aware training
-    compare_precision()                             # 浮点 vs QAT 的 box/mask mAP 对比 / box/mask mAP comparison between float and QAT
+    compare_precision()                             # 浮点 vs QAT 的 mAP 对比 / mAP comparison between float vs QAT
 
-模型尺度用 --model yolo26n|yolo26s|yolo26m|yolo26l|yolo26x 选择（默认 yolo26n） / Model scale selected via --model yolo26n|yolo26s|yolo26m|yolo26l|yolo26x (default yolo26n).
-backbone / neck（层 0-22）与 networks_yolo26-detect.py 完全一致，直接复用 / backbone/neck (layers 0-22) identical to networks_yolo26-detect.py, directly reused;
-分割头为 ultralytics yolo26-seg.yaml 的 Segment26（层 23）/ segmentation head is Segment26 from ultralytics yolo26-seg.yaml (layer 23):
-    cv2/cv3 检测框/分类支路与检测模型相同 / cv2/cv3 bounding box/classification branches same as detection model; 额外的 cv4 输出 32 个 mask 系数 / additional cv4 outputs 32 mask coefficients;
-    Proto26 融合 P3/P4/P5 多尺度特征 / Proto26 fuses P3/P4/P5 multi-scale features, 生成 (B,32,160,160) mask prototypes / generates (B,32,160,160) mask prototypes,
-    并带一条 semantic 辅助分割支路（仅训练时返回，用于 sem_loss） / with an auxiliary semantic segmentation branch (returned only during training, used for sem_loss).
-训练损失使用官方 v8SegmentationLoss（TaskAlignedAssigner + BCEDice）/ Training loss uses official v8SegmentationLoss (TaskAlignedAssigner + BCEDice);
-推理输出 (检测张量[xywh+scores+mask系数], protos) / Inference outputs (detection tensor [xywh+scores+mask coefficients], protos), 经 NMS + process_mask 得到实例掩码 / instance masks obtained via NMS + process_mask,
-按 mask_iou 在 10 个 IoU 阈值上计算 mask mAP / mask mAP computed via mask_iou at 10 IoU thresholds.
+模型尺度用 --model yolo26n|yolo26s|yolo26m|yolo26l|yolo26x 选择（默认 yolo26n） /
+Model scale selected via --model yolo26n|yolo26s|yolo26m|yolo26l|yolo26x (default yolo26n):
+通道按 make_divisible(min(c, max_ch)*width, 8)、重复次数按 max(round(n*depth), 1)
+缩放，与 ultralytics parse_model 完全一致 / channels scaled via make_divisible(min(c, max_ch)*width, 8),
+repeat counts via max(round(n*depth), 1), identical to ultralytics parse_model.
+本地缺失的官方预训练权重（任意尺度）会像 ultralytics 一样从 GitHub Releases 自动下载；仅离线或自定义路径缺失时才从头训练 /
+Missing official pretrained weights (any scale) are auto-downloaded from GitHub Releases like ultralytics;
+random init only happens when offline or a custom path is missing.
+
+网络结构与 ultralytics/cfg/models/26/yolo26-obb.yaml（scale=n）逐层对齐 /
+Network architecture aligned layer-by-layer with ultralytics/cfg/models/26/yolo26-obb.yaml (scale=n):
+backbone / neck（层 0-22）与 networks_yolo26-detect.py 完全一致，直接复用 /
+backbone/neck (layers 0-22) identical to networks_yolo26-detect.py, directly reused;
+检测头为 OBB26（层 23，继承 det.Detect，仅新增 cv4 角度分支） /
+head is OBB26 (layer 23, inherits det.Detect, only adds cv4 angle branch).
+Conv / C3k2(C3k) / SPPF / C2PSA(Attention) / PAN-FPN / OBB26(reg_max=1, ne=1 角度分支 / angle branch).
+说明 / Note: yolo26n-obb 原始 end2end 双头（one2many+one2one）这里只保留 one2many 单头 /
+original yolo26n-obb end2end dual-head (one2many+one2one), only one2many head kept here;
+损失仍使用官方 RotatedTaskAlignedAssigner(topk=10) 的 v8OBBLoss（box/cls/l1/angle 四项） /
+loss still uses official v8OBBLoss with RotatedTaskAlignedAssigner(topk=10) (box/cls/l1/angle);
+数据集为 dota8-multispectral（10 通道 TIFF，15 类，OBB 标注 xywhr），首层 Conv 输入通道随 /
+dataset is dota8-multispectral (10-channel TIFF, 15 classes, OBB xywhr labels); first Conv input
+data['channels'] 自适应（预训练首层为 3 通道，shape mismatch 自动跳过、重新初始化） /
+channels adapt to data['channels'] (pretrained first conv is 3-channel, skipped on shape mismatch);
+backbone / neck / OBB 检测头拓扑与官方完全一致，可直接加载 yolo26n-obb.pt 的权重 /
+backbone / neck / obb head topology fully consistent with official, can directly load yolo26n-obb.pt weights
+（one2one_* 双头权重会被跳过 / one2one_* dual-head weights are skipped）.
 """
 
 import argparse
@@ -30,7 +50,6 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 import quantization as quant_pkg
 
@@ -43,26 +62,24 @@ det_spec = importlib.util.spec_from_file_location(
 det = importlib.util.module_from_spec(det_spec)
 det_spec.loader.exec_module(det)
 
-# ultralytics 提供数据管道 / 损失 / 解码 / NMS / mask 处理 / mAP / ultralytics provides data pipeline / loss / decode / NMS / mask processing / mAP
+# ultralytics 提供数据管道 / 损失 / 解码 / NMS / mAP / ultralytics provides data pipeline / loss / decode / NMS / mAP
 from ultralytics.cfg import get_cfg
 from ultralytics.utils import DEFAULT_CFG
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.data import build_yolo_dataset, build_dataloader
-from ultralytics.utils.loss import v8SegmentationLoss
-from ultralytics.utils.tal import make_anchors, dist2bbox
-from ultralytics.utils.ops import xywh2xyxy, xyxy2xywh, process_mask
+from ultralytics.utils.loss import v8OBBLoss
+from ultralytics.utils.tal import make_anchors, dist2rbox
 from ultralytics.utils.nms import non_max_suppression
-from ultralytics.utils.metrics import ap_per_class, box_iou, mask_iou
-from ultralytics.utils.torch_utils import model_info
+from ultralytics.utils.metrics import ap_per_class, batch_probiou
 from ultralytics.utils.plotting import plot_images
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-_MODEL_DIR_BASE = os.path.join(BASE_DIR, "model", "yolo26-seg")
+_MODEL_DIR_BASE = os.path.join(BASE_DIR, "model", "yolo26-obb")
 MODEL_DIR = _MODEL_DIR_BASE
 
 
 def _model_dir_for(scale=None, quant_method=None):
-    """按网络名 + 尺度 + 量化后端返回产物目录。 / Return output directory by network name + scale + quantization backend."""
+    """按网络名 + 尺度 + 量化后端返回产物目录 / Return artifact directory by net name + scale + quant backend."""
     path = _MODEL_DIR_BASE
     if scale is not None:
         path = os.path.join(path, scale)
@@ -73,14 +90,12 @@ def _model_dir_for(scale=None, quant_method=None):
 ULTRA_DIR = os.path.join(BASE_DIR, "ultralytics", "ultralytics")
 # 默认官方数据集（首次运行自动下载到 dataset/；--data 可手动指定其他目录） /
 # Default official dataset (auto-downloaded to dataset/ on first run; --data for a manual dir)
-DATA_YAML = det.DEFAULT_DATA_YAML["seg"]
+DATA_YAML = det.DEFAULT_DATA_YAML["obb"]
+# 备选：RGB OBB 可改成 "dota8.yaml" / Alternative RGB OBB: use "dota8.yaml"
 
 IMGSZ = 640
-NUM_CLASSES = 80
-NM = 32          # mask 系数个数 / number of mask coefficients（官方 yolo26-seg.yaml 各尺度固定 32，不随 width 缩放 / official yolo26-seg.yaml fixed 32 for all scales, not scaled by width）
-# npr（mask 系数头隐层通道，yaml 基准 256）按尺度缩放 / npr (mask coefficient head hidden channel, yaml baseline 256) scales by scale:
-#   make_divisible(min(256, max_ch) * width, 8)（n→64 / s→128 / m→256 / l→256 / x→384），
-#   由 det.scaled_channels(256, scale) 计算（见 ultralytics/nn/tasks.py parse_model） / computed by det.scaled_channels(256, scale) (see ultralytics/nn/tasks.py parse_model).
+NUM_CLASSES = 15
+IN_CHANNELS = 10  # 多光谱输入通道数，main 中按 data['channels'] 覆盖 / multispectral input channels, overridden by data['channels'] in main
 STRIDES = (8, 16, 32)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -89,7 +104,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 量化后端可切换：dorefa / lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / pact / Quantization backend switchable: dorefa / lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / pact
 # backbone 组件从检测网络复用，因此切换时同步切换检测网络模块内绑定的后端算子 / Backbone components are reused from detection network, so bound backend ops in detection module must switch in sync.
 # ---------------------------------------------------------------------------
-DEFAULT_QUANT_METHOD = "lsqplus_v1"
+DEFAULT_QUANT_METHOD = det.DEFAULT_QUANT_METHOD
 QUANT_METHOD = DEFAULT_QUANT_METHOD
 Q = quant_pkg.load_quant_backend(DEFAULT_QUANT_METHOD)
 
@@ -97,17 +112,16 @@ QuantAdd = Q.QuantAdd
 QuantCat = Q.QuantCat
 QuantConcat = Q.QuantConcat
 QuantConv2d = Q.QuantConv2d
-QuantConvTranspose2d = Q.QuantConvTranspose2d
 QuantMaxPool = Q.QuantMaxPool
 QuantSiLU = getattr(Q, 'QuantSiLU', None)
 QuantSigmoid = getattr(Q, 'QuantSigmoid', None)
-QuantMatMul = getattr(Q, 'QuantMatMul', None)
+QuantReLU = getattr(Q, 'QuantReLU', None)
 
 
 def set_quant_method(method):
-    """切换量化后端（必须在构建 QuantYOLO26Seg 之前调用）。 / Switch quantization backend (must be called before constructing QuantYOLO26Seg)."""
+    """切换量化后端（必须在构建 QuantYOLO26OBB 之前调用）。 / Switch quantization backend (must be called before constructing QuantYOLO26OBB)."""
     global Q, QUANT_METHOD
-    global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantConvTranspose2d, QuantMaxPool, QuantSiLU, QuantSigmoid, QuantMatMul
+    global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantMaxPool, QuantSiLU, QuantSigmoid, QuantReLU
 
     # 复用的 backbone/neck block 类内部引用的是 det 模块的全局算子，必须先同步切换 / Reused backbone/neck block classes reference global ops in det module; must switch in sync first
     det.set_quant_method(method)
@@ -117,167 +131,140 @@ def set_quant_method(method):
     QuantCat = det.QuantCat
     QuantConcat = det.QuantConcat
     QuantConv2d = det.QuantConv2d
-    QuantConvTranspose2d = Q.QuantConvTranspose2d
     QuantMaxPool = det.QuantMaxPool
     QuantSiLU = getattr(Q, 'QuantSiLU', None)
     QuantSigmoid = getattr(Q, 'QuantSigmoid', None)
-    QuantMatMul = getattr(Q, 'QuantMatMul', None)
+    QuantReLU = getattr(Q, 'QuantReLU', None)
     return Q
 
 
-# ============================== 分割头组件 / Segmentation Head Components ==============================
+# ============================== OBB 检测头组件 / OBB Head Components ==============================
 
+class OBBDetect(det.Detect):
+    """YOLO26 OBB 旋转框检测头（单 one2many 头，reg_max=1，分类支路为 DWConv，含 cv4 角度分支） /
+    YOLO26 OBB head (single one2many head, reg_max=1, class branch uses DWConv, with cv4 angle branch).
 
-class Proto26(nn.Module):
-    """复刻 ultralytics.nn.modules.block.Proto26（yolo26-seg, nm=32，npr 随尺度缩放）。 / Reproduces ultralytics.nn.modules.block.Proto26 (yolo26-seg, nm=32, npr scales with model scale).
+    继承 det.Detect（cv2 框 / cv3 分类支路完全复用），仅新增 cv4 角度分支并覆盖 self.no /
+    Inherits det.Detect (cv2 box / cv3 class branches fully reused), only adds cv4 angle branch and overrides self.no.
+    与官方 OBB26 一致：角度分支输出 raw logits（不做 sigmoid*pi 缩放） /
+    Same as official OBB26: angle branch outputs raw logits (no sigmoid*pi scaling).
 
-    多尺度融合：P3 特征 + 上采样的 P4/P5 细化特征（两次残差加法）， / Multi-scale fusion: P3 features + upsampled P4/P5 refined features (two residual additions),
-    经 feat_fuse 后送入 Proto（Conv3x3 -> ConvTranspose2d 上采样 2x -> Conv3x3 -> Conv1x1）， / After feat_fuse, fed into Proto (Conv3x3 -> ConvTranspose2d upsample 2x -> Conv3x3 -> Conv1x1),
-    输出 (B, nm=32, 160, 160) prototypes；训练时额外返回 semseg 的 (B, nc, 160, 160) 语义图。 / Outputs (B, nm=32, 160, 160) prototypes; during training additionally returns semseg's (B, nc, 160, 160) semantic map.
-
-    属性命名与官方完全一致（cv1/upsample/cv2/cv3/feat_refine/feat_fuse/semseg）， / Attribute naming matches official exactly (cv1/upsample/cv2/cv3/feat_refine/feat_fuse/semseg),
-    可直接加载 yolo26{scale}-seg.pt 中 model.23.proto.* 的权重。 / Can directly load weights from model.23.proto.* in yolo26{scale}-seg.pt.
+    训练时返回 dict(boxes/scores/angle/feats) 供 v8OBBLoss 使用 /
+    During training returns dict(boxes/scores/angle/feats) for v8OBBLoss;
+    评估时返回解码后的 (B, 4+nc+1, num_anchors) 张量（xywh 像素 + sigmoid 分数 + 角度弧度） /
+    During eval returns decoded (B, 4+nc+1, num_anchors) tensor (xywh pixels + sigmoid scores + angle rad).
     """
 
-    def __init__(self, ch=(64, 128, 256), npr=64, nm=NM, nc=NUM_CLASSES, quant=False):
-        super().__init__()
-        # Proto(npr, npr, nm): cv1/cv2 为 npr 通道，upsample 为 2x 转置卷积，cv3 输出 nm 通道 / Proto(npr, npr, nm): cv1/cv2 have npr channels, upsample is 2x transposed conv, cv3 outputs nm channels
-        self.cv1 = det.Conv(npr, npr, k=3, quant=quant)
-        if quant:
-            self.upsample = QuantConvTranspose2d(
-                npr, npr, kernel_size=2, stride=2, padding=0, bias=True,
-                a_bits=8, w_bits=8, per_channel=True,
-            )
-        else:
-            self.upsample = nn.ConvTranspose2d(npr, npr, 2, 2, 0, bias=True)
-        self.cv2 = det.Conv(npr, npr, k=3, quant=quant)
-        self.cv3 = det.Conv(npr, nm, quant=quant)
-
-        self.feat_refine = nn.ModuleList(det.Conv(x, ch[0], k=1, quant=quant) for x in ch[1:])
-        self.refine_adds = (
-            nn.ModuleList(det.QuantAdd(a_bits=8, quant_inference=True) for _ in ch[1:])
-            if quant else None
-        )
-        self.feat_fuse = det.Conv(ch[0], npr, k=3, quant=quant)
-        self.semseg = nn.Sequential(
-            det.Conv(ch[0], npr, k=3, quant=quant),
-            det.Conv(npr, npr, k=3, quant=quant),
-            QuantConv2d(npr, nc, 1, a_bits=8, w_bits=8, per_channel=True)
-            if quant else nn.Conv2d(npr, nc, 1),
-        )
-
-    def forward(self, x):
-        feat = x[0]
-        for i, refine in enumerate(self.feat_refine):
-            up_feat = F.interpolate(refine(x[i + 1]), scale_factor=2 ** (i + 1), mode="nearest")
-            if self.refine_adds is not None:
-                feat = self.refine_adds[i](feat, up_feat)
-            else:
-                feat = feat + up_feat
-        p = self.cv3(self.cv2(self.upsample(self.cv1(self.feat_fuse(feat)))))
-        if self.training:
-            semantic = self.semseg(feat)
-            return p, semantic
-        return p
-
-
-class Segment(det.Detect):
-    """YOLO26-seg 分割头（单 one2many 头，reg_max=1）。 / YOLO26-seg segmentation head (single one2many head, reg_max=1).
-
-    训练时返回 dict(boxes/scores/feats/mask_coefficient/proto) 供 v8SegmentationLoss 使用， / During training returns dict(boxes/scores/feats/mask_coefficient/proto) for v8SegmentationLoss,
-    proto 为 (protos, semantic) 二元组；评估时返回 (检测张量, protos)： / proto is a (protos, semantic) tuple; during evaluation returns (detection tensor, protos):
-    检测张量通道顺序 xywh(4) + sigmoid 分类(nc) + 原始 mask 系数(nm)，与 NMS 的 / Detection tensor channel order xywh(4) + sigmoid classification(nc) + raw mask coefficients(nm), consistent with NMS's
-    split((4, nc, extra)) / process_mask 约定一致。 / split((4, nc, extra)) / process_mask convention.
-    """
-
-    def __init__(self, nc=NUM_CLASSES, nm=NM, npr=64, reg_max=1, ch=(64, 128, 256), quant=False):
+    def __init__(self, nc=NUM_CLASSES, ne=1, reg_max=1, ch=(64, 128, 256), quant=False):
         super().__init__(nc=nc, reg_max=reg_max, ch=ch, quant=quant)
-        self.nm = nm
-        self.npr = npr
-        # 属性名必须为 proto，与官方 Segment26 / yolo26n-seg.pt 的 model.23.proto.* 对齐 / Attribute name must be proto, aligned with official Segment26 / model.23.proto.* in yolo26n-seg.pt
-        self.proto = Proto26(ch, npr, nm, nc, quant=quant)
-        c4 = max(ch[0] // 4, self.nm)
+        self.ne = ne  # 角度等额外参数个数 / number of extra params (angle)
+        self.no = nc + reg_max * 4 + ne  # 覆盖父类：加上角度通道 / override parent: add angle channels
+        c4 = max(ch[0] // 4, ne)  # 角度分支隐藏通道，与官方 OBB 一致 / angle branch hidden channels, same as official OBB
+        # cv4 角度分支：官方 OBB 为 Conv(x, c4, 3) + Conv(c4, c4, 3) + Conv2d(c4, ne, 1) /
+        # cv4 angle branch: official OBB uses Conv(x, c4, 3) + Conv(c4, c4, 3) + Conv2d(c4, ne, 1)
         self.cv4 = nn.ModuleList(
             nn.Sequential(
                 det.Conv(x, c4, 3, quant=quant),
                 det.Conv(c4, c4, 3, quant=quant),
-                QuantConv2d(c4, self.nm, 1, a_bits=8, w_bits=8, per_channel=True)
-                if quant else nn.Conv2d(c4, self.nm, 1),
+                QuantConv2d(c4, ne, 1, a_bits=8, w_bits=8, per_channel=True)
+                if quant else nn.Conv2d(c4, ne, 1),
             )
             for x in ch
         )
-        self._anchors = None
-        self._strides_tensor = None
-        self._feat_shape = None
+
+    def forward_head(self, x):
+        bs = x[0].shape[0]
+        boxes = torch.cat([self.cv2[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        scores = torch.cat([self.cv3[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+        # OBB26：角度为 raw logits，训练时由 v8OBBLoss 直接回归 /
+        # OBB26: raw angle logits, directly regressed by v8OBBLoss during training
+        angle = torch.cat([self.cv4[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], dim=-1)
+        return {"boxes": boxes, "scores": scores, "angle": angle, "feats": x}
 
     def forward(self, x):
-        bs = x[0].shape[0]
-        boxes = torch.cat(
-            [self.cv2[i](x[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1
-        )
-        scores = torch.cat(
-            [self.cv3[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1
-        )
-        mask_coefficient = torch.cat(
-            [self.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)], dim=-1
-        )
-
-        proto = self.proto(x)
+        preds = self.forward_head(x)
         if self.training:
-            return {
-                "boxes": boxes,
-                "scores": scores,
-                "feats": x,
-                "mask_coefficient": mask_coefficient,
-                "proto": proto,
-            }
-
+            return preds
+        # 推理：ltrb 距离 + 角度 -> 旋转框 xywh（×stride），分类 sigmoid /
+        # Inference: ltrb distances + angle -> rotated bbox xywh (×stride), class sigmoid
         shape = x[0].shape
         if self._feat_shape != shape:
             self._anchors, self._strides_tensor = (
                 a.transpose(0, 1) for a in make_anchors(x, self.stride, 0.5)
             )
             self._feat_shape = shape
-        dbox = dist2bbox(boxes, self._anchors.unsqueeze(0), xywh=True, dim=1)
+        dbox = dist2rbox(self.dfl(preds["boxes"]), preds["angle"], self._anchors.unsqueeze(0), dim=1)
         dbox = dbox * self._strides_tensor
-        det = torch.cat((dbox, scores.sigmoid(), mask_coefficient), 1)
-        # eval 时 Proto26 只返回 protos 张量 / In eval mode Proto26 only returns protos tensor
-        proto_p = proto[0] if isinstance(proto, tuple) else proto
-        return det, proto_p
+        # 输出 (B, 4+nc+1, N)：xywh 像素 + sigmoid 分数 + 角度（弧度，raw） /
+        # Output (B, 4+nc+1, N): xywh pixels + sigmoid scores + angle (radians, raw)
+        return torch.cat((dbox, preds["scores"].sigmoid(), preds["angle"]), 1)
 
 
 # ============================== 网络主体 / Network Body ==============================
 
 
-class YOLO26Seg(det.YOLO26):
-    """yolo26n-seg（scale=n）分割网络。quant=False 浮点模型，True 为伪量化模型。 / yolo26n-seg (scale=n) segmentation network. quant=False float model, True fake-quantized model.
+class YOLO26OBB(det.YOLO26):
+    """YOLO26 OBB 旋转框检测网络（scale 可选 n/s/m/l/x） / YOLO26 OBB detection network (scale n/s/m/l/x optional).
+    quant=False 浮点模型，True 为 aLSQ+ 伪量化模型 / quant=False for float model, True for aLSQ+ pseudo-quantized model.
 
-    层 0-22 与检测网络一致（直接构建后替换层 23），topology 编号/save 集合不变， / Layers 0-22 identical to detection network (built directly then replace layer 23); topology indices/save set unchanged,
-    因此 yolo26n-seg.pt 的 state_dict（model.0.* ~ model.23.*）可直接加载， / so state_dict of yolo26n-seg.pt (model.0.* ~ model.23.*) can be loaded directly,
+    层 0-22 与检测网络一致（直接构建后替换层 23 为 OBBDetect），topology 编号/save 集合不变， /
+    Layers 0-22 identical to detection network (built directly then replace layer 23 with OBBDetect); topology indices/save set unchanged,
+    因此 yolo26{scale}-obb.pt 的 state_dict（model.0.* ~ model.23.*）可直接加载， /
+    so state_dict of yolo26{scale}-obb.pt (model.0.* ~ model.23.*) can be loaded directly,
     end2end 双头 one2one_* 参数被跳过。 / end2end dual-head one2one_* parameters are skipped.
     """
 
-    def __init__(self, nc=NUM_CLASSES, quant=False, scale=det.DEFAULT_SCALE):
-        # 先构建检测网络得到完整的 0-22 backbone/neck，再把层 23 的 Detect 换成 Segment / First build detection network to get complete 0-22 backbone/neck, then replace layer 23's Detect with Segment
+    def __init__(self, nc=NUM_CLASSES, quant=False, scale=det.DEFAULT_SCALE, ch_in=None):
+        # ch_in=None 时读全局 IN_CHANNELS（main 会按 data['channels'] 覆盖）；多光谱为 10 /
+        # ch_in=None reads global IN_CHANNELS (main overrides per data['channels']); 10 for multispectral
+        self.ch_in = ch_in if ch_in is not None else IN_CHANNELS
+        # 先构建检测网络得到完整的 0-22 backbone/neck，再把层 23 的 Detect 换成 OBBDetect /
+        # First build detection network to get complete 0-22 backbone/neck, then replace layer 23's Detect with OBBDetect
         super().__init__(nc=nc, quant=quant, scale=scale)
-        head = Segment(
-            nc=nc, nm=NM, npr=det.scaled_channels(256, scale),
-            reg_max=1, ch=det.detect_head_channels(scale), quant=quant,
-        )
+        head = OBBDetect(nc=nc, ne=1, reg_max=1, ch=det.detect_head_channels(scale), quant=quant)
         det._tag(head, 23, [16, 19, 22])
         self.model[-1] = head
+        # 多光谱输入通道数 != 3 时替换首层 Conv（detect 默认按 RGB 3 通道构建） /
+        # Replace first Conv when input channels != 3 (detect builds RGB 3-channel by default)
+        if self.ch_in != 3:
+            c0 = self.model[0].conv.out_channels
+            self.model[0] = det.Conv(self.ch_in, c0, 3, 2, quant=quant)
+            det._tag(self.model[0], 0, -1)
+        self.yaml_file = f"{det.base_name(self.scale, 'obb')}.yaml"  # 供官方 model_info 打印模型名 / for official model_info to print model name
         self._register_quantizer_buffers()
-        self._initialize_head()
+        self._initialize_head()  # 换了头（可能还有首层），需重新推算 stride / 初始化偏置 / head (and maybe first conv) replaced: re-infer strides / re-init bias
+
+    def _initialize_head(self):
+        """用一次 dummy 前向推算 stride 并初始化检测头偏置（官方做法） /
+        Use one dummy forward to infer strides and init head bias (official approach).
+
+        dummy 输入通道数取当前首层 Conv 的 in_channels（父类构建期 3 通道、换首层后为多光谱通道）， /
+        dummy input channel count follows current first Conv's in_channels (3 during parent build, multispectral after swap);
+        不能用全零！LSQ v1 的 activation_quantizer 用全零初始化 s=0，之后 torch.div(x, 0) → NaN /
+        must NOT be all zeros! LSQ v1 activation_quantizer initializes s=0 with all-zeros, causing torch.div(x,0) → NaN.
+        用 randn 让每个 quantizer 得到合理的初始 s / Use randn so each quantizer gets a reasonable initial s.
+        """
+        was_training = self.training
+        self.eval()
+        with torch.no_grad():
+            dummy = torch.randn(1, self.model[0].conv.in_channels, IMGSZ, IMGSZ) * 0.1  # 小随机噪声，避免全零 / small random noise, avoid all zeros
+            feats = self._forward_features(dummy)
+            head = self.model[-1]
+            head.stride = torch.tensor([IMGSZ / f.shape[-2] for f in feats])
+            head.bias_init()
+            head._feat_shape = None
+        if was_training:
+            self.train()
 
 
-class FloatYOLO26Seg(YOLO26Seg):
-    def __init__(self, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
-        super().__init__(nc=nc, quant=False, scale=scale)
+class FloatYOLO26OBB(YOLO26OBB):
+    def __init__(self, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE, ch_in=None):
+        super().__init__(nc=nc, quant=False, scale=scale, ch_in=ch_in)
 
 
-class QuantYOLO26Seg(YOLO26Seg):
-    def __init__(self, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
-        super().__init__(nc=nc, quant=True, scale=scale)
+class QuantYOLO26OBB(YOLO26OBB):
+    def __init__(self, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE, ch_in=None):
+        super().__init__(nc=nc, quant=True, scale=scale, ch_in=ch_in)
 
 
 # ============================== 数据 / 损失 / 评估 / Data / Loss / Evaluation ==============================
@@ -286,12 +273,20 @@ class QuantYOLO26Seg(YOLO26Seg):
 def _make_cfg(num_workers):
     cfg = get_cfg(DEFAULT_CFG)
     cfg.imgsz = IMGSZ
-    cfg.task = "segment"  # YOLODataset 据此生成 polygon -> bitmap masks / sem_masks / YOLODataset generates polygon -> bitmap masks / sem_masks accordingly
+    cfg.task = "obb"  # OBB 旋转框任务 / OBB oriented bounding box task
     cfg.workers = num_workers
     return cfg
 
 
 def _build_loaders(batch_size, num_workers, data, calibration=False):
+    """构建 dataloader；train 模式额外返回 cfg / train_set（close_mosaic 需要引用） /
+    Build dataloader; train mode additionally returns cfg / train_set (required by close_mosaic).
+
+    train：640x640 + mosaic/翻转等增强；val：rect letterbox；
+    calibration：无增强的 640x640 letterbox /
+    train: 640x640 + mosaic/flip etc. augmentations; val: rect letterbox;
+    calibration: no-aug 640x640 letterbox.
+    """
     cfg = _make_cfg(num_workers)
     if calibration:
         dataset = build_yolo_dataset(cfg, data["val"], batch_size, data, mode="val", rect=False)
@@ -311,8 +306,8 @@ def _build_loaders(batch_size, num_workers, data, calibration=False):
 
 
 def get_dataloaders(batch_size=8, num_workers=2, calibration=False):
-    """复用 ultralytics 官方 coco128-seg 数据管道（含 masks / sem_masks）。 / Reuse ultralytics official coco128-seg data pipeline (includes masks / sem_masks)."""
-    data = det.get_data_dict(DATA_YAML, "seg")
+    """复用 ultralytics 官方 dota8-multispectral 数据管道 / Reuse ultralytics official dota8-multispectral data pipeline."""
+    data = det.get_data_dict(DATA_YAML, "obb")
     if calibration:
         return _build_loaders(batch_size, num_workers, data, calibration=True), data
     train_loader, val_loader, _, _ = _build_loaders(batch_size, num_workers, data)
@@ -320,13 +315,13 @@ def get_dataloaders(batch_size=8, num_workers=2, calibration=False):
 
 
 class _LossShim:
-    """v8SegmentationLoss 只需要 model.args / model.model[-1] / model.parameters()。 / v8SegmentationLoss only needs model.args / model.model[-1] / model.parameters()."""
+    """v8OBBLoss 只需要 model.args / model.model[-1] / model.parameters() /
+    v8OBBLoss only needs model.args / model.model[-1] / model.parameters()."""
 
-    def __init__(self, segment_head, epochs):
-        self.args = SimpleNamespace(
-            box=7.5, cls=0.5, dfl=1.5, epochs=epochs, overlap_mask=True
-        )
-        self.model = [None] * 23 + [segment_head]
+    def __init__(self, detect_head, epochs):
+        # angle=1.0：v8OBBLoss 的角度损失增益 / angle=1.0: angle loss gain required by v8OBBLoss
+        self.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, angle=1.0, epochs=epochs)
+        self.model = [None] * 23 + [detect_head]
         self.class_weights = None
 
     def parameters(self):
@@ -334,15 +329,20 @@ class _LossShim:
 
 
 def build_criterion(model, epochs):
-    return v8SegmentationLoss(_LossShim(model.model[-1], epochs), tal_topk=10)
+    return v8OBBLoss(_LossShim(model.model[-1], epochs), tal_topk=10)
 
 
 IOU_VECTOR = torch.linspace(0.5, 0.95, 10)
 
 
 def _match_predictions(pred_labels, pred_bboxes, gt_labels, gt_bboxes, iou_vector):
-    """复刻 ultralytics BaseValidator._process_batch：在 10 个 IoU 阈值上匹配预测与 GT。 / Reproduces ultralytics BaseValidator._process_batch: match predictions with GT at 10 IoU thresholds."""
-    iou = box_iou(gt_bboxes, pred_bboxes)
+    """复刻 ultralytics OBBValidator._process_batch：用 batch_probiou 在 10 个 IoU 阈值上匹配旋转框 /
+    Replicate ultralytics OBBValidator._process_batch: match rotated boxes at 10 IoU thresholds with batch_probiou.
+
+    pred_bboxes / gt_bboxes 均为 xywhr（5 列，像素单位，角度弧度） /
+    both pred_bboxes and gt_bboxes are xywhr (5 cols, pixel units, angle in radians).
+    """
+    iou = batch_probiou(gt_bboxes, pred_bboxes)
     correct = torch.zeros(pred_bboxes.shape[0], iou_vector.numel(), dtype=torch.bool)
     correct_class = gt_labels[:, None] == pred_labels[None, :]
     for i, threshold in enumerate(iou_vector):
@@ -360,42 +360,20 @@ def _match_predictions(pred_labels, pred_bboxes, gt_labels, gt_bboxes, iou_vecto
     return correct
 
 
-def _match_masks(pred_labels, pred_masks, gt_labels, gt_masks, iou_vector):
-    """与框匹配同构，但 IoU 用 mask_iou（pred_masks/gt_masks 均已二值化）。 / Structurally same as box matching, but IoU uses mask_iou (pred_masks/gt_masks are both binarized)."""
-    # mask_iou 只接受二维 (N, H*W)，先拉平 / mask_iou only accepts 2D (N, H*W), flatten first
-    n_gt, n_pred = gt_masks.shape[0], pred_masks.shape[0]
-    gt_flat = gt_masks.reshape(n_gt, -1).float()
-    pred_flat = pred_masks.reshape(n_pred, -1).float()
-    iou = mask_iou(gt_flat, pred_flat)
-    correct = torch.zeros(pred_masks.shape[0], iou_vector.numel(), dtype=torch.bool)
-    correct_class = gt_labels[:, None] == pred_labels[None, :]
-    for i, threshold in enumerate(iou_vector):
-        matches_idx = torch.where((iou >= threshold) & correct_class)
-        if matches_idx[0].shape[0] == 0:
-            continue
-        matches = torch.cat(
-            (torch.stack(matches_idx, 1), iou[matches_idx[0], matches_idx[1]][:, None]), 1
-        ).cpu().numpy()
-        if matches_idx[0].shape[0] > 1:
-            matches = matches[matches[:, 2].argsort()[::-1]]
-            matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-            matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-        correct[matches[:, 1].astype(int), i] = True
-    return correct
-
-
-def _maybe_visualize(batch, predictions, protos, names, viz_dir, viz_prefix, viz_state):
-    """用 ultralytics 官方 plot_images 保存本批的 GT 拼图与预测拼图（含分割掩码，val_batch 风格） /
-    Use official ultralytics plot_images to save GT and prediction mosaics of this batch (with seg masks, val_batch style).
+def _maybe_visualize(batch, predictions, names, viz_dir, viz_prefix, viz_state):
+    """用 ultralytics 官方 plot_images 保存本批的 GT 拼图与预测拼图（val_batch 风格，与官方验证器一致） /
+    Use official ultralytics plot_images to save GT and prediction mosaics of this batch (val_batch style, same as official validators).
 
     viz_state 跨 batch 记录已保存图片数 / viz_state tracks saved image count across batches.
+    OBB：bboxes 为 xywhr（5 列），plot_images 自动检测并画旋转框 /
+    OBB: bboxes are xywhr (5 cols), plot_images auto-detects and draws rotated boxes;
+    多光谱图像自动截取前 3 通道显示 / multispectral images auto-cropped to first 3 channels.
     """
     os.makedirs(viz_dir, exist_ok=True)
     bs = batch["img"].shape[0]
     bi = viz_state["batch"]
-    image_size = tuple(batch["img"].shape[2:])
-    # GT 拼图（labels）：cls + 归一化 xywh 框 + batch_idx，与官方 plot_val_samples 一致 /
-    # GT mosaic (labels): cls + normalized xywh boxes + batch_idx, same as official plot_val_samples
+    # GT 拼图（labels）：cls + 归一化 xywhr 框 + batch_idx，与官方 plot_val_samples 一致 /
+    # GT mosaic (labels): cls + normalized xywhr boxes + batch_idx, same as official plot_val_samples
     plot_images(
         labels={
             "cls": batch["cls"].squeeze(-1),
@@ -408,22 +386,19 @@ def _maybe_visualize(batch, predictions, protos, names, viz_dir, viz_prefix, viz
         names=names,
         threaded=False,  # 训练循环内同步执行，避免线程堆积 / run synchronously inside training loop to avoid thread pile-up
     )
-    # 预测拼图（preds）：与官方 SegmentationValidator.plot_predictions 一致，含 masks（process_mask upsample 到图像分辨率） /
-    # Prediction mosaic (preds): same as official SegmentationValidator.plot_predictions, incl. masks (process_mask upsampled to image size)
+    # 预测拼图（preds）：rotated NMS 输出为 [x,y,w,h,conf,cls,angle]，取 xywh+angle 拼成 xywhr /
+    # Prediction mosaic (preds): rotated NMS outputs [x,y,w,h,conf,cls,angle]; take xywh+angle as xywhr
     if any(p.shape[0] for p in predictions):
-        mask_list = [
-            process_mask(protos[i], p[:, 6:6 + NM], p[:, :4], shape=image_size, upsample=True)
-            for i, p in enumerate(predictions) if p.shape[0]
-        ]
         plot_images(
             labels={
                 "cls": torch.cat([p[:, 5] for p in predictions]),
                 "conf": torch.cat([p[:, 4] for p in predictions]),
-                "bboxes": xyxy2xywh(torch.cat([p[:, :4] for p in predictions])),
+                "bboxes": torch.cat(
+                    [torch.cat([p[:, :4], p[:, 6:7]], dim=-1) for p in predictions]
+                ),
                 "batch_idx": torch.cat(
                     [torch.full((p.shape[0],), i) for i, p in enumerate(predictions)]
                 ),
-                **({"masks": torch.cat(mask_list)} if mask_list else {}),
             },
             images=batch["img"],
             paths=batch.get("im_file"),
@@ -438,18 +413,14 @@ def _maybe_visualize(batch, predictions, protos, names, viz_dir, viz_prefix, viz
 @torch.no_grad()
 def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres=0.001,
              iou_thres=0.7, viz_dir=None, viz_max=30, viz_prefix="eval"):
-    """在 coco128-seg 验证集上同时计算 box mAP 与 mask mAP。若 viz_dir 不为空，
-    额外把前 viz_max 张验证图的 GT/预测拼图（含掩码）保存到 {viz_dir}/fvisualize/。 / Compute both box mAP and mask mAP on coco128-seg validation set.
-    If viz_dir is set, additionally save GT/prediction mosaics (with masks) of the first viz_max val images into {viz_dir}/fvisualize/.
-
-    与官方 SegmentationValidator 一致：NMS 后的 mask 系数与 protos 相乘， / Consistent with official SegmentationValidator: post-NMS mask coefficients multiplied with protos,
-    在 proto 分辨率（160x160，图像 /4）上二值化并按框裁剪；GT overlap 索引掩码 / Binarize at proto resolution (160x160, image /4) and crop by boxes; GT overlap index masks
-    拆分后插值到同一分辨率，用 mask_iou 在 10 个阈值上匹配。 / split then interpolated to same resolution, matched via mask_iou at 10 thresholds.
-    """
+    """在验证集上计算 OBB mAP50 / mAP50-95（rotated NMS + batch_probiou + ap_per_class，与官方 OBBValidator 一致）。
+    若 viz_dir 不为空，额外把前 viz_max 张验证图的 GT/预测拼图保存到 {viz_dir}/fvisualize/ /
+    Compute OBB mAP50 / mAP50-95 on val set (rotated NMS + batch_probiou + ap_per_class, consistent with official OBBValidator).
+    If viz_dir is set, additionally save GT/prediction mosaics of the first viz_max val images into {viz_dir}/fvisualize/."""
     model.eval()
-    stats_conf, stats_pcls, stats_tcls = [], [], []
-    stats_tp_box, stats_tp_mask = [], []
-    names = data.names if hasattr(data, "names") else data["names"]
+    stats_conf, stats_pcls, stats_tcls, stats_tp = [], [], [], []
+    names = data.names if hasattr(data, 'names') else data["names"]
+    nc = len(names)  # OBB 输出含角度列，NMS 必须显式传 nc / OBB output has angle column, NMS needs explicit nc
     num_images = len(val_loader.dataset)
     steps = max_batches or math.ceil(num_images / batch_size)
     # 可视化输出目录与计数器 / visualization output dir and counters
@@ -462,136 +433,117 @@ def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres
         if batch_index >= steps:
             break
         images = batch["img"].float().to(device) / 255.0
-        det, protos = model(images)
         predictions = non_max_suppression(
-            det,
+            model(images),
             conf_thres=conf_thres,
             iou_thres=iou_thres,
+            nc=nc,  # 显式类别数，否则角度列会被误当类别 / explicit nc, otherwise the angle column is mistaken for a class
             multi_label=True,
             agnostic=False,
             max_det=300,
-            nc=NUM_CLASSES,  # 显式指定，否则 nm=32 个 mask 系数会被当成类别 / Specify explicitly, otherwise nm=32 mask coefficients would be treated as classes
+            rotated=True,  # OBB 旋转框 NMS（fast_nms + batch_probiou） / rotated box NMS (fast_nms + batch_probiou)
         )
         image_size = batch["img"].shape[2:]
-        mh, mw = protos.shape[2:]
 
         # 每次评估都可视化前几批（失败仅告警，绝不影响评估） / visualize first batches on every evaluate (failure only warns, never breaks eval)
         if viz_out and viz_state["saved"] < viz_max:
             try:
-                _maybe_visualize(batch, predictions, protos, names, viz_out, viz_prefix, viz_state)
+                _maybe_visualize(batch, predictions, names, viz_out, viz_prefix, viz_state)
             except Exception as exc:
                 print(f"      [viz] 可视化保存失败（仅告警）: {exc} / visualization save failed (warn only): {exc}")
 
         for sample_index, pred in enumerate(predictions):
             index = batch["batch_idx"] == sample_index
             gt_cls = batch["cls"][index].squeeze(-1)
-            gt_boxes = batch["bboxes"][index]
-            nl = gt_cls.shape[0]
-            if nl:
-                gt_boxes = xywh2xyxy(gt_boxes) * torch.tensor(image_size)[[1, 0, 1, 0]]
+            gt_boxes = batch["bboxes"][index]  # 归一化 xywhr（5 列） / normalized xywhr (5 cols)
+            if gt_cls.shape[0]:
+                # 仅 xywh 乘图像尺寸，角度保持弧度不变 / scale only xywh to pixels, angle stays in radians
+                scale = torch.tensor(image_size)[[1, 0, 1, 0]]
+                gt_boxes = torch.cat([gt_boxes[:, :4] * scale, gt_boxes[:, 4:5]], dim=1)
 
-            # GT 实例掩码：overlap_mask=True 时每张图是一张 1..nl 的索引图 / GT instance masks: when overlap_mask=True each image is an index map 1..nl
-            gt_mask_i = batch["masks"][sample_index].float().to(device)  # (1, gh, gw)
-            if nl:
-                gt_masks = gt_mask_i == torch.arange(1, nl + 1, device=device).view(nl, 1, 1)
-                gt_masks = gt_masks.float()
-                if tuple(gt_masks.shape[-2:]) != (mh, mw):
-                    gt_masks = F.interpolate(
-                        gt_masks[None], (mh, mw), mode="bilinear", align_corners=False
-                    )[0].gt_(0.5)
-            else:
-                gt_masks = torch.zeros((0, mh, mw), device=device)
-
-            tp_box = torch.zeros(pred.shape[0], IOU_VECTOR.numel(), dtype=torch.bool)
-            tp_mask = torch.zeros(pred.shape[0], IOU_VECTOR.numel(), dtype=torch.bool)
-            if pred.shape[0] and nl:
-                tp_box = _match_predictions(
-                    pred[:, 5].cpu(), pred[:, :4].cpu(), gt_cls, gt_boxes, IOU_VECTOR
-                )
-                coeff = pred[:, 6:6 + NM]
-                pred_masks = process_mask(
-                    protos[sample_index], coeff, pred[:, :4], shape=tuple(image_size)
-                )  # (N, mh, mw) uint8
-                tp_mask = _match_masks(
-                    pred[:, 5].cpu(),
-                    pred_masks.float().cpu(),
-                    gt_cls,
-                    gt_masks.cpu(),
-                    IOU_VECTOR,
+            # rotated NMS 输出 [x,y,w,h,conf,cls,angle]，匹配时取 xywhr /
+            # rotated NMS outputs [x,y,w,h,conf,cls,angle]; take xywhr for matching
+            pred_boxes = torch.cat([pred[:, :4], pred[:, 6:7]], dim=1)
+            true_positive = torch.zeros(pred.shape[0], IOU_VECTOR.numel(), dtype=torch.bool)
+            if pred.shape[0] and gt_cls.shape[0]:
+                true_positive = _match_predictions(
+                    pred[:, 5].cpu(), pred_boxes.cpu(), gt_cls, gt_boxes, IOU_VECTOR
                 )
 
             stats_conf.append(pred[:, 4].cpu())
             stats_pcls.append(pred[:, 5].cpu())
-            stats_tp_box.append(tp_box)
-            stats_tp_mask.append(tp_mask)
+            stats_tp.append(true_positive)
             stats_tcls.append(gt_cls)
 
     conf_all = torch.cat(stats_conf).numpy()
     pred_cls_all = torch.cat(stats_pcls).numpy()
-    tcls_all = torch.cat(stats_tcls).numpy()
+    tp_all = torch.cat(stats_tp).numpy()
+    target_cls_all = torch.cat(stats_tcls).numpy()
 
-    def _ap(tp_all):
-        if conf_all.shape[0] == 0 or tcls_all.shape[0] == 0:
-            return 0.0, 0.0, 0.0, 0.0
-        _, _, precision, recall, _, ap, *_ = ap_per_class(
-            tp_all, conf_all, pred_cls_all, tcls_all, plot=False, names=names
-        )
-        return float(ap[:, 0].mean()), float(ap.mean()), float(precision.mean()), float(recall.mean())
+    if conf_all.shape[0] == 0 or target_cls_all.shape[0] == 0:
+        return {"map50": 0.0, "map": 0.0, "precision": 0.0, "recall": 0.0}
 
-    box_map50, box_map, box_p, box_r = _ap(torch.cat(stats_tp_box).numpy())
-    mask_map50, mask_map, mask_p, mask_r = _ap(torch.cat(stats_tp_mask).numpy())
+    _, _, precision, recall, _, ap, _, _, _, _, _, _ = ap_per_class(
+        tp_all, conf_all, pred_cls_all, target_cls_all, plot=False, names=names
+    )
     return {
-        "map50": box_map50, "map": box_map, "precision": box_p, "recall": box_r,
-        "mask_map50": mask_map50, "mask_map": mask_map,
-        "mask_precision": mask_p, "mask_recall": mask_r,
+        "map50": float(ap[:, 0].mean()),
+        "map": float(ap.mean()),
+        "precision": float(precision.mean()),
+        "recall": float(recall.mean()),
     }
 
 
-# ============================== checkpoint / 权重复制 / 导出 / Checkpoint / Weight Copy / Export ==============================
+# ============================== checkpoint / 权重复制 / 导出 / checkpoint / Weight Copy / Export ==============================
 
 
-def load_checkpoint(model, path, return_meta=False):
-    return det.load_checkpoint(model, path, return_meta=return_meta)
-
-
-def save_checkpoint(model, path, **metadata):
-    det.save_checkpoint(model, path, **metadata)
+load_checkpoint = det.load_checkpoint
+save_checkpoint = det.save_checkpoint
 
 
 def load_pretrained(model, path=None, scale=det.DEFAULT_SCALE):
-    """加载官方 yolo26{scale}-seg.pt；单头模型跳过 one2one_* 双头权重。 / Load official yolo26{scale}-seg.pt; single-head model skips one2one_* dual-head weights.
+    """加载官方 yolo26{scale}-obb.pt 权重；自动跳过 one2one_* 双头权重和 shape mismatch /
+    Load official yolo26{scale}-obb.pt weights; auto-skip one2one_* dual-head weights and shape mismatch.
 
-    本地缺失的官方权重（如 yolo26s-seg.pt）会按 ultralytics 方式自动下载；仅离线或自定义路径缺失时才从头训练。 /
-    Missing official weights (e.g. yolo26s-seg.pt) are auto-downloaded like ultralytics; random init only when offline or custom path missing.
+    本地缺失的官方权重（如 yolo26s-obb.pt）会按 ultralytics 方式自动下载；仅离线或自定义路径缺失时才从头训练 /
+    Missing official weights (e.g. yolo26s-obb.pt) are auto-downloaded like ultralytics; random init only when offline or custom path missing.
     """
     if path is None:
-        path = os.path.join(ULTRA_DIR, f"{det.base_name(scale, 'seg')}.pt")
+        path = os.path.join(ULTRA_DIR, f"{det.base_name(scale, 'obb')}.pt")
     # 官方权重名缺失时自动下载（同 ultralytics）；自定义路径缺失则从头训练 /
     # Auto-download official asset names (like ultralytics); missing custom path -> train from scratch
     path = det.resolve_pretrained_path(path)
     if path is None:
-        print(f"[Pretrain] [warn] 未找到预训练权重，{det.model_name(scale)}-seg 将从头训练")
+        print(f"[Pretrain] [warn] 未找到预训练权重，{det.model_name(scale)}-obb 将从头训练")
         return model
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     state_dict = checkpoint["model"].float().state_dict()
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    skipped = [k for k in unexpected if "one2one_" in k]
-    other_unexpected = [k for k in unexpected if "one2one_" not in k]
-    if other_unexpected:
-        print(f"[Pretrain] 警告：{len(other_unexpected)} 个未识别权重未加载: {other_unexpected[:3]}")
-    print(f"[Pretrain] 已加载 {path}（跳过 {len(skipped)} 个 one2one 双头参数，缺失 {len(missing)} 个）")
-    seg_missing = [k for k in missing if "proto" in k or "cv4" in k]
-    if seg_missing:
-        print(f"[Pretrain] 分割头缺失参数: {seg_missing[:5]}")
+
+    # 过滤 shape mismatch 的 key（首层 Conv 3→10 通道 / Detect head nc 变化等） /
+    # Filter shape mismatch keys (first Conv 3->10 channels / Detect head nc changes etc.)
+    model_sd = model.state_dict()
+    filtered = {k: v for k, v in state_dict.items()
+                if k in model_sd and model_sd[k].shape == v.shape}
+    skipped_shape = [k for k, v in state_dict.items()
+                     if k in model_sd and model_sd[k].shape != v.shape]
+    missing_unexpected = set(model_sd.keys()) - set(filtered.keys())
+
+    model.load_state_dict(filtered, strict=False)
+    print(f"[Pretrain] 已加载 {path}")
+    print(f"  ✓ 成功加载: {len(filtered)} 参数")
+    if skipped_shape:
+        print(f"  ⚠️  跳过 shape mismatch: {len(skipped_shape)} 参数 (首层 3→10 通道 / nc 变化)")
+    if missing_unexpected:
+        print(f"  ⚠️  missing/unexpected: {len(missing_unexpected)} 参数")
     return model
 
 
-def copy_float_to_quant(float_model, quant_model):
-    return det.copy_float_to_quant(float_model, quant_model)
+copy_float_to_quant = det.copy_float_to_quant
 
 
 def build_float_model(quant_model, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
-    """把量化模型的反量化权重灌进同结构的干净浮点模型（用于导出纯浮点 ONNX）。 / Inject dequantized weights from quantized model into a clean float model of same structure (for exporting pure-float ONNX)."""
+    """把量化模型的反量化权重灌进同结构的干净浮点模型（用于导出纯浮点 ONNX） /
+    Inject dequantized weights from quant model into a clean float model of same architecture (for pure-float ONNX export)."""
     quant_pkg.freeze_batch_init(quant_model)
     quant_model.eval()
 
@@ -600,7 +552,7 @@ def build_float_model(quant_model, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
         if quant_pkg.is_weight_quant_module(module):
             quant_state[f"{name}.weight"] = quant_pkg.dequantized_weight(module)
 
-    float_model = FloatYOLO26Seg(nc=nc, scale=scale)
+    float_model = FloatYOLO26OBB(nc=nc, scale=scale)
     float_state = float_model.state_dict()
     missing = []
     for key in float_state:
@@ -614,18 +566,27 @@ def build_float_model(quant_model, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
     return float_model
 
 
-def collect_quant_params(quant_model):
-    return quant_pkg.collect_quant_params(quant_model)
+collect_quant_params = quant_pkg.collect_quant_params
 
 
 def export_onnx(float_model, onnx_path, opset=16, imgsz=None):
-    """导出 ONNX，输入形状完全固定为 [1, 3, H, W]（无 dynamic_axes，图尺寸清晰可见） /
-    Export ONNX with fully static input shape [1, 3, H, W] (no dynamic_axes, graph dimensions clearly visible)."""
+    """导出 ONNX，输入形状完全固定为 [1, C, H, W]（无 dynamic_axes，图尺寸清晰可见） /
+    Export ONNX with fully static input shape [1, C, H, W] (no dynamic_axes, graph dimensions clearly visible).
+
+    C 取模型首层输入通道（多光谱为 10） / C equals model first-layer input channels (10 for multispectral).
+
+    Args / 参数:
+        float_model: 浮点模型（或已反量化的"干净"模型） / Float model (or dequantized "clean" model)
+        onnx_path: 输出 .onnx 路径 / Output .onnx path
+        opset: ONNX opset，默认 16 / ONNX opset, default 16
+        imgsz: 输入图像尺寸 H=W；默认模块级 IMGSZ(640) / Input image size H=W; default module-level IMGSZ (640)
+    """
     H = W = imgsz if imgsz is not None else IMGSZ
     os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
     float_model.eval()
     model_device = next(float_model.parameters()).device
-    dummy = torch.randn(1, 3, H, W, device=model_device)
+    ch_in = getattr(float_model, "ch_in", IN_CHANNELS)
+    dummy = torch.randn(1, ch_in, H, W, device=model_device)
     torch.onnx.export(
         float_model,
         dummy,
@@ -635,10 +596,10 @@ def export_onnx(float_model, onnx_path, opset=16, imgsz=None):
         do_constant_folding=True,
         dynamo=False,
         input_names=["images"],
-        output_names=["preds", "proto"],
-        # 无 dynamic_axes → 输入输出形状完全固定 / No dynamic_axes → all shapes fully fixed
+        output_names=["preds"],
+        # 无 dynamic_axes → 输入形状完全固定 [1, 3, H, W] / No dynamic_axes → input shape fully fixed [1, 3, H, W]
     )
-    # onnxsim 简化（若已安装） / onnxsim simplify (if installed)
+    # onnxsim 简化（若已安装） / onnxsim simplification (if installed)
     try:
         import onnx
         from onnxsim import simplify as onnxsim_simplify
@@ -657,9 +618,11 @@ def export_onnx(float_model, onnx_path, opset=16, imgsz=None):
 
 
 def _try_export_onnx(model, onnx_path):
-    """训练保存 best checkpoint 时同步导出 ONNX；失败仅告警，绝不影响训练。 / Export ONNX synchronously when saving best checkpoint during training; failure only warns, never affects training.
+    """训练保存 best checkpoint 时同步导出 ONNX；失败仅告警，绝不影响训练 /
+    Export ONNX synchronously when saving best checkpoint during training; failure only warns, never affects training.
 
-    导出后模型被置为 eval，由下一轮 train_one_epoch 的 model.train() 恢复。 / After export model is set to eval, restored by model.train() in next round of train_one_epoch.
+    导出后模型被置为 eval，由下一轮 train_one_epoch 的 model.train() 恢复 /
+    Model is set to eval after export; next train_one_epoch model.train() restores it.
     """
     try:
         export_onnx(model, onnx_path)
@@ -677,7 +640,7 @@ def verify(float_model, quant_model, onnx_path, quant_params):
         op_types = {node.op_type for node in onnx_model.graph.node}
         quant_nodes = op_types & {"QuantizeLinear", "DequantizeLinear"}
         assert not quant_nodes, f"ONNX 中仍存在量化节点: {sorted(quant_nodes)}"
-        print(f"      ONNX checker 通过，算子数: {len(op_types)}（含 Conv/ConvTranspose/Concat 等）")
+        print(f"      ONNX checker 通过，算子数: {len(op_types)}（含 Conv/Concat/Reshape/Sigmoid 等）")
     except ImportError:
         print("      [skip] 未安装 onnx，跳过结构检查")
 
@@ -686,21 +649,18 @@ def verify(float_model, quant_model, onnx_path, quant_params):
         session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         torch.manual_seed(0)
         float_model.cpu().eval()
-        x = torch.randn(1, 3, IMGSZ, IMGSZ)
+        x = torch.randn(1, getattr(float_model, "ch_in", IN_CHANNELS), IMGSZ, IMGSZ)
         with torch.no_grad():
-            y_torch_det, y_torch_proto = float_model(x)
-        y_onnx = session.run(["preds", "proto"], {"images": x.numpy()})
-        max_diff_det = float(np.abs(y_torch_det.numpy() - y_onnx[0]).max())
-        max_diff_proto = float(np.abs(y_torch_proto.numpy() - y_onnx[1]).max())
-        ref_mag = max(float(np.abs(y_torch_det.numpy()).max()),
-                      float(np.abs(y_torch_proto.numpy()).max()))
-        print(
-            f"      onnxruntime vs PyTorch 最大绝对误差: det {max_diff_det:.3e} / "
-            f"proto {max_diff_proto:.3e}（参考幅度 {ref_mag:.3e}）"
-        )
-        # 输出含大数量级解码坐标，纯绝对阈值过严：max(1e-3 绝对, 1e-5 相对) / Output contains large-magnitude decoded coords; pure absolute threshold too strict: max(1e-3 abs, 1e-5 rel)
-        assert max(max_diff_det, max_diff_proto) < max(1e-3, 1e-5 * ref_mag), (
-            "ONNX 数值误差过大"
+            y_torch = float_model(x).numpy()
+        y_onnx = session.run(["preds"], {"images": x.numpy()})[0]
+        max_diff = float(np.abs(y_torch - y_onnx).max())
+        ref_mag = float(np.abs(y_torch).max())
+        print(f"      onnxruntime vs PyTorch 最大绝对误差: {max_diff:.3e}（参考幅度 {ref_mag:.3e}）")
+        # 输出含大数量级解码坐标（如 0~imgsz 的 box 值），纯绝对阈值过严： /
+        # Output contains large-magnitude decoded coordinates (e.g. 0~imgsz box values); pure abs threshold too strict:
+        # 改为 max(1e-3 绝对, 1e-5 相对)，仍足以抓住导出结构错误 / change to max(1e-3 abs, 1e-5 rel), still sufficient to catch export structural errors
+        assert max_diff < max(1e-3, 1e-5 * ref_mag), (
+            f"ONNX 数值误差过大: {max_diff}（参考幅度 {ref_mag:.3e}）"
         )
     except ImportError:
         print("      [skip] 未安装 onnxruntime，跳过数值比对")
@@ -718,12 +678,12 @@ def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None, scale=det
 
     if model_dir is None:
         model_dir = _MODEL_DIR_BASE
-    quant_checkpoint = os.path.join(model_dir, f"{prefix}_{det.base_name(scale, 'seg')}.pth")
+    quant_checkpoint = os.path.join(model_dir, f"{prefix}_{det.base_name(scale, 'obb')}.pth")
     save_checkpoint(quant_model, quant_checkpoint, **(meta or {}))
 
     quant_params = collect_quant_params(quant_model)
-    json_path = os.path.join(model_dir, f"{prefix}_{det.base_name(scale, 'seg')}_quant_params.json")
-    pth_path = os.path.join(model_dir, f"{prefix}_{det.base_name(scale, 'seg')}_quant_params.pth")
+    json_path = os.path.join(model_dir, f"{prefix}_quant_params.json")
+    pth_path = os.path.join(model_dir, f"{prefix}_quant_params.pth")
     with open(json_path, "w", encoding="utf-8") as file:
         json.dump(quant_params, file, indent=2, ensure_ascii=False)
     torch.save(
@@ -739,11 +699,11 @@ def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None, scale=det
     print(f"[2/5] 量化参数已写出: {json_path} / {pth_path}（{len(quant_params)} 个张量）")
 
     float_model = build_float_model(quant_model, nc=nc, scale=scale)
-    float_checkpoint = os.path.join(model_dir, f"{prefix}_{det.base_name(scale, 'seg')}_float.pth")
+    float_checkpoint = os.path.join(model_dir, f"{prefix}_{det.base_name(scale, 'obb')}_float.pth")
     save_checkpoint(float_model, float_checkpoint)
     print(f"[3/5] 干净浮点权重已写出: {float_checkpoint}")
 
-    onnx_path = os.path.join(model_dir, f"{prefix}_{det.base_name(scale, 'seg')}_float.onnx")
+    onnx_path = os.path.join(model_dir, f"{prefix}_{det.base_name(scale, 'obb')}_float.onnx")
     export_onnx(float_model, onnx_path, opset=16)
     print(f"[4/5] 干净浮点 ONNX 已写出: {onnx_path}")
 
@@ -762,27 +722,41 @@ _build_optimizer = det._build_optimizer
 
 def train_one_epoch(model, loader, criterion, optimizer, epoch, epochs, nb, ema=None,
                     nbs=64, warmup_epochs=3.0, lrf=0.01, max_batches=None):
-    """与检测版一致的官方训练循环；损失项为 box/seg/cls/l1/sem 五项。 / Official training loop consistent with detection version; loss items are box/seg/cls/l1/sem (five terms)."""
+    """官方 BaseTrainer 训练循环复刻：线性 lr 衰减 + warmup（lr 与梯度累积同步插值） /
+    Official BaseTrainer training loop replica: linear lr decay + warmup (lr interpolated
+    synchronously with gradient accumulation)
+    + 梯度累积到 nbs + 梯度裁剪(10.0) + EMA 更新 /
+    + gradient accumulation to nbs + gradient clipping (10.0) + EMA update.
+
+    criterion 返回已乘 batch_size 的损失向量（官方直接 backward，不除以 batch） /
+    criterion returns loss vector already multiplied by batch_size (official backward directly, no batch divide)
+    与未缩放的 items dict；loss 项数按 criterion.loss_names 泛化（OBB 为 box/cls/l1/angle 四项） /
+    and unscaled items dict; loss item count generalized via criterion.loss_names (4 for OBB: box/cls/l1/angle).
+    """
     model.train()
     batch_size = loader.batch_size
     accumulate = max(round(nbs / batch_size), 1)
     warmup_steps = round(min(warmup_epochs, max(epochs - 1, 0)) * nb) if warmup_epochs > 0 else 0
-    lf = lambda x_step: max(1 - x_step / epochs, 0) * (1.0 - lrf) + lrf
+    # 线性衰减（官方默认 cos_lr=False）：lf(0)=1 → lf(epochs)=lrf / Linear decay (official default cos_lr=False): lf(0)=1 → lf(epochs)=lrf
+    lf = lambda x: max(1 - x / epochs, 0) * (1.0 - lrf) + lrf
 
+    # 官方每个 epoch 开始时 scheduler.step()：lr = initial_lr * lf(epoch) / Official scheduler.step() at epoch start: lr = initial_lr * lf(epoch)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lf(epoch)
 
+    loss_names = list(criterion.loss_names)
     total_steps = nb if max_batches is None else min(nb, max_batches)
-    loss_items_sum = torch.zeros(5)
+    loss_items_sum = torch.zeros(len(loss_names))
     last_opt_step = 0
     for i, batch in enumerate(loader):
         if i >= total_steps:
             break
-        ni = i + nb * epoch
+        ni = i + nb * epoch  # 自训练开始的累计 batch 数 / cumulative batch count since training start
         if ni < warmup_steps:
             xi = [0, warmup_steps]
             accumulate = max(1, int(np.interp(ni, xi, [1, nbs / batch_size]).round()))
             for group in optimizer.param_groups:
+                # optimizer=auto 时 warmup_bias_lr=0.0：所有组 lr 从 0 爬升 / optimizer=auto warmup_bias_lr=0.0: all group lr ramps from 0
                 group["lr"] = float(
                     np.interp(ni, xi, [0.0, group["initial_lr"] * lf(epoch)])
                 )
@@ -801,36 +775,30 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch, epochs, nb, ema=
             last_opt_step = ni
 
         loss_items_sum += torch.stack(
-            [
-                loss_items["box_loss"].detach().cpu(),
-                loss_items["seg_loss"].detach().cpu(),
-                loss_items["cls_loss"].detach().cpu(),
-                loss_items["l1_loss"].detach().cpu(),
-                loss_items["sem_loss"].detach().cpu(),
-            ]
+            [loss_items[name].detach().cpu() for name in loss_names]
         )
 
     avg_items = (loss_items_sum / total_steps).tolist()
-    return float(sum(avg_items)), avg_items
+    return float(sum(avg_items)), dict(zip(loss_names, avg_items))
 
 
 def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num_workers=2,
                 max_train_batches=None, max_eval_batches=None, scale=det.DEFAULT_SCALE,
                 resume=False):
-    print(f"========== Float training ({det.model_name(scale)}-seg / coco128-seg) ==========")
+    print(f"========== Float training ({det.model_name(scale)}-obb / dota8-multispectral OBB) ==========")
     print(f"Device: {device}")
     if lr is None:
-        lr = _auto_lr()
+        lr = _auto_lr(num_classes)
     print(
         f"Optimizer: AdamW(lr={lr:g}, betas=(0.9, 0.999)) wd=5e-4（官方 optimizer=auto 配方）"
         " | warmup 3ep | 梯度累积 nbs=64 | EMA | close_mosaic=10"
     )
 
-    data = det.get_data_dict(DATA_YAML, "seg")
+    data = det.get_data_dict(DATA_YAML, "obb")
     train_loader, val_loader, cfg, train_set = _build_loaders(batch_size, num_workers, data)
     nb = len(train_loader)
 
-    float_model = FloatYOLO26Seg(num_classes, scale=scale).to(device)
+    float_model = FloatYOLO26OBB(num_classes, scale=scale).to(device)
     det.model_info(float_model, imgsz=IMGSZ)
     load_pretrained(float_model, scale=scale)
 
@@ -842,21 +810,22 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
     best_fitness = -1.0
     best_epoch = -1
     best_meta = {}
+    # best checkpoint 加 _best 后缀，与 PTQ/QAT 命名一致 / best checkpoint uses _best suffix, consistent with PTQ/QAT naming
     model_dir = _model_dir_for(scale=scale)
-    checkpoint_path = os.path.join(model_dir, f"{det.base_name(scale, 'seg')}_best.pth")
-    last_checkpoint = os.path.join(model_dir, f"{det.base_name(scale, 'seg')}_last.pth")
+    checkpoint_path = os.path.join(model_dir, f"{det.base_name(scale, 'obb')}_best.pth")
+    last_checkpoint = os.path.join(model_dir, f"{det.base_name(scale, 'obb')}_last.pth")
 
-    # resume：从 _last.pth 恢复，接续训练 / Resume: restore from _last.pth, continue training
+    # resume：从 _last.pth 恢复，接续训练 / resume: restore from _last.pth, continue training
     start_epoch = 0
     if resume and os.path.exists(last_checkpoint):
         print(f"[Float] Resume from {last_checkpoint}")
-        _, meta = det.load_checkpoint(float_model, last_checkpoint, return_meta=True)
+        _, meta = load_checkpoint(float_model, last_checkpoint, return_meta=True)
         ema.ema.load_state_dict(float_model.state_dict())
         start_epoch = meta.get("epoch", 0)
         best_fitness = meta.get("fitness", -1.0)
         best_meta = meta
         best_epoch = start_epoch
-        print(f"[Float] 从 epoch {start_epoch} 接续训练，当前 best mask mAP50={meta.get('mask_map50', 0):.4f}")
+        print(f"[Float] 从 epoch {start_epoch} 接续训练，当前 best mAP50={meta.get('map50', 0):.4f}")
     elif resume:
         print(f"[Float] Resume 开启但找不到 {last_checkpoint}，从头训练")
 
@@ -866,16 +835,15 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
             train_set.close_mosaic(copy.copy(cfg))
             train_loader.reset()
 
-        train_loss, items = train_one_epoch(
+        train_loss, loss_items = train_one_epoch(
             float_model, train_loader, criterion, optimizer, epoch, epochs, nb, ema=ema,
             max_batches=max_train_batches,
         )
-        box_loss, seg_loss, cls_loss, l1_loss, sem_loss = items
         metrics = evaluate(
             ema.ema, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
             viz_dir=model_dir, viz_prefix=f"float_ep{epoch + 1:03d}"
         )
-        fitness = 0.9 * metrics["mask_map"] + 0.1 * metrics["mask_map50"]
+        fitness = 0.9 * metrics["map"] + 0.1 * metrics["map50"]
 
         epoch_meta = {
             "stage": "float",
@@ -884,11 +852,7 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
             "total_epochs": epochs,
             "lr": lr,
             "train_loss": float(train_loss),
-            "box_loss": float(box_loss),
-            "seg_loss": float(seg_loss),
-            "cls_loss": float(cls_loss),
-            "l1_loss": float(l1_loss),
-            "sem_loss": float(sem_loss),
+            **{k: float(v) for k, v in loss_items.items()},
             "fitness": float(fitness),
             **metrics,
         }
@@ -901,32 +865,26 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
             save_checkpoint(ema.ema, checkpoint_path, **best_meta)
             _try_export_onnx(ema.ema, os.path.splitext(checkpoint_path)[0] + ".onnx")
 
+        loss_str = " ".join(f"{k.replace('_loss', '')}:{v:.3f}" for k, v in loss_items.items())
         print(
             f"[Float] Epoch [{epoch + 1}/{epochs}] | loss:{train_loss:.4f} "
-            f"(box:{box_loss:.3f} seg:{seg_loss:.3f} cls:{cls_loss:.3f} sem:{sem_loss:.3f}) | "
-            f"box mAP50:{metrics['map50']:.4f} | mask mAP50:{metrics['mask_map50']:.4f} "
-            f"mAP50-95:{metrics['mask_map']:.4f}"
+            f"({loss_str}) | "
+            f"mAP50:{metrics['map50']:.4f} mAP50-95:{metrics['map']:.4f}"
         )
 
-    load_checkpoint(float_model, checkpoint_path)
+    load_checkpoint(float_model, checkpoint_path)  # 载入最优 EMA 权重，供后续 PTQ 使用 / Load best EMA weights for subsequent PTQ
     best_metrics = evaluate(
         float_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
         viz_dir=model_dir, viz_prefix="float_best"
     )
     print(f"[Float] Best checkpoint: {checkpoint_path}（epoch {best_epoch}/{epochs}）")
-    print(
-        f"[Float] Best box mAP50:{best_metrics['map50']:.4f} | "
-        f"mask mAP50:{best_metrics['mask_map50']:.4f} mAP50-95:{best_metrics['mask_map']:.4f}"
-    )
+    print(f"[Float] Best mAP50:{best_metrics['map50']:.4f} mAP50-95:{best_metrics['map']:.4f}")
     return checkpoint_path, best_fitness, best_meta
 
 
-@torch.no_grad()
-def calibrate_quantizer(quant_model, calibration_loader, calibration_batches=20,
-                         float_model=None):
-    """校准量化器（委托给 detect 模块的升级版本）。 / Calibrate quantizer (delegates to upgraded version in detect module)."""
-    return det.calibrate_quantizer(quant_model, calibration_loader,
-                                    calibration_batches, float_model=float_model)
+# float 范围初始化 / 安全网校准 / minmax 赋值等校准实现全部复用 det 模块（obb 无特殊逻辑） /
+# float-range init / safety-net calibration / minmax assign implementations all reused from det module (no obb-specific logic)
+calibrate_quantizer = det.calibrate_quantizer
 
 
 def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes=NUM_CLASSES,
@@ -934,7 +892,7 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
                     scale=det.DEFAULT_SCALE):
     set_quant_method(quant_method)
     tag = quant_method
-    print(f"========== PTQ calibration ({det.model_name(scale)}-seg / {tag}) ==========")
+    print(f"========== PTQ calibration ({det.model_name(scale)}-obb / {tag}) ==========")
     print(f"Device: {device}")
 
     calibration_loader, data = get_dataloaders(batch_size, num_workers, calibration=True)
@@ -942,17 +900,17 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
 
     float_dir = _model_dir_for(scale=scale)
     quant_dir = _model_dir_for(scale=scale, quant_method=quant_method)
-    # 优先 _best.pth（与 QAT 命名一致），fallback 到旧版无后缀 .pth / Prefer _best.pth (consistent with QAT naming), fallback to old no-suffix .pth
-    float_checkpoint = os.path.join(float_dir, f"{det.base_name(scale, 'seg')}_best.pth")
+    # 优先 _best.pth（与 QAT 命名一致），fallback 到旧版无后缀 .pth / Prefer _best.pth (consistent with QAT naming), fallback to legacy no-suffix .pth
+    float_checkpoint = os.path.join(float_dir, f"{det.base_name(scale, 'obb')}_best.pth")
     if not os.path.exists(float_checkpoint):
-        float_checkpoint = os.path.join(float_dir, f"{det.base_name(scale, 'seg')}.pth")
+        float_checkpoint = os.path.join(float_dir, f"{det.base_name(scale, 'obb')}.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
 
-    float_model = FloatYOLO26Seg(num_classes, scale=scale).to(device)
+    float_model = FloatYOLO26OBB(num_classes, scale=scale).to(device)
     load_checkpoint(float_model, float_checkpoint)
 
-    ptq_model = QuantYOLO26Seg(num_classes, scale=scale).to(device)
+    ptq_model = QuantYOLO26OBB(num_classes, scale=scale).to(device)
     det.model_info(ptq_model, imgsz=IMGSZ)
     copy_float_to_quant(float_model, ptq_model)
 
@@ -963,10 +921,7 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
         ptq_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
         viz_dir=quant_dir, viz_prefix=f"ptq_{tag}"
     )
-    print(
-        f"[PTQ-{tag}] box mAP50:{metrics['map50']:.4f} | "
-        f"mask mAP50:{metrics['mask_map50']:.4f} mAP50-95:{metrics['mask_map']:.4f}"
-    )
+    print(f"[PTQ-{tag}] mAP50:{metrics['map50']:.4f} mAP50-95:{metrics['map']:.4f}")
 
     ptq_meta = {
         "stage": "ptq",
@@ -989,10 +944,7 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
         ptq_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
         viz_dir=quant_dir, viz_prefix=f"ptq_{tag}_reload"
     )
-    print(
-        f"[PTQ] 重载 checkpoint 后 mask mAP50:{final_metrics['mask_map50']:.4f} "
-        f"mAP50-95:{final_metrics['mask_map']:.4f}"
-    )
+    print(f"[PTQ] 重载 checkpoint 后 mAP50:{final_metrics['map50']:.4f} mAP50-95:{final_metrics['map']:.4f}")
     return ptq_checkpoint
 
 
@@ -1002,10 +954,10 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
                  resume=False):
     set_quant_method(quant_method)
     tag = quant_method
-    print(f"========== QAT training ({det.model_name(scale)}-seg / {tag}) ==========")
+    print(f"========== QAT training ({det.model_name(scale)}-obb / {tag}) ==========")
     print(f"Device: {device}")
     if lr is None:
-        lr = _auto_lr() * 0.1
+        lr = _auto_lr(num_classes) * 0.1  # QAT 微调用 float auto lr 的 1/10 / QAT fine-tuning uses 1/10 of float auto lr
     print(f"Optimizer: AdamW(lr={lr:g}, betas=(0.9, 0.999)) wd=5e-4 | warmup 3ep | 梯度累积 nbs=64")
 
     train_loader, val_loader, data = get_dataloaders(batch_size, num_workers)
@@ -1013,13 +965,13 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
 
     float_dir = _model_dir_for(scale=scale)
     quant_dir = _model_dir_for(scale=scale, quant_method=quant_method)
-    ptq_checkpoint = os.path.join(quant_dir, f"ptq_{tag}_{det.base_name(scale, 'seg')}.pth")
+    ptq_checkpoint = os.path.join(quant_dir, f"ptq_{tag}_{det.base_name(scale, 'obb')}.pth")
     if not os.path.exists(ptq_checkpoint):
         raise FileNotFoundError(
             f"找不到 {tag} 的 PTQ 权重，请先运行 PTQ_calibration('{tag}'): {ptq_checkpoint}"
         )
 
-    qat_model = QuantYOLO26Seg(num_classes, scale=scale).to(device)
+    qat_model = QuantYOLO26OBB(num_classes, scale=scale).to(device)
     det.model_info(qat_model, imgsz=IMGSZ)
     _, ptq_meta = load_checkpoint(qat_model, ptq_checkpoint, return_meta=True)
     saved_method = ptq_meta.get("quant_method")
@@ -1036,10 +988,10 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
     best_fitness = -1.0
     best_epoch = -1
     best_meta = {}
-    best_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{det.base_name(scale, 'seg')}_best.pth")
-    last_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{det.base_name(scale, 'seg')}_last.pth")
+    best_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{det.base_name(scale, 'obb')}_best.pth")
+    last_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{det.base_name(scale, 'obb')}_last.pth")
 
-    # resume：从 _last.pth 恢复，接续训练 / Resume: restore from _last.pth, continue training
+    # resume：从 _last.pth 恢复，接续训练 / resume: restore from _last.pth, continue training
     start_epoch = 0
     if resume and os.path.exists(last_checkpoint):
         print(f"[QAT-{tag}] Resume from {last_checkpoint}")
@@ -1048,21 +1000,20 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
         best_fitness = meta.get("fitness", -1.0)
         best_meta = meta
         best_epoch = start_epoch
-        print(f"[QAT-{tag}] 从 epoch {start_epoch} 接续训练，当前 best mAP50={meta.get('mask_map50', 0):.4f}")
+        print(f"[QAT-{tag}] 从 epoch {start_epoch} 接续训练，当前 best mAP50={meta.get('map50', 0):.4f}")
     elif resume:
         print(f"[QAT-{tag}] Resume 开启但找不到 {last_checkpoint}，从头训练")
 
     for epoch in range(start_epoch, epochs):
-        train_loss, items = train_one_epoch(
+        train_loss, loss_items = train_one_epoch(
             qat_model, train_loader, criterion, optimizer, epoch, epochs, nb,
             max_batches=max_train_batches,
         )
-        box_loss, seg_loss, cls_loss, l1_loss, sem_loss = items
         metrics = evaluate(
             qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
             viz_dir=quant_dir, viz_prefix=f"qat_{tag}_ep{epoch + 1:03d}"
         )
-        fitness = 0.9 * metrics["mask_map"] + 0.1 * metrics["mask_map50"]
+        fitness = 0.9 * metrics["map"] + 0.1 * metrics["map50"]
 
         epoch_meta = {
             "stage": "qat",
@@ -1072,12 +1023,8 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
             "total_epochs": epochs,
             "lr": lr,
             "train_loss": float(train_loss),
-            "box_loss": float(box_loss),
-            "seg_loss": float(seg_loss),
-            "cls_loss": float(cls_loss),
-            "l1_loss": float(l1_loss),
-            "sem_loss": float(sem_loss),
-            "fitness": float(fitness),  # QAT checkpoint 需带 fitness 供接续/对比 / fitness required in QAT checkpoint meta
+            **{k: float(v) for k, v in loss_items.items()},
+            "fitness": float(fitness),
             **metrics,
         }
         save_checkpoint(qat_model, last_checkpoint, **epoch_meta)
@@ -1089,11 +1036,11 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
             save_checkpoint(qat_model, best_checkpoint, **best_meta)
             _try_export_onnx(qat_model, os.path.splitext(best_checkpoint)[0] + ".onnx")
 
+        loss_str = " ".join(f"{k.replace('_loss', '')}:{v:.3f}" for k, v in loss_items.items())
         print(
             f"[QAT-{tag}] Epoch [{epoch + 1}/{epochs}] | loss:{train_loss:.4f} "
-            f"(box:{box_loss:.3f} seg:{seg_loss:.3f} cls:{cls_loss:.3f} sem:{sem_loss:.3f}) | "
-            f"box mAP50:{metrics['map50']:.4f} | mask mAP50:{metrics['mask_map50']:.4f} "
-            f"mAP50-95:{metrics['mask_map']:.4f}"
+            f"({loss_str}) | "
+            f"mAP50:{metrics['map50']:.4f} mAP50-95:{metrics['map']:.4f}"
         )
 
     load_checkpoint(qat_model, best_checkpoint)
@@ -1103,7 +1050,7 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
     )
     print(
         f"[QAT-{tag}] Best epoch:{best_epoch}/{epochs} | "
-        f"mask mAP50:{best_metrics['mask_map50']:.4f} mAP50-95:{best_metrics['mask_map']:.4f} | "
+        f"mAP50:{best_metrics['map50']:.4f} mAP50-95:{best_metrics['map']:.4f} | "
         f"Best: {best_checkpoint}"
     )
     qat_checkpoint = save_quant_outputs(
@@ -1117,18 +1064,18 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_class
                       num_workers=2, max_eval_batches=None, scale=det.DEFAULT_SCALE):
     set_quant_method(quant_method)
     tag = quant_method
-    print(f"========== Float vs QAT precision ({det.model_name(scale)}-seg / coco128-seg / {tag}) ==========")
+    print(f"========== Float vs QAT precision ({det.model_name(scale)}-obb / dota8-multispectral OBB / {tag}) ==========")
     print(f"Device: {device}")
 
     float_dir = _model_dir_for(scale=scale)
     quant_dir = _model_dir_for(scale=scale, quant_method=quant_method)
     # 优先 _best.pth，fallback 到无后缀 / Prefer _best.pth, fallback to no-suffix
-    float_checkpoint = os.path.join(float_dir, f"{det.base_name(scale, 'seg')}_best.pth")
+    float_checkpoint = os.path.join(float_dir, f"{det.base_name(scale, 'obb')}_best.pth")
     if not os.path.exists(float_checkpoint):
-        float_checkpoint = os.path.join(float_dir, f"{det.base_name(scale, 'seg')}.pth")
-    qat_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{det.base_name(scale, 'seg')}_best.pth")
+        float_checkpoint = os.path.join(float_dir, f"{det.base_name(scale, 'obb')}.pth")
+    qat_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{det.base_name(scale, 'obb')}_best.pth")
     if not os.path.exists(qat_checkpoint):
-        qat_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{det.base_name(scale, 'seg')}.pth")
+        qat_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{det.base_name(scale, 'obb')}.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
     if not os.path.exists(qat_checkpoint):
@@ -1138,14 +1085,14 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_class
 
     _, val_loader, data = get_dataloaders(batch_size, num_workers)
 
-    float_model = FloatYOLO26Seg(num_classes, scale=scale).to(device)
+    float_model = FloatYOLO26OBB(num_classes, scale=scale).to(device)
     float_model, float_meta = load_checkpoint(float_model, float_checkpoint, return_meta=True)
     float_metrics = evaluate(
         float_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
         viz_dir=quant_dir, viz_prefix="compare_float"
     )
 
-    qat_model = QuantYOLO26Seg(num_classes, scale=scale).to(device)
+    qat_model = QuantYOLO26OBB(num_classes, scale=scale).to(device)
     qat_model, qat_meta = load_checkpoint(qat_model, qat_checkpoint, return_meta=True)
     saved_method = qat_meta.get("quant_method")
     if saved_method is not None and saved_method != tag:
@@ -1162,28 +1109,25 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_class
     print(
         f"[Compare] Float | best epoch:{float_meta.get('epoch', '-')}/"
         f"{float_meta.get('total_epochs', '-')} | "
-        f"box mAP50:{float_metrics['map50']:.4f} | "
-        f"mask P:{float_metrics['mask_precision']:.4f} R:{float_metrics['mask_recall']:.4f} "
-        f"mAP50:{float_metrics['mask_map50']:.4f} mAP50-95:{float_metrics['mask_map']:.4f}"
+        f"P:{float_metrics['precision']:.4f} R:{float_metrics['recall']:.4f} "
+        f"mAP50:{float_metrics['map50']:.4f} mAP50-95:{float_metrics['map']:.4f}"
     )
     print(
         f"[Compare] QAT   | best epoch:{qat_meta.get('epoch', '-')}/"
         f"{qat_meta.get('total_epochs', '-')} | "
-        f"box mAP50:{qat_metrics['map50']:.4f} | "
-        f"mask P:{qat_metrics['mask_precision']:.4f} R:{qat_metrics['mask_recall']:.4f} "
-        f"mAP50:{qat_metrics['mask_map50']:.4f} mAP50-95:{qat_metrics['mask_map']:.4f}"
+        f"P:{qat_metrics['precision']:.4f} R:{qat_metrics['recall']:.4f} "
+        f"mAP50:{qat_metrics['map50']:.4f} mAP50-95:{qat_metrics['map']:.4f}"
     )
     print(
-        f"[Compare] delta | box mAP50:{qat_metrics['map50'] - float_metrics['map50']:+.4f} | "
-        f"mask mAP50:{qat_metrics['mask_map50'] - float_metrics['mask_map50']:+.4f} "
-        f"mAP50-95:{qat_metrics['mask_map'] - float_metrics['mask_map']:+.4f}"
+        f"[Compare] delta | mAP50:{qat_metrics['map50'] - float_metrics['map50']:+.4f} "
+        f"mAP50-95:{qat_metrics['map'] - float_metrics['map']:+.4f}"
     )
     return {"float": float_metrics, "qat": qat_metrics, "float_meta": float_meta, "qat_meta": qat_meta}
 
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
-        description="YOLO26-seg: 浮点训练(加载 yolo26{scale}-seg.pt) -> PTQ -> QAT -> box/mask mAP 对比，模型尺度与量化方法可选"
+        description="YOLO26-obb: 浮点训练(加载 yolo26{scale}-obb.pt，缺失则从头训练) -> PTQ -> QAT -> mAP 对比，模型尺度与量化方法可选"
     )
     parser.add_argument(
         "--model",
@@ -1215,12 +1159,13 @@ def build_arg_parser():
     parser.add_argument("--qat-lr", type=float, default=None,
                         help="默认 float auto lr x 0.1")
     parser.add_argument("--calibration-batches", type=int, default=20)
+    # 冒烟/快速验证用：每个 epoch / 评估最多跑多少个 batch，默认不限制（完整训练） / Smoke test / quick validation: max batches per epoch / eval, default unlimited (full training)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
     parser.add_argument(
         "--data",
         default=DATA_YAML,
-        help="数据集 yaml 路径或数据集目录（默认自动下载 coco8-seg.yaml 到 dataset/；可手动指定其他目录）",
+        help="数据集 yaml 路径或数据集目录（默认自动下载 dota8-multispectral.yaml 到 dataset/；RGB OBB 可用 dota8.yaml 或手动指定其他目录）",
     )
     parser.add_argument("--resume", action="store_true",
                         help="从 _last.pth checkpoint 接续训练")
@@ -1231,20 +1176,21 @@ if __name__ == "__main__":
     quant_pkg.install_print_timestamp()  # print 加分钟级时间戳 / minute-precision timestamp for print
     args = build_arg_parser().parse_args()
 
-    # 根据 --data 动态覆盖全局 NUM_CLASSES 和 DATA_YAML（默认走自动下载） /
-    # Override global NUM_CLASSES / DATA_YAML per --data (default auto-downloads)
-    DATA_YAML = args.data  # 复用变量名；函数内部引用它 / Reuse variable name; functions reference it internally
+    # 根据 --data yaml 动态覆盖全局 NUM_CLASSES / DATA_YAML / IN_CHANNELS /
+    # Dynamically override global NUM_CLASSES / DATA_YAML / IN_CHANNELS per --data yaml
+    DATA_YAML = args.data  # 复用变量名；函数内部引用它 / Reuse variable name; referenced inside functions
     try:
-        _tmp = det.get_data_dict(args.data, "seg")
+        _tmp = det.get_data_dict(args.data, "obb")
         NUM_CLASSES = len(_tmp["names"])
+        IN_CHANNELS = int(_tmp.get("channels", 3))  # 多光谱通道数自适应 / adapt multispectral channels
     except Exception:
-        pass  # yaml 解析失败则保留默认 80 / Keep default 80 if yaml parsing fails
-    print(f"数据集: {args.data} | 类别数: {NUM_CLASSES}")
+        pass  # yaml 解析失败则保留默认 15 类 / 10 通道 / Keep default 15 classes / 10 channels if yaml parsing fails
+    print(f"数据集: {args.data} | 类别数: {NUM_CLASSES} | 输入通道: {IN_CHANNELS}")
 
     scale = det.get_scale(args.model)
     print(f"Python: {sys.executable}")
     print(f"torch: {torch.__version__} | Device: {device}")
-    print(f"模型: {det.model_name(scale)}-seg | 量化方法: {args.quant} | 阶段: {args.stage}")
+    print(f"模型: {det.model_name(scale)}-obb | 量化方法: {args.quant} | 阶段: {args.stage}")
 
     tag = args.quant
     qat_epochs = (
@@ -1254,6 +1200,7 @@ if __name__ == "__main__":
     )
 
     if args.stage in ("all", "float"):
+        # lr=None → 官方 optimizer=auto：AdamW lr=round(0.002*5/(4+nc), 6)（nc=80 → 0.000119）/ lr=None → official optimizer=auto: AdamW lr=round(0.002*5/(4+nc), 6) (nc=80 → 0.000119)
         float_train(
             batch_size=args.float_batch_size,
             lr=args.float_lr,

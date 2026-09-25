@@ -1,22 +1,32 @@
-"""YOLO26 检测网络的 aLSQ+ 量化感知训练流程（coco128，尺度可选 n/s/m/l/x）。
+"""YOLO26 检测网络的 aLSQ+ 量化感知训练流程（coco128，尺度可选 n/s/m/l/x） /
+aLSQ+ Quantization-Aware Training pipeline for YOLO26 detection network
+(coco128, scales n/s/m/l/x optional).
 
-流程：
-    float_train(lr=float_lr, epochs=float_epochs)   # 浮点训练（默认加载 yolo26{scale}.pt 预训练权重）
-    PTQ_calibration()                               # 训练后量化校准
-    QAT_training(lr=qat_lr, epochs=qat_epochs)      # 量化感知训练
-    compare_precision()                             # 浮点 vs QAT 的 mAP 对比
+流程 / Pipeline:
+    float_train(lr=float_lr, epochs=float_epochs)   # 浮点训练 / float training（默认加载 yolo26{scale}.pt 预训练权重 / loads yolo26{scale}.pt pretrained weights by default）
+    PTQ_calibration()                               # 训练后量化校准 / post-training quantization calibration
+    QAT_training(lr=qat_lr, epochs=qat_epochs)      # 量化感知训练 / quantization-aware training
+    compare_precision()                             # 浮点 vs QAT 的 mAP 对比 / mAP comparison between float vs QAT
 
-模型尺度用 --model yolo26n|yolo26s|yolo26m|yolo26l|yolo26x 选择（默认 yolo26n）：
+模型尺度用 --model yolo26n|yolo26s|yolo26m|yolo26l|yolo26x 选择（默认 yolo26n） /
+Model scale selected via --model yolo26n|yolo26s|yolo26m|yolo26l|yolo26x (default yolo26n):
 通道按 make_divisible(min(c, max_ch)*width, 8)、重复次数按 max(round(n*depth), 1)
-缩放，与 ultralytics parse_model 完全一致。仓库仅随附 yolo26n.pt 预训练权重，
-其余尺度会自动跳过加载、从头训练。
+缩放，与 ultralytics parse_model 完全一致 / channels scaled via make_divisible(min(c, max_ch)*width, 8),
+repeat counts via max(round(n*depth), 1), identical to ultralytics parse_model.
+本地缺失的官方预训练权重（任意尺度）会像 ultralytics 一样从 GitHub Releases 自动下载；仅离线或自定义路径缺失时才从头训练 /
+Missing official pretrained weights (any scale) are auto-downloaded from GitHub Releases like ultralytics;
+random init only happens when offline or a custom path is missing.
 
-网络结构与 ultralytics/cfg/models/26/yolo26.yaml（scale=n）逐层对齐：
-Conv / C3k2(C3k) / SPPF / C2PSA(Attention) / PAN-FPN / Detect(reg_max=1)。
-说明：yolo26n 原始 end2end 双头（one2many+one2one）这里只保留 one2many 单头，
-损失仍使用官方 TaskAlignedAssigner(topk=10) + CIoU 的 v8DetectionLoss；
-backbone / neck / 检测头拓扑与官方完全一致，可直接加载 yolo26n.pt 的权重
-（one2one_* 双头权重会被跳过）。
+网络结构与 ultralytics/cfg/models/26/yolo26.yaml（scale=n）逐层对齐 /
+Network architecture aligned layer-by-layer with ultralytics/cfg/models/26/yolo26.yaml (scale=n):
+Conv / C3k2(C3k) / SPPF / C2PSA(Attention) / PAN-FPN / Detect(reg_max=1).
+说明 / Note: yolo26n 原始 end2end 双头（one2many+one2one）这里只保留 one2many 单头 /
+original yolo26n end2end dual-head (one2many+one2one), only one2many head kept here;
+损失仍使用官方 TaskAlignedAssigner(topk=10) + CIoU 的 v8DetectionLoss /
+loss still uses official v8DetectionLoss with TaskAlignedAssigner(topk=10) + CIoU;
+backbone / neck / 检测头拓扑与官方完全一致，可直接加载 yolo26n.pt 的权重 /
+backbone / neck / detect head topology fully consistent with official, can directly load yolo26n.pt weights
+（one2one_* 双头权重会被跳过 / one2one_* dual-head weights are skipped）.
 """
 
 import argparse
@@ -31,26 +41,138 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 import torch.nn as nn
+from pathlib import Path
 
 import quantization as quant_pkg
 
-# ultralytics 提供数据管道 / 损失 / 解码 / NMS / mAP
+# ultralytics 提供数据管道 / 损失 / 解码 / NMS / mAP / ultralytics provides data pipeline / loss / decode / NMS / mAP
 from ultralytics.cfg import get_cfg
-from ultralytics.utils import DEFAULT_CFG
+from ultralytics.utils import DEFAULT_CFG, YAML
+from ultralytics.utils.checks import check_file
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.data import build_yolo_dataset, build_dataloader
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils.tal import make_anchors, dist2bbox
-from ultralytics.utils.ops import xywh2xyxy
+from ultralytics.utils.ops import xywh2xyxy, xyxy2xywh
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.metrics import ap_per_class, box_iou
 from ultralytics.utils.torch_utils import model_info
+from ultralytics.utils.plotting import plot_images
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(BASE_DIR, "model")
+_MODEL_DIR_BASE = os.path.join(BASE_DIR, "model", "yolo26-detect")
+MODEL_DIR = _MODEL_DIR_BASE
+
+
+def _model_dir_for(scale=None, quant_method=None):
+    """按网络名 + 尺度 + 量化后端返回产物目录 / Return artifact directory by net name + scale + quant backend."""
+    path = _MODEL_DIR_BASE
+    if scale is not None:
+        path = os.path.join(path, scale)
+    if quant_method is not None:
+        path = os.path.join(path, quant_method)
+    os.makedirs(path, exist_ok=True)
+    return path
 ULTRA_DIR = os.path.join(BASE_DIR, "ultralytics", "ultralytics")
-COCO128_YAML = os.path.join(ULTRA_DIR, "cfg", "datasets", "coco128.yaml")
-# COCO128_YAML = os.path.join(ULTRA_DIR, "cfg", "datasets", "VOC.yaml")
+
+# ---------------------------------------------------------------------------
+# 数据集解析：优先自动下载，--data 可手动指定任意 yaml / 目录 /
+# Dataset resolution: auto-download by default; --data can point to any yaml / dir
+# ---------------------------------------------------------------------------
+# 自动下载根目录（ultralytics 按 yaml 内 download URL 把数据下载解压到这里） /
+# Auto-download root (ultralytics downloads + unzips data here per yaml's download URL)
+DATASET_DIR = os.path.join(BASE_DIR, "dataset")
+
+# 各任务默认的 ultralytics 官方数据集 yaml（裸文件名，位于 ultralytics 包 cfg/datasets/；
+# 首次运行时自动下载：detect/seg/pose 用 coco8 系列，obb 用 dota8 多光谱，depth 用 depth8） /
+# Default official dataset yamls per task (bare names inside ultralytics cfg/datasets/;
+# auto-downloaded on first run: coco8 family for detect/seg/pose, dota8 multispectral for obb, depth8 for depth)
+DEFAULT_DATA_YAML = {
+    "detect": "coco8.yaml",
+    "seg": "coco8-seg.yaml",
+    "pose": "coco8-pose.yaml",
+    "obb": "dota8-multispectral.yaml",
+    "depth": "depth8.yaml",
+}
+
+# detect 任务当前使用的数据集（main 中可被 --data 覆盖） / dataset yaml used by detect (overridable via --data in main)
+DATA_YAML = DEFAULT_DATA_YAML["detect"]
+
+_DATASETS_DIR_PATCHED = False
+
+
+def _patch_datasets_dir():
+    """把 ultralytics 的 DATASETS_DIR 在本进程内重定向到项目 dataset/。
+
+    / Redirect ultralytics' DATASETS_DIR to the project dataset/ dir for this process only.
+    ultralytics 的 check_det_dataset 下载 zip 时使用模块级 DATASETS_DIR 常量（导入时绑定，
+    不受 settings.json 影响），这里直接替换两个模块中的符号；不写用户全局配置，不影响其他项目。
+    / check_det_dataset downloads zips to the module-level DATASETS_DIR (bound at import);
+    patch the symbol in both modules in-process. No global settings.json side effects.
+    """
+    global _DATASETS_DIR_PATCHED
+    if _DATASETS_DIR_PATCHED:
+        return
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    import ultralytics.utils as _ultra_utils
+    import ultralytics.data.utils as _ultra_data_utils
+    target = Path(DATASET_DIR)
+    _ultra_utils.DATASETS_DIR = target
+    _ultra_data_utils.DATASETS_DIR = target
+    _DATASETS_DIR_PATCHED = True
+
+
+def resolve_dataset_yaml(spec=None, task="detect"):
+    """返回一份可直接传给 check_det_dataset 的 yaml 路径。
+
+    / Return a yaml path ready for check_det_dataset.
+
+    1) spec 指向已存在的 yaml 文件或数据集目录 → 原样返回（手动加载其他目录，
+       例如本机已有的 ultralytics/ultralytics/data/datasets/...）；
+    2) spec 显式给定但不存在 → 原样交给 ultralytics 处理（支持 URL / 官方报错提示）；
+    3) 默认裸文件名（coco8.yaml 等）→ 用 ultralytics 的 check_file 定位包内官方 yaml，
+       在 dataset/ 下生成一份 path 改写为绝对路径的便携副本并返回；随后 check_det_dataset
+       在数据缺失时会走 ultralytics 原生 safe_download 流程自动下载解压到 dataset/。
+
+    / 1) existing yaml/dir → returned as-is (manual datasets);
+      2) explicit but missing spec → passed through to ultralytics (URL / official error);
+      3) bare official name → locate packaged yaml via check_file, write a portable copy
+         under dataset/ with an absolute path; check_det_dataset then auto-downloads via
+         its native safe_download pipeline into dataset/.
+    """
+    name = str(spec or DEFAULT_DATA_YAML[task])
+    p = Path(name)
+    if p.exists():
+        return name  # 手动目录 / 已有 yaml 优先 / manual path takes priority
+    # 显式指定的非默认路径但不存在 → 交给 ultralytics（URL / 官方报错）；
+    # 注意 argparse 默认值本身就是官方裸名，需按默认名处理，不能当成手动路径 /
+    # explicit non-default missing spec → let ultralytics handle; the argparse default
+    # itself is the bare official name, so it must follow the auto-download branch
+    if spec is not None and name != DEFAULT_DATA_YAML.get(task):
+        return name
+
+    # 默认官方数据集：生成便携副本 / default official dataset: emit portable copy
+    _patch_datasets_dir()
+    stock = check_file(name)  # ultralytics 在其包内 cfg/datasets/ 查找 / search packaged cfg/datasets/
+    cfg = YAML.load(stock, append_filename=True)
+    cfg.pop("yaml_file", None)
+    # 解压目录名取下载 zip 的文件名（coco8.zip→coco8, depth8-png.zip→depth8-png） /
+    # extract dir derived from zip URL basename
+    url = str(cfg.get("download", ""))
+    stem = Path(url.split("?")[0]).stem if url else p.stem
+    cfg["path"] = os.path.join(DATASET_DIR, stem)  # 绝对路径，任何机器均可移植 / absolute, portable
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    out_yaml = os.path.join(DATASET_DIR, p.name)
+    YAML.save(out_yaml, cfg)
+    return out_yaml
+
+
+def get_data_dict(spec=None, task="detect"):
+    """解析数据集并返回 data 字典；数据缺失时由 ultralytics 自动下载。
+
+    / Resolve dataset and return its data dict; auto-download via ultralytics if missing.
+    """
+    return check_det_dataset(resolve_dataset_yaml(spec, task))
 
 IMGSZ = 640
 NUM_CLASSES = 80
@@ -59,7 +181,8 @@ STRIDES = (8, 16, 32)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---------------------------------------------------------------------------
-# 模型尺度选择：与 ultralytics/cfg/models/26/yolo26.yaml 的 scales 完全一致
+# 模型尺度选择：与 ultralytics/cfg/models/26/yolo26.yaml 的 scales 完全一致 /
+# Model scale selection: fully consistent with ultralytics/cfg/models/26/yolo26.yaml scales
 #   # [depth, width, max_channels]
 #   n: [0.50, 0.25, 1024]  # 260 layers, 2,572,280 parameters, 6.1 GFLOPs
 #   s: [0.50, 0.50, 1024]  # 260 layers, 10,009,784 parameters, 22.8 GFLOPs
@@ -79,7 +202,8 @@ MODEL_CHOICES = tuple(f"yolo26{s}" for s in YOLO26_SCALES)
 
 
 def get_scale(scale=DEFAULT_SCALE):
-    """归一化模型尺度名：允许传 'n' / 'yolo26n' / 'YOLO26n'。"""
+    """归一化模型尺度名：允许传 'n' / 'yolo26n' / 'YOLO26n' /
+    Normalize model scale name: accepts 'n' / 'yolo26n' / 'YOLO26n'."""
     s = str(scale)[-1].lower()
     if s not in YOLO26_SCALES:
         raise ValueError(f"未知模型尺度 {scale!r}（可选 {', '.join(MODEL_CHOICES)}）")
@@ -87,39 +211,44 @@ def get_scale(scale=DEFAULT_SCALE):
 
 
 def make_divisible(x, divisor=8):
-    """ultralytics 的通道取整规则。"""
+    """ultralytics 的通道取整规则 / ultralytics channel round rule."""
     return math.ceil(x / divisor) * divisor
 
 
 def scaled_channels(channels, scale=DEFAULT_SCALE):
-    """ultralytics parse_model 通道缩放：make_divisible(min(c, max_ch) * width, 8)。"""
+    """ultralytics parse_model 通道缩放：make_divisible(min(c, max_ch) * width, 8) /
+    ultralytics parse_model channel scaling."""
     _, width, max_channels = YOLO26_SCALES[get_scale(scale)]
     return make_divisible(min(channels, max_channels) * width)
 
 
 def scaled_repeats(repeats, scale=DEFAULT_SCALE):
-    """ultralytics parse_model 层重复次数缩放：max(round(n * depth), 1)。"""
+    """ultralytics parse_model 层重复次数缩放：max(round(n * depth), 1) /
+    ultralytics parse_model layer repeat scaling."""
     depth, _, _ = YOLO26_SCALES[get_scale(scale)]
     return max(round(repeats * depth), 1)
 
 
 def model_name(scale=DEFAULT_SCALE):
-    """官方风格模型名，如 YOLO26n / YOLO26x。"""
+    """官方风格模型名，如 YOLO26n / YOLO26x / Official-style model name, e.g. YOLO26n / YOLO26x."""
     return f"YOLO26{get_scale(scale).upper()}"
 
 
 def base_name(scale=DEFAULT_SCALE, task=""):
-    """权重 / checkpoint 基础名，如 yolo26n、yolo26s-seg。"""
+    """权重 / checkpoint 基础名，如 yolo26n、yolo26s-seg / Base name for weights / checkpoint, e.g. yolo26n, yolo26s-seg."""
     return f"yolo26{get_scale(scale)}" + (f"-{task}" if task else "")
 
 
 def detect_head_channels(scale=DEFAULT_SCALE):
-    """Detect 头三尺度输入通道（层 16/19/22 输出，yaml 基准 256/512/1024）。"""
+    """Detect 头三尺度输入通道（层 16/19/22 输出，yaml 基准 256/512/1024） /
+    Three-scale input channels for Detect head (layer 16/19/22 outputs, yaml base 256/512/1024)."""
     return tuple(scaled_channels(c, scale) for c in (256, 512, 1024))
 
 # ---------------------------------------------------------------------------
-# 量化后端可切换：dorefa / lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / pact
-# 每个后端文件都实现了同一套算子；set_quant_method() 切换后再实例化量化模型即可。
+# 量化后端可切换：dorefa / lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / pact /
+# Quant backend is switchable: dorefa / lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / pact
+# 每个后端文件都实现了同一套算子；set_quant_method() 切换后再实例化量化模型即可 /
+# Each backend file implements the same operator set; call set_quant_method() before instantiating quant model.
 # ---------------------------------------------------------------------------
 DEFAULT_QUANT_METHOD = "lsqplus_v1"
 QUANT_METHOD = DEFAULT_QUANT_METHOD
@@ -136,7 +265,8 @@ QuantReLU = getattr(Q, 'QuantReLU', None)
 
 
 def set_quant_method(method):
-    """切换量化后端（必须在构建 QuantYOLO26 之前调用）。"""
+    """切换量化后端（必须在构建 QuantYOLO26 之前调用） /
+    Switch quant backend (must call before constructing QuantYOLO26)."""
     global Q, QUANT_METHOD
     global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantMaxPool, QuantSiLU, QuantSigmoid, QuantReLU
 
@@ -153,11 +283,11 @@ def set_quant_method(method):
     return Q
 
 
-# ============================== 基础组件 ==============================
+# ============================== 基础组件 / Basic Components ==============================
 
 
 class FloatAdd(nn.Module):
-    """浮点残差加法（无参数）。"""
+    """浮点残差加法（无参数） / Float residual addition (parameter-free)."""
 
     def forward(self, a, b):
         return a + b
@@ -169,14 +299,15 @@ def autopad(kernel_size, padding=None, dilation=1):
 
 
 def make_bn(channels):
-    # 与 ultralytics 保持一致：eps=1e-3, momentum=0.03
+    # 与 ultralytics 保持一致：eps=1e-3, momentum=0.03 / Keep consistent with ultralytics: eps=1e-3, momentum=0.03
     return nn.BatchNorm2d(channels, eps=1e-3, momentum=0.03)
 
 
 class Conv(nn.Module):
-    """Conv + BN + SiLU；quant=True 时卷积换成 QuantConv2d。
+    """Conv + BN + SiLU；quant=True 时卷积换成 QuantConv2d / Conv + BN + SiLU; quant=True replaces conv with QuantConv2d.
 
-    与 ultralytics.nn.modules.Conv 同名同结构（self.conv / self.bn / self.act）。
+    与 ultralytics.nn.modules.Conv 同名同结构（self.conv / self.bn / self.act） /
+    Same name and structure as ultralytics.nn.modules.Conv (self.conv / self.bn / self.act).
     """
 
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True, bias=False, quant=False):
@@ -199,7 +330,8 @@ class Conv(nn.Module):
 
 
 class Bottleneck(nn.Module):
-    """标准瓶颈块：cv1(3x3) -> cv2(3x3)，同通道时带残差加法。"""
+    """标准瓶颈块：cv1(3x3) -> cv2(3x3)，同通道时带残差加法 /
+    Standard bottleneck: cv1(3x3) -> cv2(3x3), with residual add when channels match."""
 
     def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5, quant=False):
         super().__init__()
@@ -215,7 +347,7 @@ class Bottleneck(nn.Module):
 
 
 class C3(nn.Module):
-    """CSP Bottleneck with 3 convolutions（C3k 的基类）。"""
+    """CSP Bottleneck with 3 convolutions（C3k 的基类） / CSP Bottleneck with 3 convolutions (base class of C3k)."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, quant=False):
         super().__init__()
@@ -236,7 +368,8 @@ class C3(nn.Module):
 
 
 class C3k(C3):
-    """C3k：内部堆叠 n 个 3x3 Bottleneck（yolo26n 中 n=2）。"""
+    """C3k：内部堆叠 n 个 3x3 Bottleneck（yolo26n 中 n=2） /
+    C3k: stacks n 3x3 Bottlenecks internally (n=2 in yolo26n)."""
 
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3, quant=False):
         super().__init__(c1, c2, n, shortcut, g, e, quant=quant)
@@ -247,7 +380,7 @@ class C3k(C3):
 
 
 class C2f(nn.Module):
-    """CSP Bottleneck with 2 convolutions（C3k2 的基类）。"""
+    """CSP Bottleneck with 2 convolutions（C3k2 的基类） / CSP Bottleneck with 2 convolutions (base class of C3k2)."""
 
     def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, quant=False):
         super().__init__()
@@ -266,7 +399,8 @@ class C2f(nn.Module):
 
 
 class C3k2(C2f):
-    """yolo26n 主干核心块。c3k=True 时使用 C3k，attn=True 时使用 Bottleneck+PSABlock。"""
+    """yolo26n 主干核心块。c3k=True 时使用 C3k，attn=True 时使用 Bottleneck+PSABlock /
+    yolo26n backbone core block. Uses C3k when c3k=True, Bottleneck+PSABlock when attn=True."""
 
     def __init__(self, c1, c2, n=1, c3k=False, e=0.5, attn=False, g=1, shortcut=True, quant=False):
         super().__init__(c1, c2, n, shortcut, g, e, quant=quant)
@@ -284,7 +418,8 @@ class C3k2(C2f):
 
 
 class Attention(nn.Module):
-    """PSA 多头自注意力（qkv / proj / pe 为卷积；matmul+softmax 保持浮点）。"""
+    """PSA 多头自注意力（qkv / proj / pe 为卷积；matmul+softmax 保持浮点） /
+    PSA multi-head self-attention (qkv / proj / pe are convolutions; matmul+softmax stays float)."""
 
     def __init__(self, dim, num_heads=8, attn_ratio=0.5, quant=False):
         super().__init__()
@@ -311,7 +446,7 @@ class Attention(nn.Module):
 
 
 class PSABlock(nn.Module):
-    """注意力 + FFN，两条残差加法。"""
+    """注意力 + FFN，两条残差加法 / Attention + FFN, two residual additions."""
 
     def __init__(self, c, attn_ratio=0.5, num_heads=4, shortcut=True, quant=False):
         super().__init__()
@@ -328,7 +463,7 @@ class PSABlock(nn.Module):
 
 
 class C2PSA(nn.Module):
-    """C2PSA：cv1 降维 -> PSABlock 序列 -> cv2 融合。"""
+    """C2PSA：cv1 降维 -> PSABlock 序列 -> cv2 融合 / C2PSA: cv1 dim-reduce -> PSABlock sequence -> cv2 fuse."""
 
     def __init__(self, c1, c2, n=1, e=0.5, quant=False):
         super().__init__()
@@ -351,7 +486,8 @@ class C2PSA(nn.Module):
 
 
 class SPPF(nn.Module):
-    """YOLO26 版 SPPF：cv1 不带激活，串联 3 次 MaxPool，shortcut 残差加法。"""
+    """YOLO26 版 SPPF：cv1 不带激活，串联 3 次 MaxPool，shortcut 残差加法 /
+    YOLO26-style SPPF: cv1 no activation, 3 chained MaxPools, shortcut residual add."""
 
     def __init__(self, c1, c2, k=5, n=3, shortcut=False, quant=False):
         super().__init__()
@@ -378,7 +514,8 @@ class SPPF(nn.Module):
 
 
 class Concat(nn.Module):
-    """PAN-FPN 中的拼接节点（对应 yaml 里的 Concat 层）。"""
+    """PAN-FPN 中的拼接节点（对应 yaml 里的 Concat 层） /
+    Concat node in PAN-FPN (corresponds to Concat layer in yaml)."""
 
     def __init__(self, dimension=1, quant=False):
         super().__init__()
@@ -392,10 +529,13 @@ class Concat(nn.Module):
 
 
 class Detect(nn.Module):
-    """YOLO26 Detect 检测头（单 one2many 头，reg_max=1，分类支路为 DWConv）。
+    """YOLO26 Detect 检测头（单 one2many 头，reg_max=1，分类支路为 DWConv） /
+    YOLO26 Detect head (single one2many head, reg_max=1, class branch uses DWConv).
 
-    训练时返回 dict(boxes/scores/feats) 供 v8DetectionLoss 使用；
-    评估时返回解码后的 (B, 4+nc, num_anchors) 检测张量（xywh + sigmoid 分数）。
+    训练时返回 dict(boxes/scores/feats) 供 v8DetectionLoss 使用 /
+    During training returns dict(boxes/scores/feats) for v8DetectionLoss;
+    评估时返回解码后的 (B, 4+nc, num_anchors) 检测张量（xywh + sigmoid 分数） /
+    During eval returns decoded (B, 4+nc, num_anchors) detection tensor (xywh + sigmoid scores).
     """
 
     def __init__(self, nc=NUM_CLASSES, reg_max=1, ch=(64, 128, 256), quant=False):
@@ -440,7 +580,7 @@ class Detect(nn.Module):
         preds = self.forward_head(x)
         if self.training:
             return preds
-        # 推理：ltrb 距离 -> xywh 框（×stride），分类 sigmoid
+        # 推理：ltrb 距离 -> xywh 框（×stride），分类 sigmoid / Inference: ltrb distances -> xywh bbox (×stride), class sigmoid
         shape = x[0].shape
         if self._feat_shape != shape:
             self._anchors, self._strides_tensor = (
@@ -457,7 +597,7 @@ class Detect(nn.Module):
             cls_head[-1].bias.data[: self.nc] = math.log(5 / self.nc / (640 / self.stride[i]) ** 2)
 
 
-# ============================== 网络主体 ==============================
+# ============================== 网络主体 / Network Body ==============================
 
 
 def _tag(module, index, source):
@@ -467,12 +607,15 @@ def _tag(module, index, source):
 
 
 class YOLO26(nn.Module):
-    """YOLO26 检测网络（scale 可选 n/s/m/l/x）。quant=False 浮点模型，True 为 aLSQ+ 伪量化模型。
+    """YOLO26 检测网络（scale 可选 n/s/m/l/x） / YOLO26 detection network (scale n/s/m/l/x optional).
+    quant=False 浮点模型，True 为 aLSQ+ 伪量化模型 / quant=False for float model, True for aLSQ+ pseudo-quantized model.
 
-    层编号 / 拓扑 / 命名与 ultralytics 解析 yolo26.yaml 得到的 DetectionModel 一致，
+    层编号 / 拓扑 / 命名与 ultralytics 解析 yolo26.yaml 得到的 DetectionModel 一致 /
+    Layer index / topology / naming consistent with DetectionModel parsed from yolo26.yaml by ultralytics,
     通道按 make_divisible(min(c, max_ch)*width, 8)、重复次数按 max(round(n*depth), 1)
     缩放（与 parse_model 相同），因此浮点模型可直接加载对应尺度 yolo26{scale}.pt 的
-    state_dict。
+    state_dict / channels scaled via make_divisible(min(c, max_ch)*width, 8), repeats via
+    max(round(n*depth), 1) (same as parse_model), so float model can directly load yolo26{scale}.pt state_dict.
     """
 
     def __init__(self, nc=NUM_CLASSES, quant=False, scale=DEFAULT_SCALE):
@@ -480,12 +623,14 @@ class YOLO26(nn.Module):
         self.quant = quant
         self.nc = nc
         self.scale = get_scale(scale)
-        self.yaml_file = f"{base_name(self.scale)}.yaml"  # 供官方 model_info 打印模型名
+        self.yaml_file = f"{base_name(self.scale)}.yaml"  # 供官方 model_info 打印模型名 / for official model_info to print model name
         s = self.scale
-        C = lambda c: scaled_channels(c, s)  # 通道缩放
-        N = lambda r: scaled_repeats(r, s)   # 层重复次数缩放
-        # ultralytics parse_model 特殊规则：M/L/X 尺度所有 C3k2 强制 c3k=True
-        # （tasks.py: `if scale in {"m", "l", "x"}: args[3:4] = [True]`，覆盖 yaml 的 False）
+        C = lambda c: scaled_channels(c, s)  # 通道缩放 / channel scaling
+        N = lambda r: scaled_repeats(r, s)   # 层重复次数缩放 / layer repeat scaling
+        # ultralytics parse_model 特殊规则：M/L/X 尺度所有 C3k2 强制 c3k=True /
+        # ultralytics parse_model special rule: all C3k2 forced c3k=True for M/L/X scales
+        # （tasks.py: `if scale in {"m", "l", "x"}: args[3:4] = [True]`，覆盖 yaml 的 False） /
+        # (tasks.py: overrides yaml's False)
         c3k_all = s in ("m", "l", "x")
         layers = []
 
@@ -531,33 +676,38 @@ class YOLO26(nn.Module):
         self._initialize_head()
 
     def _register_quantizer_buffers(self):
-        """把量化器的 init_state 注册为持久化 buffer。
+        """把量化器的 init_state 注册为持久化 buffer / Register quantizer init_state as persistent buffer.
 
         LSQPlus*Quantizer 原生的 init_state 是普通 int，不会进入 state_dict，
-        checkpoint 重载后会回到 0，导致前向时用本批统计量覆盖已校准/训练好的 s。
-        注册成 buffer 后可随 checkpoint 保存与恢复。
+        checkpoint 重载后会回到 0，导致前向时用本批统计量覆盖已校准/训练好的 s /
+        Native LSQPlus*Quantizer init_state is a plain int, not in state_dict;
+        after checkpoint reload it reverts to 0, causing current-batch stats to
+        overwrite calibrated/trained s during forward.
+        注册成 buffer 后可随 checkpoint 保存与恢复 / Registering as buffer saves/restores with checkpoint.
         """
         for module in self.modules():
             if "init_state" in dict(module.named_buffers()):
                 continue
             if hasattr(module, "init_state"):
                 value = int(module.init_state)
-                del module.init_state  # 普通 int 属性需先删除才能注册同名 buffer
+                del module.init_state  # 普通 int 属性需先删除才能注册同名 buffer / plain int attribute must be deleted first to register same-name buffer
                 module.register_buffer(
                     "init_state", torch.tensor(value), persistent=True
                 )
 
     def _initialize_head(self):
-        """用一次 dummy 前向推算 stride 并初始化 Detect 偏置（官方做法）。
+        """用一次 dummy 前向推算 stride 并初始化 Detect 偏置（官方做法） /
+        Use one dummy forward to infer strides and init Detect bias (official approach).
 
         注意：dummy 输入不能用全零！LSQ v1 的 activation_quantizer 用全零
-        初始化 s=0，之后 torch.div(x, 0) → NaN。
-        用 randn 让每个 quantizer 得到合理的初始 s。
+        初始化 s=0，之后 torch.div(x, 0) → NaN / Note: dummy input must NOT be all zeros!
+        LSQ v1 activation_quantizer initializes s=0 with all-zeros, causing torch.div(x,0) → NaN.
+        用 randn 让每个 quantizer 得到合理的初始 s / Use randn so each quantizer gets a reasonable initial s.
         """
         was_training = self.training
         self.eval()
         with torch.no_grad():
-            dummy = torch.randn(1, 3, IMGSZ, IMGSZ) * 0.1  # 小随机噪声，避免全零
+            dummy = torch.randn(1, 3, IMGSZ, IMGSZ) * 0.1  # 小随机噪声，避免全零 / small random noise, avoid all zeros
             feats = self._forward_features(dummy)
             head = self.model[-1]
             head.stride = torch.tensor([IMGSZ / f.shape[-2] for f in feats])
@@ -604,7 +754,7 @@ class QuantYOLO26(YOLO26):
         super().__init__(nc=nc, quant=True, scale=scale)
 
 
-# ============================== 数据 / 损失 / 评估 ==============================
+# ============================== 数据 / 损失 / 评估 / Data / Loss / Evaluation ==============================
 
 
 def _make_cfg(num_workers):
@@ -616,10 +766,13 @@ def _make_cfg(num_workers):
 
 
 def _build_loaders(batch_size, num_workers, data, calibration=False):
-    """构建 dataloader；train 模式额外返回 cfg / train_set（close_mosaic 需要引用）。
+    """构建 dataloader；train 模式额外返回 cfg / train_set（close_mosaic 需要引用） /
+    Build dataloader; train mode additionally returns cfg / train_set (required by close_mosaic).
 
     train：640x640 + mosaic/翻转等增强；val：rect letterbox；
-    calibration：无增强的 640x640 letterbox。
+    calibration：无增强的 640x640 letterbox /
+    train: 640x640 + mosaic/flip etc. augmentations; val: rect letterbox;
+    calibration: no-aug 640x640 letterbox.
     """
     cfg = _make_cfg(num_workers)
     if calibration:
@@ -640,8 +793,8 @@ def _build_loaders(batch_size, num_workers, data, calibration=False):
 
 
 def get_dataloaders(batch_size=8, num_workers=2, calibration=False):
-    """复用 ultralytics 官方 coco128 数据管道。"""
-    data = check_det_dataset(COCO128_YAML)
+    """复用 ultralytics 官方 coco128 数据管道 / Reuse ultralytics official coco128 data pipeline."""
+    data = get_data_dict(DATA_YAML, "detect")
     if calibration:
         return _build_loaders(batch_size, num_workers, data, calibration=True), data
     train_loader, val_loader, _, _ = _build_loaders(batch_size, num_workers, data)
@@ -649,7 +802,8 @@ def get_dataloaders(batch_size=8, num_workers=2, calibration=False):
 
 
 class _LossShim:
-    """v8DetectionLoss 只需要 model.args / model.model[-1] / model.parameters()。"""
+    """v8DetectionLoss 只需要 model.args / model.model[-1] / model.parameters() /
+    v8DetectionLoss only needs model.args / model.model[-1] / model.parameters()."""
 
     def __init__(self, detect_head, epochs):
         self.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=epochs)
@@ -668,7 +822,8 @@ IOU_VECTOR = torch.linspace(0.5, 0.95, 10)
 
 
 def _match_predictions(pred_labels, pred_bboxes, gt_labels, gt_bboxes, iou_vector):
-    """复刻 ultralytics BaseValidator._process_batch：在 10 个 IoU 阈值上匹配预测与 GT。"""
+    """复刻 ultralytics BaseValidator._process_batch：在 10 个 IoU 阈值上匹配预测与 GT /
+    Replicate ultralytics BaseValidator._process_batch: match predictions and GT at 10 IoU thresholds."""
     iou = box_iou(gt_bboxes, pred_bboxes)
     correct = torch.zeros(pred_bboxes.shape[0], iou_vector.numel(), dtype=torch.bool)
     correct_class = gt_labels[:, None] == pred_labels[None, :]
@@ -687,14 +842,68 @@ def _match_predictions(pred_labels, pred_bboxes, gt_labels, gt_bboxes, iou_vecto
     return correct
 
 
+def _maybe_visualize(batch, predictions, names, viz_dir, viz_prefix, viz_state):
+    """用 ultralytics 官方 plot_images 保存本批的 GT 拼图与预测拼图（val_batch 风格，与官方验证器一致） /
+    Use official ultralytics plot_images to save GT and prediction mosaics of this batch (val_batch style, same as official validators).
+
+    viz_state 跨 batch 记录已保存图片数 / viz_state tracks saved image count across batches.
+    """
+    os.makedirs(viz_dir, exist_ok=True)
+    bs = batch["img"].shape[0]
+    bi = viz_state["batch"]
+    # GT 拼图（labels）：cls + 归一化 xywh 框 + batch_idx，与官方 plot_val_samples 一致 /
+    # GT mosaic (labels): cls + normalized xywh boxes + batch_idx, same as official plot_val_samples
+    plot_images(
+        labels={
+            "cls": batch["cls"].squeeze(-1),
+            "bboxes": batch["bboxes"],
+            "batch_idx": batch["batch_idx"],
+        },
+        images=batch["img"],
+        paths=batch.get("im_file"),
+        fname=os.path.join(viz_dir, f"{viz_prefix}_batch{bi}_labels.jpg"),
+        names=names,
+        threaded=False,  # 训练循环内同步执行，避免线程堆积 / run synchronously inside training loop to avoid thread pile-up
+    )
+    # 预测拼图（preds）：与官方 plot_predictions 一致，bboxes 需 xyxy→xywh /
+    # Prediction mosaic (preds): same as official plot_predictions, bboxes need xyxy→xywh
+    if any(p.shape[0] for p in predictions):
+        plot_images(
+            labels={
+                "cls": torch.cat([p[:, 5] for p in predictions]),
+                "conf": torch.cat([p[:, 4] for p in predictions]),
+                "bboxes": xyxy2xywh(torch.cat([p[:, :4] for p in predictions])),
+                "batch_idx": torch.cat(
+                    [torch.full((p.shape[0],), i) for i, p in enumerate(predictions)]
+                ),
+            },
+            images=batch["img"],
+            paths=batch.get("im_file"),
+            fname=os.path.join(viz_dir, f"{viz_prefix}_batch{bi}_pred.jpg"),
+            names=names,
+            threaded=False,
+        )
+    viz_state["saved"] += bs
+    viz_state["batch"] += 1
+
+
 @torch.no_grad()
-def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres=0.001, iou_thres=0.7):
-    """在验证集上计算 mAP50 / mAP50-95（NMS + ap_per_class，与官方一致）。"""
+def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres=0.001,
+             iou_thres=0.7, viz_dir=None, viz_max=30, viz_prefix="eval"):
+    """在验证集上计算 mAP50 / mAP50-95（NMS + ap_per_class，与官方一致）。
+    若 viz_dir 不为空，额外把前 viz_max 张验证图的 GT/预测拼图保存到 {viz_dir}/fvisualize/ /
+    Compute mAP50 / mAP50-95 on val set (NMS + ap_per_class, consistent with official).
+    If viz_dir is set, additionally save GT/prediction mosaics of the first viz_max val images into {viz_dir}/fvisualize/."""
     model.eval()
     stats_conf, stats_pcls, stats_tcls, stats_tp = [], [], [], []
     names = data.names if hasattr(data, 'names') else data["names"]
     num_images = len(val_loader.dataset)
     steps = max_batches or math.ceil(num_images / batch_size)
+    # 可视化输出目录与计数器 / visualization output dir and counters
+    viz_out = os.path.join(viz_dir, "fvisualize") if viz_dir else None
+    viz_state = {"saved": 0, "batch": 0}
+    if viz_out:
+        os.makedirs(viz_out, exist_ok=True)
 
     for batch_index, batch in enumerate(val_loader):
         if batch_index >= steps:
@@ -709,6 +918,13 @@ def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres
             max_det=300,
         )
         image_size = batch["img"].shape[2:]
+
+        # 每次评估都可视化前几批（失败仅告警，绝不影响评估） / visualize first batches on every evaluate (failure only warns, never breaks eval)
+        if viz_out and viz_state["saved"] < viz_max:
+            try:
+                _maybe_visualize(batch, predictions, names, viz_out, viz_prefix, viz_state)
+            except Exception as exc:
+                print(f"      [viz] 可视化保存失败（仅告警）: {exc} / visualization save failed (warn only): {exc}")
 
         for sample_index, pred in enumerate(predictions):
             index = batch["batch_idx"] == sample_index
@@ -747,7 +963,7 @@ def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres
     }
 
 
-# ============================== checkpoint / 权重复制 / 导出 ==============================
+# ============================== checkpoint / 权重复制 / 导出 / checkpoint / Weight Copy / Export ==============================
 
 
 def load_checkpoint(model, path, return_meta=False):
@@ -759,7 +975,7 @@ def load_checkpoint(model, path, return_meta=False):
         state_dict = checkpoint
         meta = {}
 
-    # 过滤 shape mismatch（不同数据集 nc 变化时 Detect head）
+    # 过滤 shape mismatch（不同数据集 nc 变化时 Detect head） / Filter shape mismatch (Detect head when nc changes across datasets)
     model_sd = model.state_dict()
     filtered = {k: v for k, v in state_dict.items()
                 if k in model_sd and model_sd[k].shape == v.shape}
@@ -769,7 +985,7 @@ def load_checkpoint(model, path, return_meta=False):
         print(f"[load_checkpoint] 跳过 {len(skipped)} 个 shape mismatch 参数")
     if len(filtered) < len(model_sd):
         missing = set(model_sd.keys()) - set(filtered.keys())
-        # 只打印非 QuantCat 的 missing（QuantCat init_state=0 是正常的）
+        # 只打印非 QuantCat 的 missing（QuantCat init_state=0 是正常的） / Only print non-QuantCat missing (QuantCat init_state=0 is normal)
         meaningful = [k for k in missing if 'QuantCat' not in k or 'init_state' not in k]
         if meaningful:
             print(f"[load_checkpoint] missing {len(meaningful)} 参数 (可能是 QuantCat init)")
@@ -786,20 +1002,57 @@ def save_checkpoint(model, path, **metadata):
         torch.save(model.state_dict(), path)
 
 
-def load_pretrained(model, path=None, scale=DEFAULT_SCALE):
-    """加载官方 yolo26{scale}.pt 权重；自动跳过 one2one_* 双头权重和 shape mismatch（nc 变化）。
+def resolve_pretrained_path(path):
+    """解析预训练权重路径：官方权重名缺失时像 ultralytics 一样自动下载 /
+    Resolve the pretrained-weight path: when an official asset name is missing locally, auto-download it like ultralytics.
 
-    仓库仅随附 yolo26n.pt；s/m/l/x 缺失时跳过加载，模型随机初始化从头训练。
+    - 路径已存在：原样返回（用户自定义文件或本地官方权重均可） / Existing path (user file or local official weight): returned as-is.
+    - 文件名属于 ultralytics 官方发布资产（如 yolo26n.pt / yolo26s-seg.pt）：调用
+      ``ultralytics.utils.downloads.attempt_download_asset`` 从 GitHub Releases 下载到该路径 /
+      Basename is an official ultralytics release asset (e.g. yolo26n.pt / yolo26s-seg.pt): downloaded from
+      GitHub Releases into that path via ``attempt_download_asset``.
+    - 其余自定义路径缺失或下载失败：返回 None，由调用方按“从头训练”处理 /
+      Any other missing custom path, or download failure: returns None; caller falls back to random init.
+
+    参考 / Reference: https://github.com/ultralytics/ultralytics/blob/main/README.md
+    """
+    if path and os.path.exists(path):
+        return path
+    fname = os.path.basename(path) if path else ""
+    try:
+        from ultralytics.utils.downloads import GITHUB_ASSETS_NAMES, attempt_download_asset
+        if fname in GITHUB_ASSETS_NAMES:
+            print(f"[Pretrain] 本地未找到官方权重 {fname}，按 ultralytics 方式从 GitHub Releases 自动下载 ...")
+            downloaded = attempt_download_asset(path)  # 传入绝对路径时会直接下载到该路径 / absolute path downloads in place
+            if downloaded and os.path.exists(downloaded):
+                print(f"[Pretrain] 自动下载完成: {downloaded}")
+                return downloaded
+            print(f"[Pretrain] [warn] 自动下载未产出文件: {fname}")
+    except Exception as e:  # 离线 / 网络受限环境下优雅退回从头训练 / Graceful fallback to random init when offline
+        print(f"[Pretrain] [warn] 自动下载 {fname} 失败（{e}）")
+    return None
+
+
+def load_pretrained(model, path=None, scale=DEFAULT_SCALE):
+    """加载官方 yolo26{scale}.pt 权重；自动跳过 one2one_* 双头权重和 shape mismatch（nc 变化） /
+    Load official yolo26{scale}.pt weights; auto-skip one2one_* dual-head weights and shape mismatch (nc changes).
+
+    path 为官方权重名（如 yolo26n.pt / yolo26s.pt）且本地缺失时，会像 ultralytics 一样自动从 GitHub Releases 下载；
+    path 为用户自定义路径时直接加载该文件，缺失则从头训练 /
+    When path is an official asset name (e.g. yolo26n.pt / yolo26s.pt) missing locally, it is auto-downloaded from
+    GitHub Releases like ultralytics; a user-defined path is loaded directly, and training starts from scratch if it is missing.
     """
     if path is None:
         path = os.path.join(ULTRA_DIR, f"{base_name(scale)}.pt")
-    if not os.path.exists(path):
-        print(f"[Pretrain] [warn] 未找到预训练权重 {path}，{model_name(scale)} 将从头训练")
+    path = resolve_pretrained_path(path)
+    if path is None:
+        print(f"[Pretrain] [warn] 未找到预训练权重，{model_name(scale)} 将从头训练")
         return model
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     state_dict = checkpoint["model"].float().state_dict()
 
-    # 过滤 shape mismatch 的 key（COCO 80类 → VOC 20类 时 Detect head 分类层）
+    # 过滤 shape mismatch 的 key（COCO 80类 → VOC 20类 时 Detect head 分类层） /
+    # Filter shape mismatch keys (Detect head class layer when COCO 80 classes → VOC 20 classes)
     model_sd = model.state_dict()
     filtered = {k: v for k, v in state_dict.items()
                 if k in model_sd and model_sd[k].shape == v.shape}
@@ -824,15 +1077,19 @@ def copy_float_to_quant(float_model, quant_model):
         if key in quant_state and quant_state[key].shape == value.shape:
             quant_state[key] = value.detach().clone().to(device=quant_state[key].device)
     quant_model.load_state_dict(quant_state)
-    # 灌入真实权重后，让所有量化器从第 0 批重新统计 scale/beta（构建模型时的
-    # dummy 零输入前向可能已经把 init_state 推到 1）：各后端的量化器在
-    # init_state==0 的首次前向都会用自己的原生公式按真实权重/激活重新初始化。
+    # 灌入真实权重后，让所有量化器从第 0 批重新统计 scale/beta（构建模型时的 /
+    # After injecting real weights, let all quantizers re-collect scale/beta from batch 0 (dummy zero-input
+    # dummy 零输入前向可能已经把 init_state 推到 1）：各后端的量化器在 /
+    # forward during model construction may have already pushed init_state to 1): each backend's quantizer at
+    # init_state==0 的首次前向都会用自己的原生公式按真实权重/激活重新初始化 /
+    # first forward with init_state==0 re-initializes using its native formula on real weights/activations.
     quant_pkg.reset_quantizer_states(quant_model)
     return quant_model
 
 
 def build_float_model(quant_model, nc=NUM_CLASSES, scale=DEFAULT_SCALE):
-    """把量化模型的反量化权重灌进同结构的干净浮点模型（用于导出纯浮点 ONNX）。"""
+    """把量化模型的反量化权重灌进同结构的干净浮点模型（用于导出纯浮点 ONNX） /
+    Inject dequantized weights from quant model into a clean float model of same architecture (for pure-float ONNX export)."""
     quant_pkg.freeze_batch_init(quant_model)
     quant_model.eval()
 
@@ -856,15 +1113,25 @@ def build_float_model(quant_model, nc=NUM_CLASSES, scale=DEFAULT_SCALE):
 
 
 def collect_quant_params(quant_model):
-    # 各后端 scale/zero_point 提取差异由 quantization 包统一处理
+    # 各后端 scale/zero_point 提取差异由 quantization 包统一处理 / Backend-specific scale/zero_point extraction unified by quantization package
     return quant_pkg.collect_quant_params(quant_model)
 
 
-def export_onnx(float_model, onnx_path, opset=16):
+def export_onnx(float_model, onnx_path, opset=16, imgsz=None):
+    """导出 ONNX，输入形状完全固定为 [1, 3, H, W]（无 dynamic_axes，图尺寸清晰可见） /
+    Export ONNX with fully static input shape [1, 3, H, W] (no dynamic_axes, graph dimensions clearly visible).
+
+    Args / 参数:
+        float_model: 浮点模型（或已反量化的"干净"模型） / Float model (or dequantized "clean" model)
+        onnx_path: 输出 .onnx 路径 / Output .onnx path
+        opset: ONNX opset，默认 16 / ONNX opset, default 16
+        imgsz: 输入图像尺寸 H=W；默认模块级 IMGSZ(640) / Input image size H=W; default module-level IMGSZ (640)
+    """
+    H = W = imgsz if imgsz is not None else IMGSZ
     os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
     float_model.eval()
     model_device = next(float_model.parameters()).device
-    dummy = torch.randn(1, 3, IMGSZ, IMGSZ, device=model_device)
+    dummy = torch.randn(1, 3, H, W, device=model_device)
     torch.onnx.export(
         float_model,
         dummy,
@@ -875,9 +1142,9 @@ def export_onnx(float_model, onnx_path, opset=16):
         dynamo=False,
         input_names=["images"],
         output_names=["preds"],
-        dynamic_axes={"images": {0: "batch_size"}, "preds": {0: "batch_size"}},
+        # 无 dynamic_axes → 输入形状完全固定 [1, 3, H, W] / No dynamic_axes → input shape fully fixed [1, 3, H, W]
     )
-    # onnxsim 简化（若已安装）
+    # onnxsim 简化（若已安装） / onnxsim simplification (if installed)
     try:
         import onnx
         from onnxsim import simplify as onnxsim_simplify
@@ -896,9 +1163,11 @@ def export_onnx(float_model, onnx_path, opset=16):
 
 
 def _try_export_onnx(model, onnx_path):
-    """训练保存 best checkpoint 时同步导出 ONNX；失败仅告警，绝不影响训练。
+    """训练保存 best checkpoint 时同步导出 ONNX；失败仅告警，绝不影响训练 /
+    Export ONNX synchronously when saving best checkpoint during training; failure only warns, never affects training.
 
-    导出后模型被置为 eval，由下一轮 train_one_epoch 的 model.train() 恢复。
+    导出后模型被置为 eval，由下一轮 train_one_epoch 的 model.train() 恢复 /
+    Model is set to eval after export; next train_one_epoch model.train() restores it.
     """
     try:
         export_onnx(model, onnx_path)
@@ -932,8 +1201,9 @@ def verify(float_model, quant_model, onnx_path, quant_params):
         max_diff = float(np.abs(y_torch - y_onnx).max())
         ref_mag = float(np.abs(y_torch).max())
         print(f"      onnxruntime vs PyTorch 最大绝对误差: {max_diff:.3e}（参考幅度 {ref_mag:.3e}）")
-        # 输出含大数量级解码坐标（如 0~imgsz 的 box 值），纯绝对阈值过严：
-        # 改为 max(1e-3 绝对, 1e-5 相对)，仍足以抓住导出结构错误
+        # 输出含大数量级解码坐标（如 0~imgsz 的 box 值），纯绝对阈值过严： /
+        # Output contains large-magnitude decoded coordinates (e.g. 0~imgsz box values); pure abs threshold too strict:
+        # 改为 max(1e-3 绝对, 1e-5 相对)，仍足以抓住导出结构错误 / change to max(1e-3 abs, 1e-5 rel), still sufficient to catch export structural errors
         assert max_diff < max(1e-3, 1e-5 * ref_mag), (
             f"ONNX 数值误差过大: {max_diff}（参考幅度 {ref_mag:.3e}）"
         )
@@ -946,16 +1216,19 @@ def verify(float_model, quant_model, onnx_path, quant_params):
     print(f"      量化参数完整性检查通过（{len(quant_params)} 个张量）")
 
 
-def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None, scale=DEFAULT_SCALE):
+def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None, scale=DEFAULT_SCALE,
+                      model_dir=None):
     quant_pkg.freeze_batch_init(quant_model)
     quant_model.eval()
 
-    quant_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_{base_name(scale)}.pth")
+    if model_dir is None:
+        model_dir = _MODEL_DIR_BASE
+    quant_checkpoint = os.path.join(model_dir, f"{prefix}_{base_name(scale)}.pth")
     save_checkpoint(quant_model, quant_checkpoint, **(meta or {}))
 
     quant_params = collect_quant_params(quant_model)
-    json_path = os.path.join(MODEL_DIR, f"{prefix}_quant_params.json")
-    pth_path = os.path.join(MODEL_DIR, f"{prefix}_quant_params.pth")
+    json_path = os.path.join(model_dir, f"{prefix}_quant_params.json")
+    pth_path = os.path.join(model_dir, f"{prefix}_quant_params.pth")
     with open(json_path, "w", encoding="utf-8") as file:
         json.dump(quant_params, file, indent=2, ensure_ascii=False)
     torch.save(
@@ -971,11 +1244,11 @@ def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None, scale=DEF
     print(f"[2/5] 量化参数已写出: {json_path} / {pth_path}（{len(quant_params)} 个张量）")
 
     float_model = build_float_model(quant_model, nc=nc, scale=scale)
-    float_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_{base_name(scale)}_float.pth")
+    float_checkpoint = os.path.join(model_dir, f"{prefix}_{base_name(scale)}_float.pth")
     save_checkpoint(float_model, float_checkpoint)
     print(f"[3/5] 干净浮点权重已写出: {float_checkpoint}")
 
-    onnx_path = os.path.join(MODEL_DIR, f"{prefix}_{base_name(scale)}_float.onnx")
+    onnx_path = os.path.join(model_dir, f"{prefix}_{base_name(scale)}_float.onnx")
     export_onnx(float_model, onnx_path, opset=16)
     print(f"[4/5] 干净浮点 ONNX 已写出: {onnx_path}")
 
@@ -984,13 +1257,16 @@ def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None, scale=DEF
     return quant_checkpoint, json_path, pth_path, float_checkpoint, onnx_path
 
 
-# ============================== 训练各阶段 ==============================
+# ============================== 训练各阶段 / Training Stages ==============================
 
 
 class _ModelEMA:
-    """官方 ModelEMA 精简版：对训练权重做指数滑动平均，验证与保存均使用 EMA 权重。
+    """官方 ModelEMA 精简版：对训练权重做指数滑动平均，验证与保存均使用 EMA 权重 /
+    Lightweight official ModelEMA: exponential moving average on training weights,
+    EMA weights used for validation and saving.
 
-    decay = 0.9999 * (1 - exp(-updates / 2000))，更新次数少时近似直接跟随模型。
+    decay = 0.9999 * (1 - exp(-updates / 2000))，更新次数少时近似直接跟随模型 /
+    decay = 0.9999 * (1 - exp(-updates / 2000)); few updates approximate direct model copy.
     """
 
     def __init__(self, model, decay=0.9999):
@@ -1014,15 +1290,19 @@ class _ModelEMA:
 
 
 def _auto_lr(nc=NUM_CLASSES):
-    """官方 optimizer=auto 的 AdamW 学习率，随类别数自适应（nc=80 → 0.000119）。"""
+    """官方 optimizer=auto 的 AdamW 学习率，随类别数自适应（nc=80 → 0.000119） /
+    Official optimizer=auto AdamW learning rate, adaptive to class count (nc=80 → 0.000119)."""
     return round(0.002 * 5 / (4 + nc), 6)
 
 
 def _build_optimizer(model, lr=None, decay=5e-4):
-    """官方 optimizer=auto 配方：AdamW(betas=(0.9, 0.999))，三参数组分组。
+    """官方 optimizer=auto 配方：AdamW(betas=(0.9, 0.999))，三参数组分组 /
+    Official optimizer=auto recipe: AdamW(betas=(0.9, 0.999)), three param groups.
 
-    weight 组做 weight decay；BN 权重与 bias 不做 decay（量化器 scale s / 偏移
-    beta 也归入无衰减组）；lr=None 时按类别数自适应。
+    weight 组做 weight decay；BN 权重与 bias 不做 decay（量化器 scale s / 偏移 /
+    beta 也归入无衰减组）；lr=None 时按类别数自适应 / weight group has weight decay;
+    BN weights and biases have no decay (quantizer scale s / offset beta also in no-decay group);
+    lr=None → adaptive by class count.
     """
     if lr is None:
         lr = _auto_lr()
@@ -1054,20 +1334,24 @@ def _build_optimizer(model, lr=None, decay=5e-4):
 
 def train_one_epoch(model, loader, criterion, optimizer, epoch, epochs, nb, ema=None,
                     nbs=64, warmup_epochs=3.0, lrf=0.01, max_batches=None):
-    """官方 BaseTrainer 训练循环复刻：线性 lr 衰减 + warmup（lr 与梯度累积同步插值）
-    + 梯度累积到 nbs + 梯度裁剪(10.0) + EMA 更新。
+    """官方 BaseTrainer 训练循环复刻：线性 lr 衰减 + warmup（lr 与梯度累积同步插值） /
+    Official BaseTrainer training loop replica: linear lr decay + warmup (lr interpolated
+    synchronously with gradient accumulation)
+    + 梯度累积到 nbs + 梯度裁剪(10.0) + EMA 更新 /
+    + gradient accumulation to nbs + gradient clipping (10.0) + EMA update.
 
-    criterion 返回已乘 batch_size 的损失向量（官方直接 backward，不除以 batch）
-    与未缩放的 items dict（box_loss / cls_loss / l1_loss）。
+    criterion 返回已乘 batch_size 的损失向量（官方直接 backward，不除以 batch） /
+    criterion returns loss vector already multiplied by batch_size (official backward directly, no batch divide)
+    与未缩放的 items dict（box_loss / cls_loss / l1_loss） / and unscaled items dict (box_loss / cls_loss / l1_loss).
     """
     model.train()
     batch_size = loader.batch_size
     accumulate = max(round(nbs / batch_size), 1)
     warmup_steps = round(min(warmup_epochs, max(epochs - 1, 0)) * nb) if warmup_epochs > 0 else 0
-    # 线性衰减（官方默认 cos_lr=False）：lf(0)=1 → lf(epochs)=lrf
+    # 线性衰减（官方默认 cos_lr=False）：lf(0)=1 → lf(epochs)=lrf / Linear decay (official default cos_lr=False): lf(0)=1 → lf(epochs)=lrf
     lf = lambda x: max(1 - x / epochs, 0) * (1.0 - lrf) + lrf
 
-    # 官方每个 epoch 开始时 scheduler.step()：lr = initial_lr * lf(epoch)
+    # 官方每个 epoch 开始时 scheduler.step()：lr = initial_lr * lf(epoch) / Official scheduler.step() at epoch start: lr = initial_lr * lf(epoch)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lf(epoch)
 
@@ -1077,12 +1361,12 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch, epochs, nb, ema=
     for i, batch in enumerate(loader):
         if i >= total_steps:
             break
-        ni = i + nb * epoch  # 自训练开始的累计 batch 数
+        ni = i + nb * epoch  # 自训练开始的累计 batch 数 / cumulative batch count since training start
         if ni < warmup_steps:
             xi = [0, warmup_steps]
             accumulate = max(1, int(np.interp(ni, xi, [1, nbs / batch_size]).round()))
             for group in optimizer.param_groups:
-                # optimizer=auto 时 warmup_bias_lr=0.0：所有组 lr 从 0 爬升
+                # optimizer=auto 时 warmup_bias_lr=0.0：所有组 lr 从 0 爬升 / optimizer=auto warmup_bias_lr=0.0: all group lr ramps from 0
                 group["lr"] = float(
                     np.interp(ni, xi, [0.0, group["initial_lr"] * lf(epoch)])
                 )
@@ -1124,7 +1408,7 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
         " | warmup 3ep | 梯度累积 nbs=64 | EMA | close_mosaic=10"
     )
 
-    data = check_det_dataset(COCO128_YAML)
+    data = get_data_dict(DATA_YAML, "detect")
     train_loader, val_loader, cfg, train_set = _build_loaders(batch_size, num_workers, data)
     nb = len(train_loader)
 
@@ -1140,11 +1424,12 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
     best_fitness = -1.0
     best_epoch = -1
     best_meta = {}
-    # best checkpoint 加 _best 后缀，与 PTQ/QAT 命名一致
-    checkpoint_path = os.path.join(MODEL_DIR, f"{base_name(scale)}_best.pth")
-    last_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}_last.pth")
+    # best checkpoint 加 _best 后缀，与 PTQ/QAT 命名一致 / best checkpoint uses _best suffix, consistent with PTQ/QAT naming
+    model_dir = _model_dir_for(scale=scale)
+    checkpoint_path = os.path.join(model_dir, f"{base_name(scale)}_best.pth")
+    last_checkpoint = os.path.join(model_dir, f"{base_name(scale)}_last.pth")
 
-    # resume：从 _last.pth 恢复，接续训练
+    # resume：从 _last.pth 恢复，接续训练 / resume: restore from _last.pth, continue training
     start_epoch = 0
     if resume and os.path.exists(last_checkpoint):
         print(f"[Float] Resume from {last_checkpoint}")
@@ -1169,7 +1454,8 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
             max_batches=max_train_batches,
         )
         metrics = evaluate(
-            ema.ema, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+            ema.ema, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+            viz_dir=model_dir, viz_prefix=f"float_ep{epoch + 1:03d}"
         )
         fitness = 0.9 * metrics["map"] + 0.1 * metrics["map50"]
 
@@ -1201,9 +1487,10 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
             f"mAP50:{metrics['map50']:.4f} mAP50-95:{metrics['map']:.4f}"
         )
 
-    load_checkpoint(float_model, checkpoint_path)  # 载入最优 EMA 权重，供后续 PTQ 使用
+    load_checkpoint(float_model, checkpoint_path)  # 载入最优 EMA 权重，供后续 PTQ 使用 / Load best EMA weights for subsequent PTQ
     best_metrics = evaluate(
-        float_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        float_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=model_dir, viz_prefix="float_best"
     )
     print(f"[Float] Best checkpoint: {checkpoint_path}（epoch {best_epoch}/{epochs}）")
     print(f"[Float] Best mAP50:{best_metrics['map50']:.4f} mAP50-95:{best_metrics['map']:.4f}")
@@ -1212,22 +1499,25 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
 
 def _collect_float_ranges_full(float_model, calibration_loader, calibration_batches,
                                normalize_img=True):
-    """收集 float 模型中每个 Conv/Linear + eltwise 算子的运行 min/max 范围。
+    """收集 float 模型中每个 Conv/Linear + eltwise 算子的运行 min/max 范围 /
+    Collect runtime min/max ranges for each Conv/Linear + eltwise op in the float model.
 
-    Hook 策略（全部是 named module 的 forward_pre_hook，不 monkeypatch torch.cat/add 等）：
-      - Conv2d/ConvTranspose2d/Linear: 输入 (单 tensor)
-      - FloatAdd: 两个输入 (A, C) — 同名 QuantAdd
-      - MaxPool2d: 输入 (单 tensor) — 同名 QuantMaxPool
-      - Concat: 输入列表 xs = [tensor, ...] — QuantConcat 在 {name}.op
-      - QuantCat: float 里是 torch.cat 函数调用 (C2f/C3k/SPPF/...)，无同名模块，
-        靠安全网处理
+    Hook 策略（全部是 named module 的 forward_pre_hook，不 monkeypatch torch.cat/add 等） /
+    Hook strategy (all named module forward_hooks, no monkeypatching torch.cat/add etc.):
+      - Conv2d/ConvTranspose2d/Linear: 输入 (单 tensor) / input (single tensor)
+      - FloatAdd: 两个输入 (A, C) — 同名 QuantAdd / two inputs (A, C) — same-name QuantAdd
+      - MaxPool2d: 输入 (单 tensor) — 同名 QuantMaxPool / input (single tensor) — same-name QuantMaxPool
+      - Concat: 输入列表 xs = [tensor, ...] — QuantConcat 在 {name}.op / input list xs = [tensor, ...] — QuantConcat at {name}.op
+      - QuantCat: float 里是 torch.cat 函数调用 (C2f/C3k/SPPF/...)，无同名模块， /
+        QuantCat: torch.cat function call in float (C2f/C3k/SPPF/...), no same-name module,
+        靠安全网处理 / handled by safety net
 
     Returns:
         module_input_ranges: dict[name] = list of [min, max]
-          - Conv/Linear: 1 个输入 → [[min, max]]
-          - FloatAdd: 2 个输入 → [[A_min, A_max], [C_min, C_max]]
-          - Concat: N 个输入 → [[xs[0]_min, xs[0]_max], ...]
-          - MaxPool2d: 1 个输入 → [[min, max]]
+          - Conv/Linear: 1 个输入 → [[min, max]] / 1 input
+          - FloatAdd: 2 个输入 → [[A_min, A_max], [C_min, C_max]] / 2 inputs
+          - Concat: N 个输入 → [[xs[0]_min, xs[0]_max], ...] / N inputs
+          - MaxPool2d: 1 个输入 → [[min, max]] / 1 input
     """
     module_input_ranges = {}
 
@@ -1245,7 +1535,7 @@ def _collect_float_ranges_full(float_model, calibration_loader, calibration_batc
         return hook
 
     def make_multi_input_hook(name):
-        """展开 tuple/list 中的所有 tensor 输入。"""
+        """展开 tuple/list 中的所有 tensor 输入 / Flatten all tensor inputs in tuple/list."""
         def hook(module, inputs, output):
             tensors = []
             for a in inputs:
@@ -1277,7 +1567,7 @@ def _collect_float_ranges_full(float_model, calibration_loader, calibration_batc
             hooks.append(module.register_forward_hook(make_single_input_hook(name)))
         elif cls == 'Concat':
             hooks.append(module.register_forward_hook(make_multi_input_hook(name)))
-        # 激活函数：单输入
+        # 激活函数：单输入 / Activation functions: single input
         elif isinstance(module, (nn.SiLU, nn.Sigmoid, nn.ReLU)):
             hooks.append(module.register_forward_hook(make_single_input_hook(name)))
 
@@ -1302,10 +1592,12 @@ def _collect_float_ranges_full(float_model, calibration_loader, calibration_batc
 
 
 def _set_quantizer_frozen(q):
-    """把量化器标记为已初始化/冻结（兼容 int 与 Tensor 两种 init_state）。
+    """把量化器标记为已初始化/冻结（兼容 int 与 Tensor 两种 init_state） /
+    Mark quantizer as initialized/frozen (supports both int and Tensor init_state).
 
-    与 quantization.freeze_batch_init 的单量化器版本语义一致：只改标志位，
-    不动已写入的 scale/beta/alpha。
+    与 quantization.freeze_batch_init 的单量化器版本语义一致：只改标志位， /
+    Same semantics as quantization.freeze_batch_init single-quantizer version:
+    不动已写入的 scale/beta/alpha / only changes flag bits, does not touch written scale/beta/alpha.
     """
     init_state = getattr(q, "init_state", None)
     if isinstance(init_state, torch.Tensor):
@@ -1318,22 +1610,24 @@ def _set_quantizer_frozen(q):
 
 
 def _apply_minmax_to_quantizer(q, cur_min, cur_max, eps=1e-8):
-    """通用：用 min-max 范围初始化一个量化器，支持全部 7 个后端。
+    """通用：用 min-max 范围初始化一个量化器，支持全部 7 个后端 /
+    Generic: initialize a quantizer with min-max range, supports all 7 backends.
 
-    cur_min / cur_max 允许是 Tensor 或 python float，内部统一转成 float32 Tensor。
-    各后端的 scale 语义不同，按各自原生公式赋值：
-      - minmax:  写 r_min/r_max 并按其 forward 公式重算 scale/zero_point；
-      - pact:    alpha = 绝对值最大（与其原生自初始化一致）；
-      - dorefa:  s = 激活幅度上界（归一化尺度，不是网格 scale）；
-      - lsqplus: s = (max-min)/(Qp-Qn)，beta = min - s*Qn（非对称精确覆盖）；
-      - lsq:     对称网格，取能覆盖 [min, max] 的最小 scale。
+    cur_min / cur_max 允许是 Tensor 或 python float，内部统一转成 float32 Tensor /
+    cur_min / cur_max can be Tensor or python float, internally converted to float32 Tensor.
+    各后端的 scale 语义不同，按各自原生公式赋值 / Each backend has different scale semantics, assigned by its native formula:
+      - minmax:  写 r_min/r_max 并按其 forward 公式重算 scale/zero_point / write r_min/r_max and recompute scale/zero_point per its forward formula;
+      - pact:    alpha = 绝对值最大（与其原生自初始化一致） / alpha = max abs value (consistent with its native self-init);
+      - dorefa:  s = 激活幅度上界（归一化尺度，不是网格 scale） / s = activation magnitude upper bound (normalization scale, not grid scale);
+      - lsqplus: s = (max-min)/(Qp-Qn)，beta = min - s*Qn（非对称精确覆盖） / s = (max-min)/(Qp-Qn), beta = min - s*Qn (asymmetric exact coverage);
+      - lsq:     对称网格，取能覆盖 [min, max] 的最小 scale / symmetric grid, take smallest scale covering [min, max].
     """
     cur_min = torch.as_tensor(cur_min, dtype=torch.float32)
     cur_max = torch.as_tensor(cur_max, dtype=torch.float32)
     if float(cur_min) > float(cur_max):
         cur_min, cur_max = cur_max, cur_min
 
-    # minmax 后端：r_min/r_max buffer + 原生 scale/zero_point 公式
+    # minmax 后端：r_min/r_max buffer + 原生 scale/zero_point 公式 / minmax backend: r_min/r_max buffer + native scale/zero_point formula
     if hasattr(q, "r_min") and hasattr(q, "scale"):
         if getattr(q, "all_positive", False):
             qmin, qmax = 0, q.q_range
@@ -1352,7 +1646,7 @@ def _apply_minmax_to_quantizer(q, cur_min, cur_max, eps=1e-8):
         q.init = 1
         return True
 
-    # PACT：对称截断阈值 alpha（原生自初始化用的就是绝对值最大）
+    # PACT：对称截断阈值 alpha（原生自初始化用的就是绝对值最大） / PACT: symmetric clipping threshold alpha (native self-init uses max abs value)
     if hasattr(q, "alpha"):
         cur_max_abs = torch.maximum(cur_min.abs(), cur_max.abs()).clamp(min=eps)
         q.alpha.data.copy_(cur_max_abs.reshape(q.alpha.shape).to(q.alpha.device))
@@ -1363,20 +1657,20 @@ def _apply_minmax_to_quantizer(q, cur_min, cur_max, eps=1e-8):
     Qp = getattr(q, "Qp", None)
     if hasattr(q, "s") and Qn is not None:
         if hasattr(q, "_set_init_state"):
-            # dorefa：s 是激活幅度上界（x/s 归一化到 [-1,1] 再量化）
+            # dorefa：s 是激活幅度上界（x/s 归一化到 [-1,1] 再量化） / dorefa: s is activation magnitude upper bound (x/s normalize to [-1,1] then quantize)
             if getattr(q, "all_positive", False):
                 cur_s = cur_max.clamp(min=1e-6)
             else:
                 cur_s = torch.maximum(cur_min.abs(), cur_max.abs()).clamp(min=1e-6)
             q.s.data.copy_(cur_s.reshape(q.s.shape).to(q.s.device))
         elif hasattr(q, "beta"):
-            # lsqplus：非对称 scale + beta 精确覆盖 [min, max]
+            # lsqplus：非对称 scale + beta 精确覆盖 [min, max] / lsqplus: asymmetric scale + beta exact coverage of [min, max]
             cur_s = torch.clamp(cur_max - cur_min, min=eps) / (Qp - Qn)
             q.s.data.copy_(cur_s.reshape(q.s.shape).to(q.s.device))
             cur_beta = cur_min - cur_s * Qn
             q.beta.data.copy_(cur_beta.reshape(q.beta.shape).to(q.beta.device))
         else:
-            # lsq：对称网格 [-Qn*s, Qp*s]，取能覆盖 [min, max] 的最小 scale
+            # lsq：对称网格 [-Qn*s, Qp*s]，取能覆盖 [min, max] 的最小 scale / lsq: symmetric grid [-Qn*s, Qp*s], take smallest scale covering [min, max]
             if Qn < 0:
                 cur_s = torch.maximum(cur_max / Qp, cur_min / Qn).clamp(min=eps)
             else:
@@ -1390,17 +1684,20 @@ def _apply_minmax_to_quantizer(q, cur_min, cur_max, eps=1e-8):
 
 def _init_quantizers_from_float(float_model, quant_model, calibration_loader,
                                 calibration_batches=20, normalize_img=True):
-    """用 float 模型的激活范围 + 权重范围初始化 quant 模型的量化器。
+    """用 float 模型的激活范围 + 权重范围初始化 quant 模型的量化器 /
+    Initialize quant model quantizers using float model's activation + weight ranges.
 
-    覆盖三类量化点（全部直接从 float 模型收集，无级联误差）：
-      1. Conv/Linear 的 activation_quantizer —— float forward 输入范围
-      2. Conv/Linear 的 weight_quantizer —— 当前权重的 min-max（避免 LSQ+ 3σ 饱和）
+    覆盖三类量化点（全部直接从 float 模型收集，无级联误差） / Covers three types of quantization points
+    (all collected directly from float model, no cascading error):
+      1. Conv/Linear 的 activation_quantizer —— float forward 输入范围 / Conv/Linear activation_quantizer — float forward input range
+      2. Conv/Linear 的 weight_quantizer —— 当前权重的 min-max（避免 LSQ+ 3σ 饱和） / Conv/Linear weight_quantizer — current weight min-max (avoid LSQ+ 3σ saturation)
       3. FloatAdd/MaxPool2d/Concat 的 eltwise 量化器：
            - FloatAdd(name) → QuantAdd(name).activation_quantizer0/1
            - MaxPool2d(name) → QuantMaxPool(name).activation_quantizer
            - Concat(name) → QuantConcat(name.op).activation_quantizer0/1
 
-    QuantCat（torch.cat 函数调用）无同名 float 模块，交给安全网处理。
+    QuantCat（torch.cat 函数调用）无同名 float 模块，交给安全网处理 /
+    QuantCat (torch.cat function call) has no same-name float module, handled by safety net.
     """
     module_input_ranges = _collect_float_ranges_full(
         float_model, calibration_loader, calibration_batches, normalize_img=normalize_img
@@ -1414,13 +1711,13 @@ def _init_quantizers_from_float(float_model, quant_model, calibration_loader,
 
     for name, float_range_list in module_input_ranges.items():
         # float_range_list: [[min0, max0], [min1, max1], ...]
-        # 统一处理成 list of tensors
+        # 统一处理成 list of tensors / Normalize to list of tensors
         ranges = [[torch.as_tensor(m, dtype=torch.float32),
                    torch.as_tensor(x, dtype=torch.float32)]
                   for m, x in float_range_list]
 
         if name not in quant_model_modules:
-            # 可能是 Concat → QuantConcat 在 {name}.op
+            # 可能是 Concat → QuantConcat 在 {name}.op / Might be Concat → QuantConcat at {name}.op
             qname = name + '.op'
             if qname not in quant_model_modules:
                 continue
@@ -1470,7 +1767,7 @@ def _init_quantizers_from_float(float_model, quant_model, calibration_loader,
                         eltwise_count += 1
             continue
 
-        # ── QuantMaxPool: activation_quantizer (单输入) ──
+        # ── QuantMaxPool: activation_quantizer (单输入 / single input) ──
         if cls_name == 'QuantMaxPool':
             aq = getattr(qmodule, "activation_quantizer", None)
             if aq is not None and len(ranges) >= 1:
@@ -1487,7 +1784,7 @@ def _init_quantizers_from_float(float_model, quant_model, calibration_loader,
                         eltwise_count += 1
             continue
 
-        # ── 其他量化模块：通用 activation_quantizer ──
+        # ── 其他量化模块：通用 activation_quantizer / Other quant modules: generic activation_quantizer ──
         aq = getattr(qmodule, "activation_quantizer", None)
         if aq is not None and len(ranges) >= 1:
             if _apply_minmax_to_quantizer(aq, ranges[0][0], ranges[0][1], eps):
@@ -1500,25 +1797,36 @@ def _init_quantizers_from_float(float_model, quant_model, calibration_loader,
 
 def _safety_net_calibrate(quant_model, calibration_loader, calibration_batches=20,
                           normalize_img=True):
-    """安全网校准：在真实前向中完成剩余量化点的初始化。
+    """安全网校准：在真实前向中完成剩余量化点的初始化 /
+    Safety net calibration: initialize remaining quantization points during real forward passes.
 
-    Conv/Linear 已由 _init_quantizers_from_float 按浮点范围初始化并冻结；
-    本函数处理其余量化算子（QuantAdd/QuantCat/QuantConcat/QuantMaxPool 等）：
+    Conv/Linear 已由 _init_quantizers_from_float 按浮点范围初始化并冻结 /
+    Conv/Linear already initialized and frozen from float ranges by _init_quantizers_from_float;
+    本函数处理其余量化算子（QuantAdd/QuantCat/QuantConcat/QuantMaxPool 等）： /
+    this function handles remaining quant ops (QuantAdd/QuantCat/QuantConcat/QuantMaxPool etc.):
 
-      1. 给它们挂 forward_pre_hook，记录各输入张量跨 batch 的运行 min/max；
-      2. 跑若干批真实前向 —— 各后端的原生自初始化机制正常触发
-         （LSQ+/LSQ 的 EMA、minmax 的运行统计、PACT 的首批 absmax、
-         dorefa 的首批+EMA），不存在"垃圾 scale 被冻结"的路径；
-      3. 结束后按记录的运行 min/max 统一覆盖赋值 —— 修正 PACT 只看首批、
-         LSQ 家族 EMA 滞后的问题（minmax 保留其原生 percentile 统计，不覆盖）。
+      1. 给它们挂 forward_pre_hook，记录各输入张量跨 batch 的运行 min/max /
+         Attach forward_pre_hook to record per-input-tensor runtime min/max across batches;
+      2. 跑若干批真实前向 —— 各后端的原生自初始化机制正常触发 /
+         Run several batches of real forward — each backend's native self-init triggers normally
+         （LSQ+/LSQ 的 EMA、minmax 的运行统计、PACT 的首批 absmax、 /
+         (LSQ+/LSQ EMA, minmax runtime stats, PACT first-batch absmax,
+         dorefa 的首批+EMA），不存在"垃圾 scale 被冻结"的路径； /
+         dorefa first-batch + EMA); no path where "garbage scale gets frozen";
+      3. 结束后按记录的运行 min/max 统一覆盖赋值 —— 修正 PACT 只看首批、 /
+         After completion, uniformly overwrite per recorded runtime min/max — fixes PACT first-batch-only,
+         LSQ 家族 EMA 滞后的问题（minmax 保留其原生 percentile 统计，不覆盖）。 /
+         LSQ family EMA lag issues (minmax keeps its native percentile stats, not overwritten).
     """
     records = {}
     hooks = []
 
     def make_pre_hook(name):
         def pre_hook(module, args):
-            # 展开输入张量：QuantCat 是 (tensor_list, dim)，Add/Concat 是
-            # (A, C[, dim])，MaxPool 是 (x,)，统一抽成 tensor 列表
+            # 展开输入张量：QuantCat 是 (tensor_list, dim)，Add/Concat 是 /
+            # Flatten input tensors: QuantCat is (tensor_list, dim), Add/Concat is
+            # (A, C[, dim])，MaxPool 是 (x,)，统一抽成 tensor 列表 /
+            # (A, C[, dim]), MaxPool is (x,), uniformly extract into tensor list
             tensors = []
             for a in args:
                 if isinstance(a, torch.Tensor):
@@ -1539,7 +1847,7 @@ def _safety_net_calibrate(quant_model, calibration_loader, calibration_batches=2
 
     for name, module in quant_model.named_modules():
         if quant_pkg.is_weight_quant_module(module):
-            continue  # Conv/Linear：已按 float 范围初始化
+            continue  # Conv/Linear：已按 float 范围初始化 / Conv/Linear: already initialized from float ranges
         if hasattr(module, "quantizers") and isinstance(module.quantizers, nn.ModuleList):
             hooks.append(module.register_forward_pre_hook(make_pre_hook(name)))
         elif hasattr(module, "activation_quantizer0") and hasattr(module, "activation_quantizer1"):
@@ -1559,13 +1867,14 @@ def _safety_net_calibrate(quant_model, calibration_loader, calibration_batches=2
     for h in hooks:
         h.remove()
 
-    # 按记录的运行 min/max 统一赋值 —— 只覆盖未初始化的
+    # 按记录的运行 min/max 统一赋值 —— 只覆盖未初始化的 / Uniformly assign per recorded runtime min/max —— only overwrite uninitialized ones
     quant_modules = dict(quant_model.named_modules())
     assigned = 0
     skipped = 0
 
     def _is_already_initialized(q):
-        """LSQ 家族 init_state=FROZEN; minmax/pact init=1 (已初始化标记)。"""
+        """LSQ 家族 init_state=FROZEN; minmax/pact init=1 (已初始化标记) /
+        LSQ family init_state=FROZEN; minmax/pact init=1 (initialized flag)."""
         ist = getattr(q, 'init_state', None)
         if isinstance(ist, torch.Tensor) and int(ist.flatten()[0]) >= quant_pkg.INIT_STATE_FROZEN:
             return True
@@ -1576,10 +1885,10 @@ def _safety_net_calibrate(quant_model, calibration_loader, calibration_batches=2
         return False
 
     def _assign_recorded(q, mn, mx):
-        # 已由 float 范围初始化 → 跳过（不要覆盖更准确的 float 范围）
+        # 已由 float 范围初始化 → 跳过（不要覆盖更准确的 float 范围） / Already initialized from float ranges → skip (don't overwrite more accurate float ranges)
         if _is_already_initialized(q):
             return 'skip'
-        # minmax 后端已在安全网前向中按原生 percentile 机制自收集，保留其结果
+        # minmax 后端已在安全网前向中按原生 percentile 机制自收集，保留其结果 / minmax backend already self-collected via native percentile in safety net forward, keep its result
         if hasattr(q, "r_min"):
             return 'skip'
         return _apply_minmax_to_quantizer(q, mn, mx)
@@ -1621,25 +1930,26 @@ def _safety_net_calibrate(quant_model, calibration_loader, calibration_batches=2
 @torch.no_grad()
 def calibrate_quantizer(quant_model, calibration_loader, calibration_batches=20,
                         float_model=None, normalize_img=True):
-    """校准量化器。如果提供 float_model, 用 float 模型的激活+权重范围独立校准,
-    避免级联误差和 3σ 饱和问题。
+    """校准量化器 / Calibrate quantizers. 如果提供 float_model, 用 float 模型的激活+权重范围独立校准 /
+    If float_model provided, use float model's activation + weight ranges for independent calibration,
+    避免级联误差和 3σ 饱和问题 / avoiding cascading error and 3σ saturation issues.
 
-    流程（float_model 路径）:
-      1. reset: 所有量化器回到未初始化状态 —— 构建模型时 _initialize_head 的
-         dummy 零输入前向可能已把垃圾 scale 写进量化器，必须先清掉标志位；
-      2. Conv/Linear 的激活/权重量化器用 float 范围初始化并冻结（每层独立，
-         无级联误差；权重用 min-max 精确覆盖，无 3σ 饱和）；
-      3. 安全网: 跑若干批真实前向，其余量化算子（QuantAdd/QuantCat/
-         QuantConcat/QuantMaxPool）按各后端原生机制自初始化，再统一按记录的
-         运行 min/max 赋值 —— 不存在"垃圾 scale 被冻结"的路径；
-      4. freeze 全部量化器。
+    流程（float_model 路径）/ Pipeline (float_model path):
+      1. reset: 所有量化器回到未初始化状态 / reset: all quantizers return to uninitialized state ——
+         构建模型时 _initialize_head 的 dummy 零输入前向可能已把垃圾 scale 写进量化器，必须先清掉标志位； /
+         dummy zero-input forward during _initialize_head may have written garbage scale, must clear flag bits first;
+      2. Conv/Linear 的激活/权重量化器用 float 范围初始化并冻结（每层独立，无级联误差；权重用 min-max 精确覆盖，无 3σ 饱和）/
+         Conv/Linear activation/weight quantizers init and freeze from float ranges (per-layer independent, no cascading error; weights covered by min-max exactly, no 3σ saturation);
+      3. 安全网: 跑若干批真实前向，其余量化算子（QuantAdd/QuantCat/QuantConcat/QuantMaxPool）按各后端原生机制自初始化，再统一按记录的运行 min/max 赋值 —— 不存在"垃圾 scale 被冻结"的路径； /
+         Safety net: run several batches real forward, remaining quant ops self-init per backend native mechanism, then uniformly overwrite per recorded runtime min/max — no path where "garbage scale gets frozen";
+      4. freeze 全部量化器 / freeze all quantizers.
 
-    无 float_model 时退化为纯 quant 前向自校准（各后端原生机制）。
+    无 float_model 时退化为纯 quant 前向自校准（各后端原生机制） / Without float_model, degenerates to pure quant forward self-calibration (backend native mechanism).
 
     Args:
-        normalize_img: 数据 loader 输出是否需要 /255 归一化。
-            detect/seg/pose 的数据 loader 输出 [0,255]，需要 True。
-            cls 的数据 loader 已经归一化到 [0,1]，用 False。
+        normalize_img: 数据 loader 输出是否需要 /255 归一化 / Whether dataloader output needs /255 normalization.
+            detect/seg/pose 的数据 loader 输出 [0,255]，需要 True / detect/seg/pose data loader outputs [0,255], needs True.
+            cls 的数据 loader 已经归一化到 [0,1]，用 False / cls data loader already normalized to [0,1], use False.
     """
     quant_model.eval()
     quant_pkg.reset_quantizer_states(quant_model)
@@ -1650,7 +1960,7 @@ def calibrate_quantizer(quant_model, calibration_loader, calibration_batches=20,
             normalize_img=normalize_img,
         )
 
-    # 安全网：覆盖剩余量化点（float_model=None 时这是唯一的校准手段）
+    # 安全网：覆盖剩余量化点（float_model=None 时这是唯一的校准手段） / Safety net: cover remaining quant points (this is the only calibration when float_model=None)
     _safety_net_calibrate(
         quant_model, calibration_loader, calibration_batches,
         normalize_img=normalize_img,
@@ -1670,10 +1980,12 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
     calibration_loader, data = get_dataloaders(batch_size, num_workers, calibration=True)
     _, val_loader, _ = get_dataloaders(batch_size, num_workers)
 
-    # 优先 _best.pth（与 QAT 命名一致），fallback 到旧版无后缀 .pth
-    float_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}_best.pth")
+    float_dir = _model_dir_for(scale=scale)
+    quant_dir = _model_dir_for(scale=scale, quant_method=quant_method)
+    # 优先 _best.pth（与 QAT 命名一致），fallback 到旧版无后缀 .pth / Prefer _best.pth (consistent with QAT naming), fallback to legacy no-suffix .pth
+    float_checkpoint = os.path.join(float_dir, f"{base_name(scale)}_best.pth")
     if not os.path.exists(float_checkpoint):
-        float_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}.pth")
+        float_checkpoint = os.path.join(float_dir, f"{base_name(scale)}.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
 
@@ -1688,7 +2000,8 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
                          float_model=float_model)
 
     metrics = evaluate(
-        ptq_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        ptq_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix=f"ptq_{tag}"
     )
     print(f"[PTQ-{tag}] mAP50:{metrics['map50']:.4f} mAP50-95:{metrics['map']:.4f}")
 
@@ -1703,13 +2016,15 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
         **metrics,
     }
     ptq_checkpoint = save_quant_outputs(
-        ptq_model, f"ptq_{tag}", nc=num_classes, meta=ptq_meta, scale=scale
+        ptq_model, f"ptq_{tag}", nc=num_classes, meta=ptq_meta, scale=scale,
+        model_dir=quant_dir,
     )[0]
 
     load_checkpoint(ptq_model, ptq_checkpoint)
     quant_pkg.freeze_batch_init(ptq_model)
     final_metrics = evaluate(
-        ptq_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        ptq_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix=f"ptq_{tag}_reload"
     )
     print(f"[PTQ] 重载 checkpoint 后 mAP50:{final_metrics['map50']:.4f} mAP50-95:{final_metrics['map']:.4f}")
     return ptq_checkpoint
@@ -1724,13 +2039,15 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
     print(f"========== QAT training ({model_name(scale)} / {tag}) ==========")
     print(f"Device: {device}")
     if lr is None:
-        lr = _auto_lr() * 0.1  # QAT 微调用 float auto lr 的 1/10
+        lr = _auto_lr() * 0.1  # QAT 微调用 float auto lr 的 1/10 / QAT fine-tuning uses 1/10 of float auto lr
     print(f"Optimizer: AdamW(lr={lr:g}, betas=(0.9, 0.999)) wd=5e-4 | warmup 3ep | 梯度累积 nbs=64")
 
     train_loader, val_loader, data = get_dataloaders(batch_size, num_workers)
     nb = len(train_loader)
 
-    ptq_checkpoint = os.path.join(MODEL_DIR, f"ptq_{tag}_{base_name(scale)}.pth")
+    float_dir = _model_dir_for(scale=scale)
+    quant_dir = _model_dir_for(scale=scale, quant_method=quant_method)
+    ptq_checkpoint = os.path.join(quant_dir, f"ptq_{tag}_{base_name(scale)}.pth")
     if not os.path.exists(ptq_checkpoint):
         raise FileNotFoundError(
             f"找不到 {tag} 的 PTQ 权重，请先运行 PTQ_calibration('{tag}'): {ptq_checkpoint}"
@@ -1753,10 +2070,10 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
     best_fitness = -1.0
     best_epoch = -1
     best_meta = {}
-    best_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base_name(scale)}_best.pth")
-    last_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base_name(scale)}_last.pth")
+    best_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{base_name(scale)}_best.pth")
+    last_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{base_name(scale)}_last.pth")
 
-    # resume：从 _last.pth 恢复，接续训练
+    # resume：从 _last.pth 恢复，接续训练 / resume: restore from _last.pth, continue training
     start_epoch = 0
     if resume and os.path.exists(last_checkpoint):
         print(f"[QAT-{tag}] Resume from {last_checkpoint}")
@@ -1775,7 +2092,8 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
             max_batches=max_train_batches,
         )
         metrics = evaluate(
-            qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+            qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+            viz_dir=quant_dir, viz_prefix=f"qat_{tag}_ep{epoch + 1:03d}"
         )
         fitness = 0.9 * metrics["map"] + 0.1 * metrics["map50"]
 
@@ -1810,7 +2128,8 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
 
     load_checkpoint(qat_model, best_checkpoint)
     best_metrics = evaluate(
-        qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix=f"qat_{tag}_best"
     )
     print(
         f"[QAT-{tag}] Best epoch:{best_epoch}/{epochs} | "
@@ -1818,7 +2137,8 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
         f"Best: {best_checkpoint}"
     )
     qat_checkpoint = save_quant_outputs(
-        qat_model, f"qat_{tag}", nc=num_classes, meta=best_meta, scale=scale
+        qat_model, f"qat_{tag}", nc=num_classes, meta=best_meta, scale=scale,
+        model_dir=quant_dir,
     )[0]
     return qat_checkpoint, best_fitness, best_meta
 
@@ -1830,13 +2150,15 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_class
     print(f"========== Float vs QAT precision ({model_name(scale)} / coco128 / {tag}) ==========")
     print(f"Device: {device}")
 
-    # 优先 _best.pth，fallback 到无后缀
-    float_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}_best.pth")
+    float_dir = _model_dir_for(scale=scale)
+    quant_dir = _model_dir_for(scale=scale, quant_method=quant_method)
+    # 优先 _best.pth，fallback 到无后缀 / Prefer _best.pth, fallback to no-suffix
+    float_checkpoint = os.path.join(float_dir, f"{base_name(scale)}_best.pth")
     if not os.path.exists(float_checkpoint):
-        float_checkpoint = os.path.join(MODEL_DIR, f"{base_name(scale)}.pth")
-    qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base_name(scale)}_best.pth")
+        float_checkpoint = os.path.join(float_dir, f"{base_name(scale)}.pth")
+    qat_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{base_name(scale)}_best.pth")
     if not os.path.exists(qat_checkpoint):
-        qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base_name(scale)}.pth")
+        qat_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{base_name(scale)}.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
     if not os.path.exists(qat_checkpoint):
@@ -1849,7 +2171,8 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_class
     float_model = FloatYOLO26(num_classes, scale=scale).to(device)
     float_model, float_meta = load_checkpoint(float_model, float_checkpoint, return_meta=True)
     float_metrics = evaluate(
-        float_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        float_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix="compare_float"
     )
 
     qat_model = QuantYOLO26(num_classes, scale=scale).to(device)
@@ -1862,7 +2185,8 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_class
         print(f"      [warn] QAT checkpoint 记录的尺度为 yolo26{saved_scale}，当前为 yolo26{get_scale(scale)}")
     quant_pkg.freeze_batch_init(qat_model)
     qat_metrics = evaluate(
-        qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix="compare_qat"
     )
 
     print(
@@ -1918,13 +2242,13 @@ def build_arg_parser():
     parser.add_argument("--qat-lr", type=float, default=None,
                         help="默认 float auto lr x 0.1")
     parser.add_argument("--calibration-batches", type=int, default=20)
-    # 冒烟/快速验证用：每个 epoch / 评估最多跑多少个 batch，默认不限制（完整训练）
+    # 冒烟/快速验证用：每个 epoch / 评估最多跑多少个 batch，默认不限制（完整训练） / Smoke test / quick validation: max batches per epoch / eval, default unlimited (full training)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
     parser.add_argument(
         "--data",
-        default=COCO128_YAML,
-        help="数据集 yaml 路径（默认 coco128.yaml；VOC 可用 ultralytics/ultralytics/cfg/datasets/VOC.yaml）",
+        default=DATA_YAML,
+        help="数据集 yaml 路径或数据集目录（默认自动下载 coco8.yaml 到 dataset/；可手动指定其他目录）",
     )
     parser.add_argument("--resume", action="store_true",
                         help="从 _last.pth checkpoint 接续训练")
@@ -1932,15 +2256,17 @@ def build_arg_parser():
 
 
 if __name__ == "__main__":
+    quant_pkg.install_print_timestamp()  # print 加分钟级时间戳 / minute-precision timestamp for print
     args = build_arg_parser().parse_args()
 
-    # 根据 --data yaml 动态覆盖全局 NUM_CLASSES 和 COCO128_YAML
-    COCO128_YAML = args.data  # 复用变量名；函数内部引用它
+    # 根据 --data 动态覆盖全局 NUM_CLASSES 和 DATA_YAML（默认走自动下载） /
+    # Override global NUM_CLASSES / DATA_YAML per --data (default auto-downloads)
+    DATA_YAML = args.data  # 复用变量名；函数内部引用它 / Reuse variable name; referenced inside functions
     try:
-        _tmp = check_det_dataset(args.data)
+        _tmp = get_data_dict(args.data, "detect")
         NUM_CLASSES = len(_tmp["names"])
     except Exception:
-        pass  # yaml 解析失败则保留默认 80
+        pass  # yaml 解析失败则保留默认 80 / Keep default 80 if yaml parsing fails
     print(f"数据集: {args.data} | 类别数: {NUM_CLASSES}")
 
     scale = get_scale(args.model)
@@ -1956,7 +2282,7 @@ if __name__ == "__main__":
     )
 
     if args.stage in ("all", "float"):
-        # lr=None → 官方 optimizer=auto：AdamW lr=round(0.002*5/(4+nc), 6)（nc=80 → 0.000119）
+        # lr=None → 官方 optimizer=auto：AdamW lr=round(0.002*5/(4+nc), 6)（nc=80 → 0.000119）/ lr=None → official optimizer=auto: AdamW lr=round(0.002*5/(4+nc), 6) (nc=80 → 0.000119)
         float_train(
             batch_size=args.float_batch_size,
             lr=args.float_lr,

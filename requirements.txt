@@ -10,3 +10,14 @@ numpy==2.4.4
 torch==2.11.0+cu126
 torchvision==0.26.0+cu126
 ultralytics==8.4.155
+
+# ONNX export / simplify / onnxruntime verification
+# ONNX 导出 / 简化 / onnxruntime 精度验证
+onnx==1.22.0
+onnxsim==0.7.3
+onnxruntime==1.30.0
+
+# Directly imported by network files / visualization scripts
+# 网络文件与可视化脚本直接 import
+opencv-python==4.13.0.92
+matplotlib==3.11.0

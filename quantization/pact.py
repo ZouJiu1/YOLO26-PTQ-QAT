@@ -8,7 +8,7 @@ from quantization.dorefa import DorefaWeightQuantizer
 
 
 # ********************* quantizers（量化器，量化） *********************
-# 取整(ste)
+# 取整 (STE) / rounding (STE)
 class Round(Function):
     @staticmethod
     def forward(self, input):
@@ -28,10 +28,10 @@ class quantize_pact(Function):
         ctx.other = q_range, all_positive
         tmp = values.clone()
         tmp[tmp > alpha] = alpha
-        if all_positive: # 无符号: [0, alpha]
+        if all_positive:  # 无符号: [0, alpha] / unsigned: [0, alpha]
             tmp[tmp < 0] = 0
             tmp = Round.apply(tmp * q_range / alpha) / q_range * alpha
-        else: # 有符号: [-alpha, alpha]
+        else:  # 有符号: [-alpha, alpha] / signed: [-alpha, alpha]
             tmp[tmp < -alpha] = -alpha
             tmp = Round.apply((tmp + alpha) * q_range / (2 * alpha)) / q_range * 2 * alpha - alpha
         return tmp
@@ -49,11 +49,12 @@ class quantize_pact(Function):
 
             copyvalue[copyvalue < 0] = -1
             copyvalue[copyvalue >= alpha] = -1
-            copyvalue[copyvalue >= 0] = 1 #copyvalue >= 0 & copyvalue < alpha  == copyvalue >= 0
+            copyvalue[copyvalue >= 0] = 1  # copyvalue >= 0 & copyvalue < alpha == copyvalue >= 0
             copyvalue[copyvalue < 0] = 0
             grad_weight = grad_weight * copyvalue
         else:
-            # 上界处 dq/dalpha=1, 下界处 dq/dalpha=-1, 区间内STE
+            # 上界处 dq/dalpha=1, 下界处 dq/dalpha=-1, 区间内 STE
+            # / dq/dalpha=1 at upper bound, dq/dalpha=-1 at lower bound, STE inside range
             upper = values.clone()
             upper[upper < alpha] = 0
             upper[upper >= alpha] = 1
@@ -66,7 +67,7 @@ class quantize_pact(Function):
             grad_weight = grad_weight * mask
         return grad_weight, grad_alpha, None, None
 
-# A(特征)量化
+# A(特征)量化 / A(activation) quantization
 class PactActivationQuantizer(nn.Module):
     def __init__(self, a_bits, all_positive=False):
         super(PactActivationQuantizer, self).__init__()
@@ -76,10 +77,11 @@ class PactActivationQuantizer(nn.Module):
         self.alpha = torch.nn.Parameter(torch.ones(1), requires_grad=True)
         self.init = 0
 
-    # 量化/反量化
+    # 量化/反量化 / quantize/dequantize
     def forward(self, activation):
-        if self.init==0: #initization
+        if self.init==0:  # initialization
             # copy_ 保持 alpha 的 (1,) 形状，便于 state_dict 重载
+            # / use copy_ to preserve (1,) shape of alpha for state_dict compatibility
             self.alpha.data.copy_(activation.detach().abs().max().to(self.alpha))
             self.init = 1
         q_a = quantize_pact.apply(activation, self.alpha, self.q_range, self.all_positive)
@@ -137,7 +139,8 @@ class QuantConvTranspose2d(nn.ConvTranspose2d):
                  quant_inference=False,
                  all_positive=False,
                  per_channel=False):
-        # 注意: ConvTranspose2d的参数顺序为(..., output_padding, groups, bias, dilation, padding_mode)
+        # 注意: ConvTranspose2d 的参数顺序为 (..., output_padding, groups, bias, dilation, padding_mode)
+        # / Note: ConvTranspose2d parameter order is (..., output_padding, groups, bias, dilation, padding_mode)
         super(QuantConvTranspose2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, output_padding,
                                                    groups, bias, dilation, padding_mode)
         self.quant_inference = quant_inference
@@ -255,6 +258,7 @@ class QuantDiv(nn.Module):
             Q_A = self.activation_quantizer0(A)
             Q_C = self.activation_quantizer1(C)
             # 分母反量化网格可能恰好落在 0，钳到小正数防止 0/0 产生 NaN
+            # / Dequantized denominator grid may land exactly on 0; clamp to a small positive number to avoid 0/0 → NaN
             return Q_A / torch.clamp(Q_C, min=1e-6)
 
 class QuantConcat(nn.Module):
@@ -308,7 +312,9 @@ class QuantMaxPool(nn.Module):
                                             return_indices=self.return_indices, ceil_mode=self.ceil_mode)
 
 class QuantCat(nn.Module):
-    """对多个输入张量分别做激活伪量化后再 concat（每一路各持有一个激活量化器）。"""
+    """对多个输入张量分别做激活伪量化后再 concat（每一路各持有一个激活量化器）。
+    / Apply activation pseudo-quantization to each input tensor separately, then concat (each input has its own activation quantizer).
+    """
 
     def __init__(self, num_inputs, a_bits=8):
         super().__init__()
@@ -326,7 +332,7 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8, quant_inference=Fals
     for name, child in module.named_children():
         if isinstance(child, nn.Conv2d):
             layer_counter[0] += 1
-            if layer_counter[0] >= 1: #第一层也量化
+            if layer_counter[0] >= 1:  # 第一层也量化 / quantize the first layer too
                 if child.bias is not None:
                     quant_conv = QuantConv2d(child.in_channels, child.out_channels,
                                              child.kernel_size, stride=child.stride,
@@ -347,7 +353,7 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8, quant_inference=Fals
             module._modules[name] = Relu
         elif isinstance(child, nn.ConvTranspose2d):
             layer_counter[0] += 1
-            if layer_counter[0] >= 1: #第一层也量化
+            if layer_counter[0] >= 1:  # 第一层也量化 / quantize the first layer too
                 if child.bias is not None:
                     quant_conv_transpose = QuantConvTranspose2d(child.in_channels,
                                                                 child.out_channels,
@@ -380,7 +386,7 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8, quant_inference=Fals
                 module._modules[name] = quant_conv_transpose
         elif isinstance(child, nn.Linear):
             layer_counter[0] += 1
-            if layer_counter[0] >= 1: #第一层也量化
+            if layer_counter[0] >= 1:  # 第一层也量化 / quantize the first layer too
                 if child.bias is not None:
                     quant_linear = QuantLinear(child.in_features, child.out_features,
                                                bias=True, a_bits=a_bits, w_bits=w_bits,
@@ -406,7 +412,9 @@ def prepare(model, inplace=False, a_bits=8, w_bits=8, quant_inference=False,
     return model
 
 class QuantSiLU(nn.Module):
-    """量化 SiLU (x * sigmoid(x)) — 单输入, 只有 input quantizer。"""
+    """量化 SiLU (x * sigmoid(x)) — 单输入, 只有 input quantizer。
+    / Quantized SiLU (x * sigmoid(x)) — single input, only input quantizer.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantSiLU, self).__init__()
@@ -422,7 +430,9 @@ class QuantSiLU(nn.Module):
 
 
 class QuantSigmoid(nn.Module):
-    """量化 Sigmoid — 单输入, 只有 input quantizer。"""
+    """量化 Sigmoid — 单输入, 只有 input quantizer。
+    / Quantized Sigmoid — single input, only input quantizer.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantSigmoid, self).__init__()
@@ -438,7 +448,9 @@ class QuantSigmoid(nn.Module):
 
 
 class QuantReLU(nn.Module):
-    """量化 ReLU — 单输入, 只有 input quantizer。all_positive=True 更合理。"""
+    """量化 ReLU — 单输入, 只有 input quantizer。all_positive=True 更合理。
+    / Quantized ReLU — single input, only input quantizer. all_positive=True is more appropriate.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=True,
                  per_channel=False, batch_init=20):
         super(QuantReLU, self).__init__()
@@ -454,7 +466,9 @@ class QuantReLU(nn.Module):
 
 
 class QuantSoftmax(nn.Module):
-    """量化 Softmax — 单输入, 只有 input quantizer。逐行量化/反量化后做 softmax。"""
+    """量化 Softmax — 单输入, 只有 input quantizer。逐行量化/反量化后做 softmax。
+    / Quantized Softmax — single input, only input quantizer. Softmax applied after row-wise quantize/dequantize.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantSoftmax, self).__init__()
@@ -468,7 +482,9 @@ class QuantSoftmax(nn.Module):
             return torch.softmax(self.activation_quantizer(x), dim=dim)
 
 class QuantMatMul(nn.Module):
-    """量化矩阵乘法 — 两个输入 (A, B)。"""
+    """量化矩阵乘法 — 两个输入 (A, B)。
+    / Quantized matrix multiplication — two inputs (A, B).
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantMatMul, self).__init__()

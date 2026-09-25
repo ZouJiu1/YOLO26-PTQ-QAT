@@ -1,27 +1,27 @@
-"""YOLO26n-pose 关键点网络的 aLSQ+ 量化感知训练流程（coco8-pose）。
+"""YOLO26n-pose 关键点网络的 aLSQ+ 量化感知训练流程（coco8-pose） / aLSQ+ quantization-aware training pipeline for YOLO26n-pose keypoint network (coco8-pose).
 
-流程：
-    float_train(lr=float_lr, epochs=float_epochs)   # 浮点训练（默认加载 yolo26n-pose.pt 预训练权重）
-    PTQ_calibration()                               # 训练后量化校准
-    QAT_training(lr=qat_lr, epochs=qat_epochs)      # 量化感知训练
-    compare_precision()                             # 浮点 vs QAT 的 box / pose mAP 对比
+流程 / Pipeline:
+    float_train(lr=float_lr, epochs=float_epochs)   # 浮点训练 / float-point training（默认加载 yolo26n-pose.pt 预训练权重 / loads yolo26n-pose.pt pretrained weights by default）
+    PTQ_calibration()                               # 训练后量化校准 / post-training quantization calibration
+    QAT_training(lr=qat_lr, epochs=qat_epochs)      # 量化感知训练 / quantization-aware training
+    compare_precision()                             # 浮点 vs QAT 的 box / pose mAP 对比 / box / pose mAP comparison between float and QAT
 
-网络结构与 ultralytics/cfg/models/26/yolo26-pose.yaml（scale=n）逐层对齐：
-Conv / C3k2(C3k) / SPPF / C2PSA(Attention) / PAN-FPN / Pose26(reg_max=1)。
-说明：yolo26n-pose 原始 end2end 双头（one2many+one2one）这里只保留 one2many 单头，
-损失使用官方 PoseLoss26（TaskAlignedAssigner + OKS keypoint_loss + BCE 可见性
-+ RealNVP 归一化流 RLE 损失，由 cv4_sigma 输出的 sigma 驱动）；
-backbone / neck / pose 头拓扑（含 flow_model）与官方完全一致，可直接加载
-yolo26n-pose.pt 的权重（one2one_* 双头权重会被跳过）。
+网络结构与 ultralytics/cfg/models/26/yolo26-pose.yaml（scale=n）逐层对齐 / Network architecture is layer-by-layer aligned with ultralytics/cfg/models/26/yolo26-pose.yaml (scale=n):
+Conv / C3k2(C3k) / SPPF / C2PSA(Attention) / PAN-FPN / Pose26(reg_max=1).
+说明 / Notes: yolo26n-pose 原始 end2end 双头（one2many+one2one）这里只保留 one2many 单头 / only the one2many single head is retained from the original end2end dual-head (one2many+one2one),
+损失使用官方 PoseLoss26 / loss uses official PoseLoss26（TaskAlignedAssigner + OKS keypoint_loss + BCE 可见性 / visibility
++ RealNVP 归一化流 / normalizing flow RLE 损失 / RLE loss，由 cv4_sigma 输出的 sigma 驱动 / driven by sigma output from cv4_sigma）;
+backbone / neck / pose 头拓扑（含 flow_model）与官方完全一致 / head topology (including flow_model) is fully consistent with official, 可直接加载 / can directly load
+yolo26n-pose.pt 的权重 / weights（one2one_* 双头权重会被跳过 / dual-head weights are skipped）。
 
-关键点：
-  * coco-pose 只有 1 个类别（person），所以 nc=1，kpt_shape=[17, 3]；
-  * 推理输出通道 = xywh(4) + 类别(1) + 关键点(17*3=51) = 56，NMS 后 reshape 成 (N,17,3)；
-  * 训练头 cv4(->85ch) 后接 cv4_kpts(->51) 与 cv4_sigma(->34，训练专用)；
-  * flow_model 仅在训练损失里使用（推理不经过），因此始终保持浮点 nn.Linear，不替换成
-    QuantLinear；cv4/cv4_kpts/cv4_sigma 中的 Conv2d 则参与量化。
-  * Pose26 的关键点解码为 (raw + anchor) * stride（无 v8 Pose 的 *2-0.5 偏移），
-    可见性通道走 sigmoid。
+关键点 / Key points:
+  * coco-pose 只有 1 个类别（person / 人物），所以 nc=1，kpt_shape=[17, 3]；
+  * 推理输出通道 = xywh(4) + 类别(1) + 关键点(17*3=51) = 56，NMS 后 reshape 成 (N,17,3) / inference output channels, reshaped to (N,17,3) after NMS;
+  * 训练头 cv4(->85ch) 后接 cv4_kpts(->51) 与 cv4_sigma(->34，训练专用 / training-only);
+  * flow_model 仅在训练损失里使用（推理不经过） / flow_model is only used in training loss (not passed through during inference), 因此始终保持浮点 nn.Linear / therefore kept as float-point nn.Linear throughout, 不替换成 / not replaced with
+    QuantLinear；cv4/cv4_kpts/cv4_sigma 中的 Conv2d 则参与量化 / Conv2d layers in cv4/cv4_kpts/cv4_sigma do participate in quantization.
+  * Pose26 的关键点解码为 (raw + anchor) * stride / Pose26 keypoint decoding: (raw + anchor) * stride（无 v8 Pose 的 *2-0.5 偏移 / no v8 Pose *2-0.5 offset），
+    可见性通道走 sigmoid / visibility channel goes through sigmoid.
 """
 
 import argparse
@@ -40,8 +40,8 @@ import torch.nn as nn
 
 import quantization as quant_pkg
 
-# 复用检测网络的 backbone/neck 组件与训练基础设施
-# （文件名 networks_yolo26-detect.py 含 '-'，不能直接 import，用文件路径加载）
+# 复用检测网络的 backbone/neck 组件与训练基础设施 / Reuse backbone/neck components and training infrastructure from detection network
+# （文件名 networks_yolo26-detect.py 含 '-'，不能直接 import，用文件路径加载） / (filename contains '-', cannot import directly, load via file path)
 det_spec = importlib.util.spec_from_file_location(
     "networks_yolo26_detect",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "networks_yolo26-detect.py"),
@@ -49,7 +49,7 @@ det_spec = importlib.util.spec_from_file_location(
 det = importlib.util.module_from_spec(det_spec)
 det_spec.loader.exec_module(det)
 
-# ultralytics 提供数据管道 / 损失 / 解码 / NMS / OKS / mAP
+# ultralytics 提供数据管道 / 损失 / 解码 / NMS / OKS / mAP / ultralytics provides data pipeline / loss / decoding / NMS / OKS / mAP
 from ultralytics.cfg import get_cfg
 from ultralytics.utils import DEFAULT_CFG
 from ultralytics.data.utils import check_det_dataset
@@ -60,20 +60,35 @@ from ultralytics.utils.ops import xywh2xyxy, xyxy2xywh
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.metrics import ap_per_class, box_iou, kpt_iou, OKS_SIGMA
 from ultralytics.utils.torch_utils import model_info
+from ultralytics.utils.plotting import plot_images
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_DIR = os.path.join(BASE_DIR, "model")
+_MODEL_DIR_BASE = os.path.join(BASE_DIR, "model", "yolo26-pose")
+MODEL_DIR = _MODEL_DIR_BASE
+
+
+def _model_dir_for(scale=None, quant_method=None):
+    """按网络名 + 尺度 + 量化后端返回产物目录。/ Return product directory by network name + scale + quantization backend."""
+    path = _MODEL_DIR_BASE
+    if scale is not None:
+        path = os.path.join(path, scale)
+    if quant_method is not None:
+        path = os.path.join(path, quant_method)
+    os.makedirs(path, exist_ok=True)
+    return path
 ULTRA_DIR = os.path.join(BASE_DIR, "ultralytics", "ultralytics")
-COCO8_POSE_YAML = os.path.join(ULTRA_DIR, "cfg", "datasets", "coco8-pose.yaml")
+# 默认官方数据集（首次运行自动下载到 dataset/；--data 可手动指定其他目录） /
+# Default official dataset (auto-downloaded to dataset/ on first run; --data for a manual dir)
+DATA_YAML = det.DEFAULT_DATA_YAML["pose"]
 PRETRAINED_WEIGHTS = os.path.join(ULTRA_DIR, "yolo26n-pose.pt")
 
 IMGSZ = 640
-NUM_CLASSES = 1          # coco-pose 只有 person
-KPT_SHAPE = [17, 3]      # 17 个关键点，x/y/visibility
+NUM_CLASSES = 1          # coco-pose 只有 person / coco-pose has only person class
+KPT_SHAPE = [17, 3]      # 17 个关键点，x/y/visibility / 17 keypoints, x/y/visibility
 NKPT = KPT_SHAPE[0]
 NDIM = KPT_SHAPE[1]
 NK = NKPT * NDIM         # 51
-NK_SIGMA = NKPT * 2      # 34（每个关键点 sigma_x / sigma_y）
+NK_SIGMA = NKPT * 2      # 34（每个关键点 sigma_x / sigma_y） / 34 (sigma_x / sigma_y per keypoint)
 # Pose26: c4 = max(ch[0]//4, nkpt*(ndim+2)) = max(16, 85) = 85
 C4 = max(64 // 4, NKPT * (NDIM + 2))
 STRIDES = (8, 16, 32)
@@ -82,7 +97,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---------------------------------------------------------------------------
 # 量化后端可切换：dorefa / lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / pact
+# Quantization backend is switchable: dorefa / lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / pact
 # backbone 组件从检测网络复用，因此切换时同步切换检测网络模块内绑定的后端算子。
+# backbone components are reused from detection network, so switching also syncs backend ops bound in the detect module.
 # ---------------------------------------------------------------------------
 DEFAULT_QUANT_METHOD = "lsqplus_v1"
 QUANT_METHOD = DEFAULT_QUANT_METHOD
@@ -99,11 +116,12 @@ QuantMatMul = getattr(Q, 'QuantMatMul', None)
 
 
 def set_quant_method(method):
-    """切换量化后端（必须在构建 QuantYOLO26Pose 之前调用）。"""
+    """切换量化后端（必须在构建 QuantYOLO26Pose 之前调用） / Switch quantization backend (must be called before building QuantYOLO26Pose)."""
     global Q, QUANT_METHOD
     global QuantAdd, QuantCat, QuantConcat, QuantConv2d, QuantMaxPool, QuantSiLU, QuantSigmoid, QuantMatMul
 
     # 复用的 backbone/neck block 类内部引用的是 det 模块的全局算子，必须先同步切换
+    # Reused backbone/neck block classes internally reference global ops in the detect module, must sync first
     det.set_quant_method(method)
     Q = quant_pkg.load_quant_backend(method)
     QUANT_METHOD = method
@@ -118,15 +136,14 @@ def set_quant_method(method):
     return Q
 
 
-# ============================== RealNVP 归一化流 ==============================
+# ============================== RealNVP 归一化流 / normalizing flow ==============================
 
 
 class RealNVP(nn.Module):
-    """复刻 ultralytics.nn.modules.block.RealNVP（PoseLoss26 的 RLE 损失需要）。
+    """复刻 ultralytics.nn.modules.block.RealNVP（PoseLoss26 的 RLE 损失需要） / Replica of ultralytics.nn.modules.block.RealNVP (required by PoseLoss26's RLE loss).
 
-    仅在训练损失里对归一化残差做 log_prob；推理不经过此模块，因此保持纯浮点
-    nn.Linear，不参与量化。属性 / buffer 命名（loc/cov/mask/s/t）与官方一致，
-    可直接加载 yolo26n-pose.pt 中 model.23.flow_model.* 的权重。
+    仅在训练损失里对归一化残差做 log_prob / Only used for log_prob of normalized residuals in training loss；推理不经过此模块 / inference does not go through this module，因此保持纯浮点 nn.Linear / thus kept as pure float nn.Linear，不参与量化 / does not participate in quantization. 属性 / buffer 命名（loc/cov/mask/s/t）与官方一致 / attribute/buffer naming (loc/cov/mask/s/t) matches official，
+    可直接加载 yolo26n-pose.pt 中 model.23.flow_model.* 的权重 / can directly load weights of model.23.flow_model.* from yolo26n-pose.pt.
     """
 
     @staticmethod
@@ -144,6 +161,7 @@ class RealNVP(nn.Module):
     def __init__(self):
         super().__init__()
         # loc/cov 现在已不参与计算，但仍注册以兼容旧 checkpoint
+        # loc/cov are no longer used in computation, but still registered for backward compatibility with old checkpoints
         self.register_buffer("loc", torch.zeros(2))
         self.register_buffer("cov", torch.eye(2))
         self.register_buffer("mask", torch.tensor([[0, 1], [1, 0]] * 3, dtype=torch.float32))
@@ -171,26 +189,26 @@ class RealNVP(nn.Module):
         if x.dtype == torch.float32 and self.s[0][0].weight.dtype != torch.float32:
             self.float()
         z, log_det = self.backward_p(x)
-        # 二维标准正态闭式 log N(z; 0, I)
+        # 二维标准正态闭式 log N(z; 0, I) / Closed-form log N(z; 0, I) for 2D standard normal
         return -0.5 * (z.float() ** 2).sum(-1) - math.log(2 * math.pi) + log_det
 
 
-# ============================== Pose26 检测/关键点头 ==============================
+# ============================== Pose26 检测/关键点头 / detection/keypoint head ==============================
 
 
 class Pose(det.Detect):
-    """YOLO26-pose 关键点头（单 one2many 头，reg_max=1，Pose26 解码方式）。
+    """YOLO26-pose 关键点头（单 one2many 头，reg_max=1，Pose26 解码方式） / YOLO26-pose keypoint head (single one2many head, reg_max=1, Pose26 decoding).
 
-    训练时返回 dict(boxes/scores/feats/kpts/kpts_sigma) 供官方 PoseLoss26 使用；
-    评估时返回解码后的检测张量，通道顺序：
-        xywh(4) + sigmoid 类别(nc) + 关键点(nk=51)
-    与 NMS 的 split((4, nc, extra)) 约定一致，NMS 后把后 51 列 reshape 为 (N,17,3)。
+    训练时返回 dict(boxes/scores/feats/kpts/kpts_sigma) 供官方 PoseLoss26 使用 / Returns dict(boxes/scores/feats/kpts/kpts_sigma) during training for official PoseLoss26；
+    评估时返回解码后的检测张量 / returns decoded detection tensor during evaluation，通道顺序 / channel order:
+        xywh(4) + sigmoid 类别 / classes (nc) + 关键点 / keypoints (nk=51)
+    与 NMS 的 split((4, nc, extra)) 约定一致 / consistent with NMS split((4, nc, extra)) convention，NMS 后把后 51 列 reshape 为 (N,17,3) / reshape the last 51 columns to (N,17,3) after NMS.
 
-    结构（与官方 Pose26 对齐）：
-        cv4[i]  = Conv3x3 -> Conv3x3（输出 c4=85，无末端 1x1）
+    结构（与官方 Pose26 对齐） / Structure (aligned with official Pose26):
+        cv4[i]  = Conv3x3 -> Conv3x3（输出 c4=85，无末端 1x1 / no trailing 1x1）
         cv4_kpts[i] = Conv1x1(c4 -> nk=51)
-        cv4_sigma[i] = Conv1x1(c4 -> nk_sigma=34)（仅训练）
-        flow_model = RealNVP()（仅训练损失使用，纯浮点）
+        cv4_sigma[i] = Conv1x1(c4 -> nk_sigma=34)（仅训练 / training-only）
+        flow_model = RealNVP()（仅训练损失使用，纯浮点 / used only in training loss, pure float）
     """
 
     def __init__(self, nc=NUM_CLASSES, kpt_shape=None, reg_max=1,
@@ -203,7 +221,7 @@ class Pose(det.Detect):
         self.nkpt, self.ndim = self.kpt_shape[0], self.kpt_shape[1]
         self.nk = self.nkpt * self.ndim
         self.nk_sigma = self.nkpt * 2
-        # RLE 归一化流（训练损失专用，永不量化）
+        # RLE 归一化流（训练损失专用，永不量化） / RLE normalizing flow (training loss only, never quantized)
         self.flow_model = RealNVP()
 
         c4 = max(ch[0] // 4, self.nkpt * (self.ndim + 2))
@@ -227,7 +245,7 @@ class Pose(det.Detect):
         )
 
     def forward(self, x):
-        # 检测支路（cv2/cv3）直接复用父类
+        # 检测支路（cv2/cv3）直接复用父类 / Detection branch (cv2/cv3) directly inherited from parent
         preds = self.forward_head(x)
         bs = x[0].shape[0]
 
@@ -247,7 +265,7 @@ class Pose(det.Detect):
             preds["kpts_sigma"] = kpts_sigma
             return preds
 
-        # ---------------- 推理：Pose26 解码 (raw + anchor) * stride ----------------
+        # ---------------- 推理 / inference: Pose26 解码 / decoding (raw + anchor) * stride ----------------
         shape = x[0].shape
         if self._feat_shape != shape:
             self._anchors, self._strides_tensor = (
@@ -258,6 +276,7 @@ class Pose(det.Detect):
         num_anchors = kpts.shape[-1]
         y = kpts.view(bs, self.nkpt, self.ndim, num_anchors)
         # 缓存的 _anchors 为转置后的 (2, N)（dist2bbox 约定），取两行网格坐标
+        # Cached _anchors is transposed (2, N) (dist2bbox convention), take two rows of grid coordinates
         ax = self._anchors[0].view(1, 1, num_anchors)
         ay = self._anchors[1].view(1, 1, num_anchors)
         st = self._strides_tensor.view(1, 1, num_anchors)
@@ -271,19 +290,20 @@ class Pose(det.Detect):
         return torch.cat((dbox, preds["scores"].sigmoid(), kpts_decoded), 1)
 
 
-# ============================== 网络主体 ==============================
+# ============================== 网络主体 / Network body ==============================
 
 
 class YOLO26Pose(det.YOLO26):
-    """yolo26n-pose（scale=n）关键点网络。quant=False 浮点模型，True 为伪量化模型。
+    """yolo26n-pose（scale=n）关键点网络 / keypoint network. quant=False 浮点模型 / float model，True 为伪量化模型 / pseudo-quantized model.
 
-    层 0-22 与检测网络一致（直接构建后替换层 23），topology 编号/save 集合不变，
-    因此 yolo26n-pose.pt 的 state_dict（model.0.* ~ model.23.*，含 flow_model）
-    可直接加载，end2end 双头 one2one_* 参数被跳过。
+    层 0-22 与检测网络一致（直接构建后替换层 23）/ Layers 0-22 are identical to detection network (directly built then layer 23 replaced)，topology 编号/save 集合不变 / topology indexing/save set unchanged，
+    因此 yolo26n-pose.pt 的 state_dict（model.0.* ~ model.23.*，含 flow_model / including flow_model）
+    可直接加载 / can be directly loaded，end2end 双头 one2one_* 参数被跳过 / end2end dual-head one2one_* params are skipped.
     """
 
     def __init__(self, nc=NUM_CLASSES, quant=False, scale=det.DEFAULT_SCALE):
         # 先构建检测网络得到完整的 0-22 backbone/neck，再把层 23 的 Detect 换成 Pose
+        # First build detection network to get complete 0-22 backbone/neck, then replace layer 23's Detect with Pose
         super().__init__(nc=nc, quant=quant, scale=scale)
         head = Pose(nc=nc, kpt_shape=KPT_SHAPE, reg_max=1, quant=quant, scale=scale)
         det._tag(head, 23, [16, 19, 22])
@@ -302,13 +322,13 @@ class QuantYOLO26Pose(YOLO26Pose):
         super().__init__(nc=nc, quant=True, scale=scale)
 
 
-# ============================== 数据 / 损失 / 评估 ==============================
+# ============================== 数据 / 损失 / 评估 / data / loss / evaluation ==============================
 
 
 def _make_cfg(num_workers):
     cfg = get_cfg(DEFAULT_CFG)
     cfg.imgsz = IMGSZ
-    cfg.task = "pose"  # YOLODataset 据此生成 keypoints 标注
+    cfg.task = "pose"  # YOLODataset 据此生成 keypoints 标注 / YOLODataset generates keypoint annotations accordingly
     cfg.workers = num_workers
     return cfg
 
@@ -333,8 +353,8 @@ def _build_loaders(batch_size, num_workers, data, calibration=False):
 
 
 def get_dataloaders(batch_size=8, num_workers=2, calibration=False):
-    """复用 ultralytics 官方 coco8-pose 数据管道（含 keypoints）。"""
-    data = check_det_dataset(COCO8_POSE_YAML)
+    """复用 ultralytics 官方 coco8-pose 数据管道（含 keypoints）。/ Reuse ultralytics official coco8-pose data pipeline (with keypoints)."""
+    data = det.get_data_dict(DATA_YAML, "pose")
     if calibration:
         return _build_loaders(batch_size, num_workers, data, calibration=True), data
     train_loader, val_loader, _, _ = _build_loaders(batch_size, num_workers, data)
@@ -342,12 +362,12 @@ def get_dataloaders(batch_size=8, num_workers=2, calibration=False):
 
 
 class _LossShim:
-    """PoseLoss26 只需要 model.args / model.model[-1] / model.parameters()。"""
+    """PoseLoss26 只需要 model.args / model.model[-1] / model.parameters()。/ PoseLoss26 only needs model.args / model.model[-1] / model.parameters()."""
 
     def __init__(self, pose_head, epochs):
         self.args = SimpleNamespace(
             box=7.5, cls=0.5, dfl=1.5,
-            pose=12.0, kobj=1.0, rle=1.0,   # ultralytics/cfg/default.yaml 官方增益
+            pose=12.0, kobj=1.0, rle=1.0,   # ultralytics/cfg/default.yaml 官方增益 / official gains
             epochs=epochs,
         )
         self.model = [None] * 23 + [pose_head]
@@ -359,6 +379,7 @@ class _LossShim:
 
 def build_criterion(model, epochs):
     # 官方 PoseLoss26：v8PoseLoss(OKS keypoint loss + BCE 可见性) + RealNVP RLE
+    # Official PoseLoss26: v8PoseLoss(OKS keypoint loss + BCE visibility) + RealNVP RLE
     return PoseLoss26(_LossShim(model.model[-1], epochs), tal_topk=10)
 
 
@@ -366,9 +387,9 @@ IOU_VECTOR = torch.linspace(0.5, 0.95, 10)
 
 
 def _match_iou(pred_labels, gt_labels, iou, iou_vector):
-    """复刻 ultralytics BaseValidator.match_predictions：在 10 个 IoU 阈值上贪心匹配。
+    """复刻 ultralytics BaseValidator.match_predictions：在 10 个 IoU 阈值上贪心匹配。/ Replica of ultralytics BaseValidator.match_predictions: greedy matching over 10 IoU thresholds.
 
-    iou 形状 (num_gt, num_pred)，box IoU 或 pose OKS 均可。
+    iou 形状 (num_gt, num_pred)，box IoU 或 pose OKS 均可。/ iou shape (num_gt, num_pred), works for box IoU or pose OKS.
     """
     correct = torch.zeros(iou.shape[1], iou_vector.numel(), dtype=torch.bool)
     correct_class = gt_labels[:, None] == pred_labels[None, :]
@@ -387,14 +408,68 @@ def _match_iou(pred_labels, gt_labels, iou, iou_vector):
     return correct
 
 
-@torch.no_grad()
-def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres=0.001, iou_thres=0.7):
-    """在 coco8-pose 验证集上同时计算 box mAP 与 pose(OKS) mAP。
+def _maybe_visualize(batch, predictions, names, viz_dir, viz_prefix, viz_state):
+    """用 ultralytics 官方 plot_images 保存本批的 GT 拼图与预测拼图（含关键点骨架，val_batch 风格） /
+    Use official ultralytics plot_images to save GT and prediction mosaics of this batch (with keypoint skeletons, val_batch style).
 
-    与官方 PoseValidator._process_batch 一致：NMS 后把额外 51 列 reshape 成
-    (N,17,3) 关键点；GT 关键点由归一化坐标缩放到 letterbox 输入尺寸；
-    OKS 的面积项取 GT 框 xywh 的 w*h*0.53（cocoeval 约定），
-    用 kpt_iou(OKS) 在 10 个阈值上匹配。
+    viz_state 跨 batch 记录已保存图片数 / viz_state tracks saved image count across batches.
+    """
+    os.makedirs(viz_dir, exist_ok=True)
+    bs = batch["img"].shape[0]
+    bi = viz_state["batch"]
+    # GT 拼图（labels）：cls + 归一化 xywh 框 + batch_idx + 归一化关键点，与官方 plot_val_samples 一致 /
+    # GT mosaic (labels): cls + normalized xywh boxes + batch_idx + normalized keypoints, same as official plot_val_samples
+    gt_labels = {
+        "cls": batch["cls"].squeeze(-1),
+        "bboxes": batch["bboxes"],
+        "batch_idx": batch["batch_idx"],
+    }
+    if "keypoints" in batch:
+        gt_labels["keypoints"] = batch["keypoints"]
+    plot_images(
+        labels=gt_labels,
+        images=batch["img"],
+        paths=batch.get("im_file"),
+        fname=os.path.join(viz_dir, f"{viz_prefix}_batch{bi}_labels.jpg"),
+        names=names,
+        threaded=False,  # 训练循环内同步执行，避免线程堆积 / run synchronously inside training loop to avoid thread pile-up
+    )
+    # 预测拼图（preds）：与官方 PoseValidator.plot_predictions 一致，关键点为 letterbox 像素坐标 (N,17,3) /
+    # Prediction mosaic (preds): same as official PoseValidator.plot_predictions, keypoints are letterbox pixel coords (N,17,3)
+    if any(p.shape[0] for p in predictions):
+        plot_images(
+            labels={
+                "cls": torch.cat([p[:, 5] for p in predictions]),
+                "conf": torch.cat([p[:, 4] for p in predictions]),
+                "bboxes": xyxy2xywh(torch.cat([p[:, :4] for p in predictions])),
+                "batch_idx": torch.cat(
+                    [torch.full((p.shape[0],), i) for i, p in enumerate(predictions)]
+                ),
+                "keypoints": torch.cat(
+                    [p[:, 6:6 + NKPT * 3].reshape(-1, NKPT, 3) for p in predictions]
+                ),
+            },
+            images=batch["img"],
+            paths=batch.get("im_file"),
+            fname=os.path.join(viz_dir, f"{viz_prefix}_batch{bi}_pred.jpg"),
+            names=names,
+            threaded=False,
+        )
+    viz_state["saved"] += bs
+    viz_state["batch"] += 1
+
+
+@torch.no_grad()
+def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres=0.001,
+             iou_thres=0.7, viz_dir=None, viz_max=30, viz_prefix="eval"):
+    """在 coco8-pose 验证集上同时计算 box mAP 与 pose(OKS) mAP。若 viz_dir 不为空，
+    额外把前 viz_max 张验证图的 GT/预测拼图（含关键点）保存到 {viz_dir}/fvisualize/。/ Compute both box mAP and pose(OKS) mAP on coco8-pose validation set.
+    If viz_dir is set, additionally save GT/prediction mosaics (with keypoints) of the first viz_max val images into {viz_dir}/fvisualize/.
+
+    与官方 PoseValidator._process_batch 一致：NMS 后把额外 51 列 reshape 成 / Consistent with official PoseValidator._process_batch: reshape extra 51 columns after NMS to
+    (N,17,3) 关键点 / keypoints；GT 关键点由归一化坐标缩放到 letterbox 输入尺寸 / GT keypoints are scaled from normalized coords to letterbox input size；
+    OKS 的面积项取 GT 框 xywh 的 w*h*0.53（cocoeval 约定 / convention），
+    用 kpt_iou(OKS) 在 10 个阈值上匹配 / match over 10 thresholds using kpt_iou(OKS).
     """
     model.eval()
     stats_conf, stats_pcls, stats_tcls = [], [], []
@@ -403,6 +478,11 @@ def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres
     num_images = len(val_loader.dataset)
     steps = max_batches or math.ceil(num_images / batch_size)
     sigma = OKS_SIGMA if KPT_SHAPE == [17, 3] else np.ones(NKPT) / NKPT
+    # 可视化输出目录与计数器 / visualization output dir and counters
+    viz_out = os.path.join(viz_dir, "fvisualize") if viz_dir else None
+    viz_state = {"saved": 0, "batch": 0}
+    if viz_out:
+        os.makedirs(viz_out, exist_ok=True)
 
     for batch_index, batch in enumerate(val_loader):
         if batch_index >= steps:
@@ -416,9 +496,16 @@ def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres
             multi_label=True,
             agnostic=False,
             max_det=300,
-            nc=NUM_CLASSES,  # 显式指定，否则 nk=51 个关键点通道会被当成类别
+            nc=NUM_CLASSES,  # 显式指定，否则 nk=51 个关键点通道会被当成类别 / explicitly specified, otherwise nk=51 keypoint channels would be treated as classes
         )
         image_size = batch["img"].shape[2:]  # (h, w)
+
+        # 每次评估都可视化前几批（失败仅告警，绝不影响评估） / visualize first batches on every evaluate (failure only warns, never breaks eval)
+        if viz_out and viz_state["saved"] < viz_max:
+            try:
+                _maybe_visualize(batch, predictions, names, viz_out, viz_prefix, viz_state)
+            except Exception as exc:
+                print(f"      [viz] 可视化保存失败（仅告警）: {exc} / visualization save failed (warn only): {exc}")
 
         for sample_index, pred in enumerate(predictions):
             index = batch["batch_idx"] == sample_index
@@ -428,7 +515,7 @@ def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres
             if nl:
                 gt_boxes = xywh2xyxy(gt_boxes) * torch.tensor(image_size)[[1, 0, 1, 0]]
 
-            # GT 关键点：归一化坐标 -> letterbox 输入像素坐标
+            # GT 关键点：归一化坐标 -> letterbox 输入像素坐标 / GT keypoints: normalized coords -> letterbox input pixel coords
             gt_kpts = batch["keypoints"][index].float().to(device)
             if nl:
                 gt_kpts = gt_kpts.clone()
@@ -436,6 +523,7 @@ def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres
                 gt_kpts[..., 1] *= image_size[0]
 
             # 统一搬 CPU（detect evaluate 同理，ultralytics box_iou 等 metric 函数不跨设备）
+            # Move all to CPU (same for detect evaluate; ultralytics box_iou etc. metric functions don't work cross-device)
             pred_boxes = pred[:, :4].cpu()
             gt_boxes = gt_boxes.cpu()
             gt_cls = gt_cls.cpu()
@@ -449,7 +537,7 @@ def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres
                     pred[:, 5].cpu(), gt_cls,
                     box_iou(gt_boxes, pred_boxes), IOU_VECTOR
                 )
-                # 官方 cocoeval 约定：OKS 面积 = box 面积 * 0.53
+                # 官方 cocoeval 约定：OKS 面积 = box 面积 * 0.53 / Official cocoeval convention: OKS area = box area * 0.53
                 area = xyxy2xywh(gt_boxes)[:, 2:].prod(1) * 0.53
                 oks = kpt_iou(gt_kpts, pred_kpts, area=area, sigma=sigma)
                 tp_pose = _match_iou(pred[:, 5].cpu(), gt_cls, oks.cpu(), IOU_VECTOR)
@@ -481,7 +569,7 @@ def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres
     }
 
 
-# ============================== checkpoint / 权重复制 / 导出 ==============================
+# ============================== checkpoint / 权重复制 / 导出 / checkpoint / weight copy / export ==============================
 
 
 def load_checkpoint(model, path, return_meta=False):
@@ -493,14 +581,18 @@ def save_checkpoint(model, path, **metadata):
 
 
 def load_pretrained(model, path=None, scale=det.DEFAULT_SCALE):
-    """加载官方 yolo26{scale}-pose.pt 权重；单头模型跳过 one2one_* 双头权重。
+    """加载官方 yolo26{scale}-pose.pt 权重；单头模型跳过 one2one_* 双头权重。/ Load official yolo26{scale}-pose.pt weights; single-head model skips one2one_* dual-head weights.
 
-    仓库仅随附 yolo26n-pose.pt；s/m/l/x 缺失时跳过加载，模型随机初始化从头训练。
+    本地缺失的官方权重（如 yolo26s-pose.pt）会按 ultralytics 方式自动下载；仅离线或自定义路径缺失时才从头训练。/
+    Missing official weights (e.g. yolo26s-pose.pt) are auto-downloaded like ultralytics; random init only when offline or custom path missing.
     """
     if path is None:
         path = os.path.join(ULTRA_DIR, f"{det.base_name(scale, 'pose')}.pt")
-    if not os.path.exists(path):
-        print(f"[Pretrain] [warn] 未找到预训练权重 {path}，{det.model_name(scale)}-pose 将从头训练")
+    # 官方权重名缺失时自动下载（同 ultralytics）；自定义路径缺失则从头训练 /
+    # Auto-download official asset names (like ultralytics); missing custom path -> train from scratch
+    path = det.resolve_pretrained_path(path)
+    if path is None:
+        print(f"[Pretrain] [warn] 未找到预训练权重，{det.model_name(scale)}-pose 将从头训练")
         return model
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     state_dict = checkpoint["model"].float().state_dict()
@@ -521,7 +613,7 @@ def copy_float_to_quant(float_model, quant_model):
 
 
 def build_float_model(quant_model, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
-    """把量化模型的反量化权重灌进同结构的干净浮点模型（用于导出纯浮点 ONNX）。"""
+    """把量化模型的反量化权重灌进同结构的干净浮点模型（用于导出纯浮点 ONNX）。/ Inject dequantized weights from quantized model into a clean float model of the same architecture (for exporting pure-float ONNX)."""
     quant_pkg.freeze_batch_init(quant_model)
     quant_model.eval()
 
@@ -548,11 +640,14 @@ def collect_quant_params(quant_model):
     return quant_pkg.collect_quant_params(quant_model)
 
 
-def export_onnx(float_model, onnx_path, opset=16):
+def export_onnx(float_model, onnx_path, opset=16, imgsz=None):
+    """导出 ONNX，输入形状完全固定为 [1, 3, H, W]（无 dynamic_axes，图尺寸清晰可见） /
+    Export ONNX with fully static input shape [1, 3, H, W] (no dynamic_axes, graph dimensions clearly visible)."""
+    H = W = imgsz if imgsz is not None else IMGSZ
     os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
     float_model.eval()
     model_device = next(float_model.parameters()).device
-    dummy = torch.randn(1, 3, IMGSZ, IMGSZ, device=model_device)
+    dummy = torch.randn(1, 3, H, W, device=model_device)
     torch.onnx.export(
         float_model,
         dummy,
@@ -563,12 +658,9 @@ def export_onnx(float_model, onnx_path, opset=16):
         dynamo=False,
         input_names=["images"],
         output_names=["preds"],
-        dynamic_axes={
-            "images": {0: "batch_size"},
-            "preds": {0: "batch_size"},
-        },
+        # 无 dynamic_axes → 输入输出形状完全固定 / No dynamic_axes → all shapes fully fixed
     )
-    # onnxsim 简化（若已安装）
+    # onnxsim 简化（若已安装） / onnxsim simplification (if installed)
     try:
         import onnx
         from onnxsim import simplify as onnxsim_simplify
@@ -587,9 +679,9 @@ def export_onnx(float_model, onnx_path, opset=16):
 
 
 def _try_export_onnx(model, onnx_path):
-    """训练保存 best checkpoint 时同步导出 ONNX；失败仅告警，绝不影响训练。
+    """训练保存 best checkpoint 时同步导出 ONNX；失败仅告警，绝不影响训练。/ Export ONNX synchronously when saving best checkpoint during training; failure only warns, never affects training.
 
-    导出后模型被置为 eval，由下一轮 train_one_epoch 的 model.train() 恢复。
+    导出后模型被置为 eval，由下一轮 train_one_epoch 的 model.train() 恢复。/ Model is set to eval after export, restored by model.train() in the next train_one_epoch.
     """
     try:
         export_onnx(model, onnx_path)
@@ -624,6 +716,7 @@ def verify(float_model, quant_model, onnx_path, quant_params):
         ref_mag = float(np.abs(y_torch.numpy()).max())
         print(f"      onnxruntime vs PyTorch 最大绝对误差: preds {max_diff:.3e}（参考幅度 {ref_mag:.3e}）")
         # 输出含大数量级解码坐标，纯绝对阈值过严：max(1e-3 绝对, 1e-5 相对)
+        # Output contains decoded coordinates of large magnitude; pure absolute threshold too strict: max(1e-3 absolute, 1e-5 relative)
         assert max_diff < max(1e-3, 1e-5 * ref_mag), "ONNX 数值误差过大"
     except ImportError:
         print("      [skip] 未安装 onnxruntime，跳过数值比对")
@@ -634,17 +727,20 @@ def verify(float_model, quant_model, onnx_path, quant_params):
     print(f"      量化参数完整性检查通过（{len(quant_params)} 个张量）")
 
 
-def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None, scale=det.DEFAULT_SCALE):
+def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None, scale=det.DEFAULT_SCALE,
+                      model_dir=None):
     quant_pkg.freeze_batch_init(quant_model)
     quant_model.eval()
 
+    if model_dir is None:
+        model_dir = _MODEL_DIR_BASE
     base = det.base_name(scale, 'pose')
-    quant_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_{base}.pth")
+    quant_checkpoint = os.path.join(model_dir, f"{prefix}_{base}.pth")
     save_checkpoint(quant_model, quant_checkpoint, **(meta or {}))
 
     quant_params = collect_quant_params(quant_model)
-    json_path = os.path.join(MODEL_DIR, f"{prefix}_{base}_quant_params.json")
-    pth_path = os.path.join(MODEL_DIR, f"{prefix}_{base}_quant_params.pth")
+    json_path = os.path.join(model_dir, f"{prefix}_{base}_quant_params.json")
+    pth_path = os.path.join(model_dir, f"{prefix}_{base}_quant_params.pth")
     with open(json_path, "w", encoding="utf-8") as file:
         json.dump(quant_params, file, indent=2, ensure_ascii=False)
     torch.save(
@@ -660,11 +756,11 @@ def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None, scale=det
     print(f"[2/5] 量化参数已写出: {json_path} / {pth_path}（{len(quant_params)} 个张量）")
 
     float_model = build_float_model(quant_model, nc=nc, scale=scale)
-    float_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_{base}_float.pth")
+    float_checkpoint = os.path.join(model_dir, f"{prefix}_{base}_float.pth")
     save_checkpoint(float_model, float_checkpoint)
     print(f"[3/5] 干净浮点权重已写出: {float_checkpoint}")
 
-    onnx_path = os.path.join(MODEL_DIR, f"{prefix}_{base}_float.onnx")
+    onnx_path = os.path.join(model_dir, f"{prefix}_{base}_float.onnx")
     export_onnx(float_model, onnx_path, opset=16)
     print(f"[4/5] 干净浮点 ONNX 已写出: {onnx_path}")
 
@@ -673,7 +769,7 @@ def save_quant_outputs(quant_model, prefix, nc=NUM_CLASSES, meta=None, scale=det
     return quant_checkpoint, json_path, pth_path, float_checkpoint, onnx_path
 
 
-# ============================== 训练各阶段 ==============================
+# ============================== 训练各阶段 / Training stages ==============================
 
 
 _ModelEMA = det._ModelEMA
@@ -683,7 +779,7 @@ _build_optimizer = det._build_optimizer
 
 def train_one_epoch(model, loader, criterion, optimizer, epoch, epochs, nb, ema=None,
                     nbs=64, warmup_epochs=3.0, lrf=0.01, max_batches=None):
-    """与检测/分割版一致的官方训练循环；损失项为 box/pose/kobj/cls/l1/rle 六项。"""
+    """与检测/分割版一致的官方训练循环；损失项为 box/pose/kobj/cls/l1/rle 六项。/ Official training loop consistent with detection/segmentation version; loss items: box/pose/kobj/cls/l1/rle (6 items)."""
     model.train()
     batch_size = loader.batch_size
     accumulate = max(round(nbs / batch_size), 1)
@@ -711,6 +807,8 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch, epochs, nb, ema=
         images = batch["img"].float().to(device) / 255.0
         # ultralytics PoseLoss26 内部会把 batch_idx、offsets 等 tensor 混用在不同设备上
         # （新版本 bug），需先把 batch 里所有 tensor 统一搬到 device
+        # ultralytics PoseLoss26 internally mixes batch_idx, offsets and other tensors across different devices
+        # (new version bug), need to move all tensors in batch to device first
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(device)
@@ -737,7 +835,7 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch, epochs, nb, ema=
             ]
         )
 
-    if last_opt_step == 0:  # 所有 batch 都还没触发 optimizer step（smoke 极限场景兜底）
+    if last_opt_step == 0:  # 所有 batch 都还没触发 optimizer step（smoke 极限场景兜底） / no optimizer step triggered yet across all batches (fallback for smoke extreme case)
         optimizer.step()
         optimizer.zero_grad()
 
@@ -758,7 +856,7 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
         " | warmup 3ep | 梯度累积 nbs=64 | EMA | close_mosaic=10"
     )
 
-    data = check_det_dataset(COCO8_POSE_YAML)
+    data = det.get_data_dict(DATA_YAML, "pose")
     train_loader, val_loader, cfg, train_set = _build_loaders(batch_size, num_workers, data)
     nb = len(train_loader)
 
@@ -775,10 +873,11 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
     best_epoch = -1
     best_meta = {}
     base = det.base_name(scale, 'pose')
-    checkpoint_path = os.path.join(MODEL_DIR, f"{base}_best.pth")
-    last_checkpoint = os.path.join(MODEL_DIR, f"{base}_last.pth")
+    model_dir = _model_dir_for(scale=scale)
+    checkpoint_path = os.path.join(model_dir, f"{base}_best.pth")
+    last_checkpoint = os.path.join(model_dir, f"{base}_last.pth")
 
-    # resume：从 _last.pth 恢复，接续训练
+    # resume：从 _last.pth 恢复，接续训练 / resume: restore from _last.pth, continue training
     start_epoch = 0
     if resume and os.path.exists(last_checkpoint):
         print(f"[Float] Resume from {last_checkpoint}")
@@ -804,7 +903,8 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
         )
         box_loss, pose_loss, kobj_loss, cls_loss, l1_loss, rle_loss = items
         metrics = evaluate(
-            ema.ema, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+            ema.ema, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+            viz_dir=model_dir, viz_prefix=f"float_ep{epoch + 1:03d}"
         )
         fitness = 0.9 * metrics["pose_map"] + 0.1 * metrics["pose_map50"]
 
@@ -843,7 +943,8 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
 
     load_checkpoint(float_model, checkpoint_path)
     best_metrics = evaluate(
-        float_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        float_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=model_dir, viz_prefix="float_best"
     )
     print(f"[Float] Best checkpoint: {checkpoint_path}（epoch {best_epoch}/{epochs}）")
     print(
@@ -856,7 +957,7 @@ def float_train(batch_size=16, lr=None, epochs=100, num_classes=NUM_CLASSES, num
 @torch.no_grad()
 def calibrate_quantizer(quant_model, calibration_loader, calibration_batches=20,
                          float_model=None):
-    """校准量化器（委托给 detect 模块的升级版本）。"""
+    """校准量化器（委托给 detect 模块的升级版本）。/ Calibrate quantizer (delegates to the upgraded version in detect module)."""
     return det.calibrate_quantizer(quant_model, calibration_loader,
                                     calibration_batches, float_model=float_model)
 
@@ -873,10 +974,13 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
     _, val_loader, _ = get_dataloaders(batch_size, num_workers)
 
     base = det.base_name(scale, 'pose')
+    float_dir = _model_dir_for(scale=scale)
+    quant_dir = _model_dir_for(scale=scale, quant_method=quant_method)
     # 优先 _best.pth（与 QAT 命名一致），fallback 到旧版无后缀 .pth
-    float_checkpoint = os.path.join(MODEL_DIR, f"{base}_best.pth")
+    # Prefer _best.pth (consistent with QAT naming), fallback to old-style no-suffix .pth
+    float_checkpoint = os.path.join(float_dir, f"{base}_best.pth")
     if not os.path.exists(float_checkpoint):
-        float_checkpoint = os.path.join(MODEL_DIR, f"{base}.pth")
+        float_checkpoint = os.path.join(float_dir, f"{base}.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
 
@@ -891,7 +995,8 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
                          float_model=float_model)
 
     metrics = evaluate(
-        ptq_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        ptq_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix=f"ptq_{tag}"
     )
     print(
         f"[PTQ-{tag}] box mAP50:{metrics['map50']:.4f} | "
@@ -909,13 +1014,15 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_classes
         **metrics,
     }
     ptq_checkpoint = save_quant_outputs(
-        ptq_model, f"ptq_{tag}", nc=num_classes, meta=ptq_meta, scale=scale
+        ptq_model, f"ptq_{tag}", nc=num_classes, meta=ptq_meta, scale=scale,
+        model_dir=quant_dir,
     )[0]
 
     load_checkpoint(ptq_model, ptq_checkpoint)
     quant_pkg.freeze_batch_init(ptq_model)
     final_metrics = evaluate(
-        ptq_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        ptq_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix=f"ptq_{tag}_reload"
     )
     print(
         f"[PTQ] 重载 checkpoint 后 pose mAP50:{final_metrics['pose_map50']:.4f} "
@@ -940,7 +1047,9 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
     nb = len(train_loader)
 
     base = det.base_name(scale, 'pose')
-    ptq_checkpoint = os.path.join(MODEL_DIR, f"ptq_{tag}_{base}.pth")
+    float_dir = _model_dir_for(scale=scale)
+    quant_dir = _model_dir_for(scale=scale, quant_method=quant_method)
+    ptq_checkpoint = os.path.join(quant_dir, f"ptq_{tag}_{base}.pth")
     if not os.path.exists(ptq_checkpoint):
         raise FileNotFoundError(
             f"找不到 {tag} 的 PTQ 权重，请先运行 PTQ_calibration('{tag}'): {ptq_checkpoint}"
@@ -963,10 +1072,10 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
     best_fitness = -1.0
     best_epoch = -1
     best_meta = {}
-    best_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base}_best.pth")
-    last_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base}_last.pth")
+    best_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{base}_best.pth")
+    last_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{base}_last.pth")
 
-    # resume：从 _last.pth 恢复，接续训练
+    # resume：从 _last.pth 恢复，接续训练 / resume: restore from _last.pth, continue training
     start_epoch = 0
     if resume and os.path.exists(last_checkpoint):
         print(f"[QAT-{tag}] Resume from {last_checkpoint}")
@@ -986,7 +1095,8 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
         )
         box_loss, pose_loss, kobj_loss, cls_loss, l1_loss, rle_loss = items
         metrics = evaluate(
-            qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+            qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+            viz_dir=quant_dir, viz_prefix=f"qat_{tag}_ep{epoch + 1:03d}"
         )
         fitness = 0.9 * metrics["pose_map"] + 0.1 * metrics["pose_map50"]
 
@@ -1004,6 +1114,7 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
             "cls_loss": float(cls_loss),
             "l1_loss": float(l1_loss),
             "rle_loss": float(rle_loss),
+            "fitness": float(fitness),  # QAT checkpoint 需带 fitness 供接续/对比 / fitness required in QAT checkpoint meta
             **metrics,
         }
         save_checkpoint(qat_model, last_checkpoint, **epoch_meta)
@@ -1025,7 +1136,8 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
 
     load_checkpoint(qat_model, best_checkpoint)
     best_metrics = evaluate(
-        qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix=f"qat_{tag}_best"
     )
     print(
         f"[QAT-{tag}] Best epoch:{best_epoch}/{epochs} | "
@@ -1033,7 +1145,8 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=16, lr=None, epoc
         f"Best: {best_checkpoint}"
     )
     qat_checkpoint = save_quant_outputs(
-        qat_model, f"qat_{tag}", nc=num_classes, meta=best_meta, scale=scale
+        qat_model, f"qat_{tag}", nc=num_classes, meta=best_meta, scale=scale,
+        model_dir=quant_dir,
     )[0]
     return qat_checkpoint, best_fitness, best_meta
 
@@ -1046,13 +1159,15 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_class
     print(f"Device: {device}")
 
     base = det.base_name(scale, 'pose')
-    # 优先 _best.pth，fallback 到无后缀
-    float_checkpoint = os.path.join(MODEL_DIR, f"{base}_best.pth")
+    float_dir = _model_dir_for(scale=scale)
+    quant_dir = _model_dir_for(scale=scale, quant_method=quant_method)
+    # 优先 _best.pth，fallback 到无后缀 / Prefer _best.pth, fallback to no-suffix
+    float_checkpoint = os.path.join(float_dir, f"{base}_best.pth")
     if not os.path.exists(float_checkpoint):
-        float_checkpoint = os.path.join(MODEL_DIR, f"{base}.pth")
-    qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base}_best.pth")
+        float_checkpoint = os.path.join(float_dir, f"{base}.pth")
+    qat_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{base}_best.pth")
     if not os.path.exists(qat_checkpoint):
-        qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_{base}.pth")
+        qat_checkpoint = os.path.join(quant_dir, f"qat_{tag}_{base}.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
     if not os.path.exists(qat_checkpoint):
@@ -1065,7 +1180,8 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_class
     float_model = FloatYOLO26Pose(num_classes, scale=scale).to(device)
     float_model, float_meta = load_checkpoint(float_model, float_checkpoint, return_meta=True)
     float_metrics = evaluate(
-        float_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        float_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix="compare_float"
     )
 
     qat_model = QuantYOLO26Pose(num_classes, scale=scale).to(device)
@@ -1078,7 +1194,8 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=8, num_class
         print(f"      [warn] QAT checkpoint 记录的尺度为 yolo26{saved_scale}-pose，当前为 yolo26{det.get_scale(scale)}-pose")
     quant_pkg.freeze_batch_init(qat_model)
     qat_metrics = evaluate(
-        qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches
+        qat_model, val_loader, data, batch_size=batch_size, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix="compare_qat"
     )
 
     print(
@@ -1141,8 +1258,8 @@ def build_arg_parser():
     parser.add_argument("--max-eval-batches", type=int, default=None)
     parser.add_argument(
         "--data",
-        default=COCO8_POSE_YAML,
-        help="数据集 yaml 路径（默认 coco8-pose.yaml）",
+        default=DATA_YAML,
+        help="数据集 yaml 路径或数据集目录（默认自动下载 coco8-pose.yaml 到 dataset/；可手动指定其他目录）",
     )
     parser.add_argument("--resume", action="store_true",
                         help="从 _last.pth checkpoint 接续训练")
@@ -1150,15 +1267,17 @@ def build_arg_parser():
 
 
 if __name__ == "__main__":
+    quant_pkg.install_print_timestamp()  # print 加分钟级时间戳 / minute-precision timestamp for print
     args = build_arg_parser().parse_args()
 
-    # 根据 --data yaml 动态覆盖全局 NUM_CLASSES 和 COCO8_POSE_YAML
-    COCO8_POSE_YAML = args.data  # 复用变量名；函数内部引用它
+    # 根据 --data 动态覆盖全局 NUM_CLASSES 和 DATA_YAML（默认走自动下载） /
+    # Override global NUM_CLASSES / DATA_YAML per --data (default auto-downloads)
+    DATA_YAML = args.data  # 复用变量名；函数内部引用它 / Reuse variable name; referenced inside functions
     try:
-        _tmp = det.check_det_dataset(args.data)
+        _tmp = det.get_data_dict(args.data, "pose")
         NUM_CLASSES = len(_tmp["names"])
     except Exception:
-        pass  # yaml 解析失败则保留默认 1
+        pass  # yaml 解析失败则保留默认 1 / keep default 1 if yaml parsing fails
     print(f"数据集: {args.data} | 类别数: {NUM_CLASSES}")
 
     scale = det.get_scale(args.model)

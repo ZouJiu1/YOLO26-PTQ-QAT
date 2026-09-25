@@ -1,28 +1,33 @@
-"""把 float 训练保存的 checkpoint（best / last）导出为 ONNX（带 onnxsim 简化）。
+"""把 float 训练保存的 checkpoint（best / last）导出为 ONNX（带 onnxsim 简化）。 / Export float training checkpoints (best / last) to ONNX (with onnxsim simplification).
 
-背景：
+背景 / Background:
     networks_yolo26-*.py 训练流程里，export_onnx() 只在 PTQ/QAT 部署阶段被调用
     （导出的是量化参数回灌后的"干净浮点"模型）。float 训练阶段保存的
-    {base}_best.pth / {base}_last.pth 本身不会自动转 ONNX，本脚本补上这一步。
+    {base}_best.pth / {base}_last.pth 本身不会自动转 ONNX，本脚本补上这一步。 / In the networks_yolo26-*.py training pipeline, export_onnx() is only called in the PTQ/QAT deployment stage
+    (exporting the "clean float" model after quant parameter reinjection). Checkpoints saved during float training,
+    {base}_best.pth / {base}_last.pth, are not automatically converted to ONNX — this script fills that gap.
 
-用法（在 QAT_training 目录下运行）：
-    # detect：best（老命名为 yolo26n.pth，无 _best 后缀）和 last
+用法（在 QAT_training 目录下运行）： / Usage (run from QAT_training directory):
+    # detect：best（老命名为 yolo26n.pth，无 _best 后缀）和 last / detect: best (old naming yolo26n.pth, no _best suffix) and last
     python script/export_float_onnx.py --task detect --ckpt model/yolo26n.pth
     python script/export_float_onnx.py --task detect --ckpt model/yolo26n_last.pth
 
-    # seg / pose / cls 同理（按各自 base_name 规则）
+    # seg / pose / cls / obb / depth 同理（按各自 base_name 规则） / seg / pose / cls / obb / depth similar (follow their base_name convention)
     python script/export_float_onnx.py --task seg  --ckpt model/yolo26n-seg_best.pth
     python script/export_float_onnx.py --task pose --ckpt model/yolo26n-pose_best.pth
     python script/export_float_onnx.py --task cls  --ckpt model/yolo26n-cls_best.pth
+    python script/export_float_onnx.py --task obb  --ckpt model/yolo26-obb/n/yolo26n-obb_best.pth
+    python script/export_float_onnx.py --task depth --ckpt model/yolo26-depth/n/yolo26n-depth_best.pth
 
-输出命名规则：
+输出命名规则 / Output naming convention:
     不指定 --out 时，输出为 {ckpt去掉.pth}_float.onnx（与 PTQ/QAT 导出的
-    *_float.onnx 命名风格保持一致）。
+    *_float.onnx 命名风格保持一致）。 / When --out is not specified, output is {ckpt with .th stripped}_float.onnx
+    (keeps naming style consistent with PTQ/QAT exported *_float.onnx).
 
-说明：
-    * 导出只需 CPU，与正在进行的 GPU 训练互不干扰；
-    * export_onnx 内部已带 onnxsim 简化（未安装 onnxsim 时自动跳过）；
-    * checkpoint 保存的是 EMA 权重（与验证/部署口径一致）。
+说明 / Notes:
+    * 导出只需 CPU，与正在进行的 GPU 训练互不干扰； / * Export only needs CPU, no interference with ongoing GPU training;
+    * export_onnx 内部已带 onnxsim 简化（未安装 onnxsim 时自动跳过）； / * export_onnx already includes onnxsim simplification (auto-skip if onnxsim not installed);
+    * checkpoint 保存的是 EMA 权重（与验证/部署口径一致）。 / * Checkpoints store EMA weights (consistent with validation/deployment convention).
 """
 
 import argparse
@@ -30,14 +35,14 @@ import importlib.util
 import os
 import sys
 
-# 让脚本可以从仓库根目录直接运行（python script/export_float_onnx.py）
+# 让脚本可以从仓库根目录直接运行（python script/export_float_onnx.py） / Allow script to run directly from repo root (python script/export_float_onnx.py)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 MODEL_DIR = os.path.join(BASE_DIR, "model")
 
 
 def load_task_module(task):
-    """按任务动态加载 networks_yolo26-{task}.py（文件名含 '-'，用文件路径加载）。"""
+    """按任务动态加载 networks_yolo26-{task}.py（文件名含 '-'，用文件路径加载）。 / Dynamically load networks_yolo26-{task}.py by task name (filename contains '-', load via file path)."""
     path = os.path.join(BASE_DIR, f"networks_yolo26-{task}.py")
     if not os.path.exists(path):
         raise FileNotFoundError(f"未知任务 {task}，找不到 {path}")
@@ -47,26 +52,31 @@ def load_task_module(task):
     return module
 
 
-# 各任务的 Float 模型类名（模块内定义的统一命名）
+# 各任务的 Float 模型类名（模块内定义的统一命名） / Float model class names for each task (unified naming defined inside modules)
 FLOAT_CLS = {
     "detect": "FloatYOLO26",
     "seg": "FloatYOLO26Seg",
     "pose": "FloatYOLO26Pose",
     "cls": "FloatYOLO26Cls",
+    "obb": "FloatYOLO26OBB",
+    "depth": "FloatYOLO26Depth",
 }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="float checkpoint -> ONNX（含 onnxsim）")
-    parser.add_argument("--task", required=True, choices=["detect", "seg", "pose", "cls"],
-                        help="任务类型，决定加载哪个 networks_yolo26-*.py 及 Float 模型类")
+    parser = argparse.ArgumentParser(description="float checkpoint -> ONNX（含 onnxsim） / float checkpoint -> ONNX (with onnxsim)")
+    parser.add_argument("--task", required=True, choices=["detect", "seg", "pose", "cls", "obb", "depth"],
+                        help="任务类型，决定加载哪个 networks_yolo26-*.py 及 Float 模型类 / Task type, determines which networks_yolo26-*.py and Float model class to load")
     parser.add_argument("--ckpt", required=True,
-                        help="float checkpoint 路径（相对 QAT_training 目录或绝对路径）")
+                        help="float checkpoint 路径（相对 QAT_training 目录或绝对路径） / float checkpoint path (relative to QAT_training dir or absolute)")
     parser.add_argument("--out", default=None,
-                        help="输出 onnx 路径；默认 {ckpt去掉.pth}_float.onnx")
+                        help="输出 onnx 路径；默认 {ckpt去掉.pth}_float.onnx / Output onnx path; default {ckpt with .th stripped}_float.onnx")
     parser.add_argument("--scale", default="yolo26n",
-                        help="模型尺度，默认 yolo26n（与 mini 训练一致）")
-    parser.add_argument("--opset", type=int, default=16, help="ONNX opset，默认 16")
+                        help="模型尺度，默认 yolo26n（与 mini 训练一致） / Model scale, default yolo26n (consistent with mini training)")
+    parser.add_argument("--opset", type=int, default=16, help="ONNX opset，默认 16 / ONNX opset, default 16")
+    parser.add_argument("--imgsz", type=int, default=None,
+                        help="输入图像尺寸 H=W；默认模块级 IMGSZ（detect/seg/pose/obb/depth=640，cls=224） / "
+                             "Input image size H=W; default module-level IMGSZ (detect/seg/pose/obb/depth=640, cls=224)")
     args = parser.parse_args()
 
     ckpt_path = args.ckpt if os.path.isabs(args.ckpt) else os.path.join(BASE_DIR, args.ckpt)
@@ -83,7 +93,8 @@ def main():
     float_cls = getattr(module, FLOAT_CLS[args.task])
 
     # 构建浮点模型并加载 checkpoint（load_checkpoint 自带 shape mismatch 过滤，
-    # 且 checkpoint 里存的就是 EMA 权重，直接加载即可）
+    # 且 checkpoint 里存的就是 EMA 权重，直接加载即可） / Build float model and load checkpoint
+    # (load_checkpoint has built-in shape mismatch filtering, and checkpoints store EMA weights, so direct load is fine)
     model = float_cls(scale=args.scale).to(module.device)
     _, meta = module.load_checkpoint(model, ckpt_path, return_meta=True)
     print(f"[export] 加载 {ckpt_path}")
@@ -91,7 +102,7 @@ def main():
         print(f"[export] meta: stage={meta.get('stage')} epoch={meta.get('epoch')}"
               f" fitness={meta.get('fitness')}")
 
-    module.export_onnx(model, onnx_path, opset=args.opset)
+    module.export_onnx(model, onnx_path, opset=args.opset, imgsz=args.imgsz)
     print(f"[export] ONNX 已写出: {onnx_path}")
 
 

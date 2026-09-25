@@ -1,0 +1,9 @@
+path: /home/zoujiu/Desktop/projects/aLSQplus/QAT_training/dataset/depth8-png
+train: images/train
+val: images/val
+nc: 1
+names:
+  0: depth
+channels: 3
+depth_scale: 1000
+download: https://github.com/ultralytics/assets/releases/download/v0.0.0/depth8-png.zip

@@ -6,7 +6,7 @@ from torch.autograd import Function
 
 
 # ********************* quantizers（量化器，量化） *********************
-# 取整(ste)
+# 取整 (STE) / rounding (STE)
 class Round(Function):
     @staticmethod
     def forward(self, input):
@@ -19,8 +19,10 @@ class Round(Function):
         grad_input = grad_output.clone()
         return grad_input
 
-# min-max量化(标准非对称量化: scale/zero_point, 范围内梯度直通, 范围外梯度置0)
+# min-max 量化（标准非对称量化: scale/zero_point，范围内梯度直通，范围外梯度置 0）
+# / min-max quantization (standard asymmetric: scale/zero_point, STE inside range, zero gradient outside)
 # 量化: q = clamp(Round(x/scale) + zero_point, qmin, qmax)   反量化: x' = (q - zero_point) * scale
+# / Quantize: q = clamp(Round(x/scale) + zero_point, qmin, qmax)   Dequantize: x' = (q - zero_point) * scale
 class quantize_minmax(Function):
     @staticmethod
     def forward(ctx, values, scale, zero_point, qmin, qmax):
@@ -40,30 +42,32 @@ class quantize_minmax(Function):
         grad_values = grad_output * mask
         return grad_values, None, None, None, None
 
-# A(特征)量化
+# A(特征)量化 / A(activation) quantization
 class MinMaxActivationQuantizer(nn.Module):
     def __init__(self, a_bits, collect_method='percent', percentile=99.9, cluster_ratio=0.1, all_positive=False):
         super(MinMaxActivationQuantizer, self).__init__()
         self.a_bits = a_bits
         self.q_range = 2 ** self.a_bits - 1
-        self.collect_method = collect_method # 收集方式: 'percent'百分位截断 / 'cluster'间隙聚类去离群
-        self.percentile = percentile         # collect_method='percent'时使用的百分位
-        self.cluster_ratio = cluster_ratio   # collect_method='cluster'时间隙阈值占整体范围的比例
-        self.all_positive = all_positive     # 无符号: 量化范围下限截断为0
+        self.collect_method = collect_method  # 收集方式: 'percent' 百分位截断 / 'cluster' 间隙聚类去离群
+                                             # / collection method: 'percent' percentile truncation / 'cluster' gap clustering for outlier removal
+        self.percentile = percentile          # collect_method='percent' 时使用的百分位 / percentile used when collect_method='percent'
+        self.cluster_ratio = cluster_ratio    # collect_method='cluster' 时间隙阈值占整体范围的比例 / gap threshold as fraction of full range when collect_method='cluster'
+        self.all_positive = all_positive      # 无符号: 量化范围下限截断为 0 / unsigned: clamp quantization range lower bound to 0
         self.init = 0
         self.register_buffer('r_min', torch.zeros(1))
         self.register_buffer('r_max', torch.zeros(1))
         self.register_buffer('scale', torch.ones(1))
         self.register_buffer('zero_point', torch.zeros(1))
 
-    # 间隙聚类去离群点(一维版欧式聚类): 排序后按间隙分簇, 取最大簇的min/max
+    # 间隙聚类去离群点（一维版欧式聚类）: 排序后按间隙分簇，取最大簇的 min/max
+    # / Gap clustering for outlier removal (1D Euclidean clustering): sort, cluster by gaps, take min/max of the largest cluster
     def collect_cluster(self, values):
         if values.numel() <= 2:
             return values[0], values[-1]
         gaps = values[1:] - values[:-1]
         threshold = (values[-1] - values[0]) * self.cluster_ratio
         split = torch.nonzero(gaps > threshold).flatten() + 1
-        if split.numel() == 0: # 间隙均小于阈值, 全部属于一个簇
+        if split.numel() == 0:  # 间隙均小于阈值，全部属于一个簇 / all gaps below threshold, everything in one cluster
             return values[0], values[-1]
         bounds = torch.cat((torch.zeros(1, device=values.device, dtype=split.dtype),
                             split,
@@ -72,7 +76,8 @@ class MinMaxActivationQuantizer(nn.Module):
         main = int(torch.argmax(sizes))
         return values[bounds[main]], values[bounds[main + 1] - 1]
 
-    # 百分位截断去离群点: 取低分位为min、高分位为max
+    # 百分位截断去离群点: 取低分位为 min、高分位为 max
+    # / Percentile truncation for outlier removal: low percentile → min, high percentile → max
     def collect_percent(self, values):
         n = values.numel()
         low = (100.0 - self.percentile) / 100.0
@@ -80,32 +85,38 @@ class MinMaxActivationQuantizer(nn.Module):
         r_max = values[min(n - 1, int(self.percentile / 100.0 * (n - 1)))]
         return r_min, r_max
 
-    # 收集min/max + 量化/反量化
+    # 收集 min/max + 量化/反量化 / collect min/max + quantize/dequantize
     def forward(self, activation):
         values = torch.sort(activation.detach().reshape(-1))[0]
         if self.collect_method == 'cluster':
             batch_min, batch_max = self.collect_cluster(values)
         else:
             batch_min, batch_max = self.collect_percent(values)
-        if self.init == 0: # initization
+        if self.init == 0:  # initialization
             # copy_ 保持 buffer 的 (1,) 形状，便于 state_dict 重载
+            # / use copy_ to preserve (1,) shape of buffers for state_dict compatibility
             self.r_min.copy_(batch_min.reshape(1))
             self.r_max.copy_(batch_max.reshape(1))
             self.init = 1
-        else: # collect running min/max
+        else:  # collect running min/max
             self.r_min.copy_(torch.min(self.r_min, batch_min).reshape(1))
             self.r_max.copy_(torch.max(self.r_max, batch_max).reshape(1))
-        if self.all_positive: # 无符号: 量化范围下限截断为0
+        if self.all_positive:  # 无符号: 量化范围下限截断为 0 / unsigned: clamp quantization range lower bound to 0
             self.r_min.clamp_(min=0)
-        # 由收集到的[r_min, r_max]计算标准的scale/zero_point
-        if self.all_positive: # 无符号整型层: [0, 2^b-1]
+        # 由收集到的 [r_min, r_max] 计算标准的 scale/zero_point
+        # / compute standard scale/zero_point from collected [r_min, r_max]
+        if self.all_positive:  # 无符号整型层: [0, 2^b-1] / unsigned integer layer: [0, 2^b-1]
             qmin, qmax = 0, self.q_range
-        else: # 有符号整型层: [-2^(b-1), 2^(b-1)-1]
+        else:  # 有符号整型层: [-2^(b-1), 2^(b-1)-1] / signed integer layer: [-2^(b-1), 2^(b-1)-1]
             qmin, qmax = -(2 ** (self.a_bits - 1)), 2 ** (self.a_bits - 1) - 1
         eps = torch.finfo(activation.dtype).eps
         # 用全新局部张量参与前向/反传：同一量化器实例可能在一次前向中被多次调用
         # （如 SPPF 中共享的 QuantMaxPool 连串 3 次），若直接把会被 copy_ 原地改写的
         # buffer 传给 save_for_backward，后续调用会让先前调用保存的张量版本号失效。
+        # / Use fresh local tensors for forward/backward: the same quantizer instance may be
+        #   called multiple times in one forward pass (e.g. shared QuantMaxPool chained 3× in SPPF).
+        #   Passing buffers that get copy_-overwritten to save_for_backward would invalidate
+        #   previously saved tensor versions on subsequent calls.
         scale = (torch.clamp(self.r_max - self.r_min, min=eps) / (qmax - qmin)).reshape(1)
         zero_point = (qmin - self.r_min / scale).round().clamp(qmin, qmax).reshape(1)
         self.scale.copy_(scale)
@@ -113,30 +124,31 @@ class MinMaxActivationQuantizer(nn.Module):
         q_a = quantize_minmax.apply(activation, scale, zero_point, qmin, qmax)
         return q_a
 
-# W(权重)量化
+# W(权重)量化 / W(weight) quantization
 class MinMaxWeightQuantizer(nn.Module):
     def __init__(self, w_bits, all_positive=False, per_channel=False):
         super(MinMaxWeightQuantizer, self).__init__()
         self.w_bits = w_bits
         self.all_positive = all_positive
         self.per_channel = per_channel
-        if self.all_positive: # 无符号整型层: [0, 2^b-1]
+        if self.all_positive:  # 无符号整型层: [0, 2^b-1] / unsigned integer layer: [0, 2^b-1]
             self.qmin, self.qmax = 0, 2 ** w_bits - 1
-        else: # 有符号整型层: [-2^(b-1), 2^(b-1)-1]
+        else:  # 有符号整型层: [-2^(b-1), 2^(b-1)-1] / signed integer layer: [-2^(b-1), 2^(b-1)-1]
             self.qmin, self.qmax = -(2 ** (w_bits - 1)), 2 ** (w_bits - 1) - 1
 
-    # 量化/反量化
+    # 量化/反量化 / quantize/dequantize
     def forward(self, weight):
-        if self.per_channel: # 按输出通道(dim 0)统计min/max
+        if self.per_channel:  # 按输出通道 (dim 0) 统计 min/max / collect min/max per output channel (dim 0)
             w_tmp = weight.detach().reshape(weight.size(0), -1)
             r_min = w_tmp.min(dim=1).values.view(-1, *([1] * (weight.dim() - 1)))
             r_max = w_tmp.max(dim=1).values.view(-1, *([1] * (weight.dim() - 1)))
         else:
             r_min = weight.detach().min()
             r_max = weight.detach().max()
-        if self.all_positive: # 无符号: 量化范围下限截断为0
+        if self.all_positive:  # 无符号: 量化范围下限截断为 0 / unsigned: clamp quantization range lower bound to 0
             r_min = r_min.clamp(min=0)
-        # 由[r_min, r_max]计算标准的scale/zero_point
+        # 由 [r_min, r_max] 计算标准的 scale/zero_point
+        # / compute standard scale/zero_point from [r_min, r_max]
         eps = torch.finfo(weight.dtype).eps
         scale = torch.clamp(r_max - r_min, min=eps) / (self.qmax - self.qmin)
         zero_point = (self.qmin - r_min / scale).round().clamp(self.qmin, self.qmax)
@@ -195,7 +207,8 @@ class QuantConvTranspose2d(nn.ConvTranspose2d):
                  quant_inference=False,
                  all_positive=False,
                  per_channel=False):
-        # 注意: ConvTranspose2d的参数顺序为(..., output_padding, groups, bias, dilation, padding_mode)
+        # 注意: ConvTranspose2d 的参数顺序为 (..., output_padding, groups, bias, dilation, padding_mode)
+        # / Note: ConvTranspose2d parameter order is (..., output_padding, groups, bias, dilation, padding_mode)
         super(QuantConvTranspose2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, output_padding,
                                                    groups, bias, dilation, padding_mode)
         self.quant_inference = quant_inference
@@ -313,6 +326,7 @@ class QuantDiv(nn.Module):
             Q_A = self.activation_quantizer0(A)
             Q_C = self.activation_quantizer1(C)
             # 分母反量化网格可能恰好落在 0，钳到小正数防止 0/0 产生 NaN
+            # / Dequantized denominator grid may land exactly on 0; clamp to a small positive number to avoid 0/0 → NaN
             return Q_A / torch.clamp(Q_C, min=1e-6)
 
 class QuantConcat(nn.Module):
@@ -366,7 +380,9 @@ class QuantMaxPool(nn.Module):
                                             return_indices=self.return_indices, ceil_mode=self.ceil_mode)
 
 class QuantCat(nn.Module):
-    """对多个输入张量分别做激活伪量化后再 concat（每一路各持有一个激活量化器）。"""
+    """对多个输入张量分别做激活伪量化后再 concat（每一路各持有一个激活量化器）。
+    / Apply activation pseudo-quantization to each input tensor separately, then concat (each input has its own activation quantizer).
+    """
 
     def __init__(self, num_inputs, a_bits=8):
         super().__init__()
@@ -385,7 +401,7 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8, quant_inference=Fals
     for name, child in module.named_children():
         if isinstance(child, nn.Conv2d):
             layer_counter[0] += 1
-            if layer_counter[0] >= 1: #第一层也量化
+            if layer_counter[0] >= 1:  # 第一层也量化 / quantize the first layer too
                 if child.bias is not None:
                     quant_conv = QuantConv2d(child.in_channels, child.out_channels,
                                              child.kernel_size, stride=child.stride,
@@ -408,7 +424,7 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8, quant_inference=Fals
             module._modules[name] = Relu
         elif isinstance(child, nn.ConvTranspose2d):
             layer_counter[0] += 1
-            if layer_counter[0] >= 1: #第一层也量化
+            if layer_counter[0] >= 1:  # 第一层也量化 / quantize the first layer too
                 if child.bias is not None:
                     quant_conv_transpose = QuantConvTranspose2d(child.in_channels,
                                                                 child.out_channels,
@@ -441,7 +457,7 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8, quant_inference=Fals
                 module._modules[name] = quant_conv_transpose
         elif isinstance(child, nn.Linear):
             layer_counter[0] += 1
-            if layer_counter[0] >= 1: #第一层也量化
+            if layer_counter[0] >= 1:  # 第一层也量化 / quantize the first layer too
                 if child.bias is not None:
                     quant_linear = QuantLinear(child.in_features, child.out_features,
                                                bias=True, a_bits=a_bits, w_bits=w_bits,
@@ -470,7 +486,9 @@ def prepare(model, inplace=False, a_bits=8, w_bits=8, quant_inference=False,
     return model
 
 class QuantSiLU(nn.Module):
-    """量化 SiLU (x * sigmoid(x)) — 单输入, 只有 input quantizer。"""
+    """量化 SiLU (x * sigmoid(x)) — 单输入, 只有 input quantizer。
+    / Quantized SiLU (x * sigmoid(x)) — single input, only input quantizer.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantSiLU, self).__init__()
@@ -486,7 +504,9 @@ class QuantSiLU(nn.Module):
 
 
 class QuantSigmoid(nn.Module):
-    """量化 Sigmoid — 单输入, 只有 input quantizer。"""
+    """量化 Sigmoid — 单输入, 只有 input quantizer。
+    / Quantized Sigmoid — single input, only input quantizer.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantSigmoid, self).__init__()
@@ -502,7 +522,9 @@ class QuantSigmoid(nn.Module):
 
 
 class QuantReLU(nn.Module):
-    """量化 ReLU — 单输入, 只有 input quantizer。all_positive=True 更合理。"""
+    """量化 ReLU — 单输入, 只有 input quantizer。all_positive=True 更合理。
+    / Quantized ReLU — single input, only input quantizer. all_positive=True is more appropriate.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=True,
                  per_channel=False, batch_init=20):
         super(QuantReLU, self).__init__()
@@ -518,7 +540,9 @@ class QuantReLU(nn.Module):
 
 
 class QuantSoftmax(nn.Module):
-    """量化 Softmax — 单输入, 只有 input quantizer。逐行量化/反量化后做 softmax。"""
+    """量化 Softmax — 单输入, 只有 input quantizer。逐行量化/反量化后做 softmax。
+    / Quantized Softmax — single input, only input quantizer. Softmax applied after row-wise quantize/dequantize.
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantSoftmax, self).__init__()
@@ -532,7 +556,9 @@ class QuantSoftmax(nn.Module):
             return torch.softmax(self.activation_quantizer(x), dim=dim)
 
 class QuantMatMul(nn.Module):
-    """量化矩阵乘法 — 两个输入 (A, B)。"""
+    """量化矩阵乘法 — 两个输入 (A, B)。
+    / Quantized matrix multiplication — two inputs (A, B).
+    """
     def __init__(self, a_bits=8, quant_inference=False, all_positive=False,
                  per_channel=False, batch_init=20):
         super(QuantMatMul, self).__init__()

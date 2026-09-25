@@ -1,6 +1,7 @@
 import argparse
 import importlib
 import json
+import math
 import os
 import sys
 
@@ -10,20 +11,34 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 import quantization as quant_pkg
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "datas")
-MODEL_DIR = os.path.join(BASE_DIR, "model")
+_MODEL_DIR_BASE = os.path.join(BASE_DIR, "model", "mobileNetv3")
+MODEL_DIR = _MODEL_DIR_BASE
+
+
+def _model_dir_for(quant_method=None):
+    """按网络名 + 量化后端返回产物目录 / Return artifact directory by network name + quantization backend."""
+    if quant_method is None:
+        return _MODEL_DIR_BASE
+    path = os.path.join(_MODEL_DIR_BASE, quant_method)
+    os.makedirs(path, exist_ok=True)
+    return path
+
 CIFAR_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR_STD = (0.2470, 0.2435, 0.2616)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---------------------------------------------------------------------------
-# 量化后端可切换：dorefa / lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / pact
-# 每个后端文件都实现了同一套算子；set_quant_method() 切换后再实例化量化模型即可。
+# 量化后端可切换 / Quantization backend is switchable：dorefa / lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / pact
+# 每个后端文件都实现了同一套算子 / Each backend file implements the same set of operators; set_quant_method() 切换后再实例化量化模型即可 / after switching via set_quant_method(), re-instantiate the quantized model.
 # ---------------------------------------------------------------------------
 DEFAULT_QUANT_METHOD = "lsqplus_v1"
 QUANT_METHOD = DEFAULT_QUANT_METHOD
@@ -41,7 +56,7 @@ QuantSub = Q.QuantSub
 
 
 def set_quant_method(method):
-    """切换量化后端（必须在构建 QuantMobileNetV3 之前调用）。"""
+    """切换量化后端（必须在构建 QuantMobileNetV3 之前调用） / Switch quantization backend (must be called before constructing QuantMobileNetV3)."""
     global Q, QUANT_METHOD
     global QuantAdd, QuantConcat, QuantConv2d, QuantConvTranspose2d
     global QuantDiv, QuantLinear, QuantMaxPool, QuantMultiply, QuantSub
@@ -108,7 +123,7 @@ def _activation(name):
 
 
 # ----------------------------------------------------------------------------
-# 浮点版 MobileNetV3-Small（CIFAR stem stride=1），全部手写
+# 浮点版 MobileNetV3-Small（CIFAR stem stride=1），全部手写 / Float MobileNetV3-Small (CIFAR stem stride=1), fully hand-written
 # ----------------------------------------------------------------------------
 class FloatConvBNReLU(nn.Sequential):
     def __init__(self, in_planes, out_planes, kernel_size=3, stride=1, groups=1, activation="RE"):
@@ -192,8 +207,8 @@ class FloatHeadFusion(nn.Module):
 
 
 class FloatMobileNetV3(nn.Module):
-    # (in_placeholder, expansion, out, kernel, stride, use_se, activation)
-    # in 通道由上一层输出自动推导；仅 stem 改为 stride=1 以适配 CIFAR 32x32
+    # (in_placeholder, expansion, out, kernel, stride, use_se, activation) / (in_placeholder, expansion, out, kernel, stride, use_se, activation)
+    # in 通道由上一层输出自动推导；仅 stem 改为 stride=1 以适配 CIFAR 32x32 / in channels auto-derived from previous layer output; only stem changed to stride=1 to fit CIFAR 32x32
     CFGS = [
         [16, 16, 16, 3, 2, True, "RE"],
         [16, 72, 24, 3, 2, False, "RE"],
@@ -263,8 +278,8 @@ class FloatMobileNetV3(nn.Module):
 
 
 # ----------------------------------------------------------------------------
-# 量化版 MobileNetV3-Small：Conv2d->QuantConv2d，Linear->QuantLinear，
-# 残差->QuantAdd，头部融合->QuantConcat
+# 量化版 MobileNetV3-Small：Conv2d->QuantConv2d，Linear->QuantLinear / Quantized MobileNetV3-Small: Conv2d->QuantConv2d, Linear->QuantLinear
+# 残差->QuantAdd，头部融合->QuantConcat / residual->QuantAdd, head fusion->QuantConcat
 # ----------------------------------------------------------------------------
 class QuantConvBNReLU(nn.Sequential):
     def __init__(self, in_planes, out_planes, kernel_size=3, stride=1, groups=1, activation="RE"):
@@ -471,11 +486,69 @@ def train_one_epoch(model, loader, criterion, optimizer, max_batches=None):
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, max_batches=None):
+def _maybe_visualize_cifar(images, labels, outputs, viz_dir, viz_prefix, viz_state, viz_max, class_names=None):
+    """CIFAR 分类任务可视化：用 matplotlib 拼接网格，显示 GT 与预测类别（带置信度） /
+    CIFAR classification visualization: use matplotlib to create a grid showing GT and predicted classes (with confidence).
+    """
+    bs = images.shape[0]
+    n = min(bs, viz_max - viz_state["saved"])
+    if n <= 0:
+        return
+    bi = viz_state["batch"]
+    rows = cols = int(math.ceil(math.sqrt(n)))
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2, rows * 2))
+    if n == 1:
+        axes = [[axes]]
+    axes = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+    _, preds = outputs[:n].max(dim=1)
+    confs = outputs[:n].softmax(dim=1).max(dim=1)[0]
+    images = images[:n].cpu()
+    labels = labels[:n].cpu()
+    preds = preds.cpu()
+    confs = confs.cpu()
+
+    for i in range(rows * cols):
+        ax = axes[i] if i < len(axes) else None
+        if ax is None:
+            continue
+        ax.axis("off")
+        if i < n:
+            img = images[i].permute(1, 2, 0).numpy()
+            # 反归一化 / denormalize
+            img = img * CIFAR_STD + CIFAR_MEAN
+            img = img.clip(0, 1)
+            ax.imshow(img)
+            gt = class_names[labels[i]] if class_names else int(labels[i])
+            pr = class_names[preds[i]] if class_names else int(preds[i])
+            ax.set_title(
+                f"GT:{gt}  P:{pr} {confs[i]:.2f}",
+                color="green" if preds[i] == labels[i] else "red",
+                fontsize=9,
+            )
+    plt.tight_layout()
+    os.makedirs(viz_dir, exist_ok=True)
+    fig.savefig(os.path.join(viz_dir, f"{viz_prefix}_batch{bi}.jpg"), dpi=150)
+    plt.close(fig)
+    viz_state["saved"] += n
+    viz_state["batch"] += 1
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, max_batches=None, viz_dir=None, viz_max=30, viz_prefix="eval", class_names=None):
+    """top-1 accuracy（评估态模型输出 logits）。若 viz_dir 不为空，
+    额外把前 viz_max 张验证图的 GT/预测类别网格保存到 {viz_dir}/fvisualize/ /
+    top-1 accuracy (model outputs logits in eval mode). If viz_dir is set,
+    additionally save GT/predicted-class grids of the first viz_max val images into {viz_dir}/fvisualize/."""
     model.eval()
     total_loss = 0.0
     correct = 0
     total = 0
+    # 可视化输出目录与计数器 / visualization output dir and counters
+    viz_out = os.path.join(viz_dir, "fvisualize") if viz_dir else None
+    viz_state = {"saved": 0, "batch": 0}
+    if viz_out:
+        os.makedirs(viz_out, exist_ok=True)
 
     for batch_index, (images, labels) in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
@@ -489,6 +562,13 @@ def evaluate(model, loader, criterion, max_batches=None):
         _, predicted = outputs.max(dim=1)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
+
+        # 每次评估都可视化前几批（失败仅告警，绝不影响评估） / visualize first batches on every evaluate (failure only warns, never breaks eval)
+        if viz_out and viz_state["saved"] < viz_max:
+            try:
+                _maybe_visualize_cifar(images, labels, outputs, viz_out, viz_prefix, viz_state, viz_max, class_names)
+            except Exception as exc:
+                print(f"      [viz] 可视化保存失败（仅告警）: {exc} / visualization save failed (warn only): {exc}")
 
     return total_loss / total, correct / total
 
@@ -524,7 +604,7 @@ def copy_float_to_quant(float_model, quant_model):
             quant_state[key] = value.detach().clone().to(device=quant_state[key].device)
 
     quant_model.load_state_dict(quant_state)
-    # 灌入新权重后，让各后端的量化器从第 0 批重新统计
+    # 灌入新权重后，让各后端的量化器从第 0 批重新统计 / After loading new weights, let each backend's quantizer re-collect stats from batch 0
     quant_pkg.reset_quantizer_states(quant_model)
     return quant_model
 
@@ -559,11 +639,14 @@ def collect_quant_params(quant_model):
     return quant_pkg.collect_quant_params(quant_model)
 
 
-def export_onnx(float_model, onnx_path, opset=16):
+def export_onnx(float_model, onnx_path, opset=16, imgsz=None):
+    """导出 ONNX，输入形状完全固定为 [1, 3, H, W]（无 dynamic_axes，图尺寸清晰可见） /
+    Export ONNX with fully static input shape [1, 3, H, W] (no dynamic_axes, graph dimensions clearly visible)."""
+    H = W = imgsz if imgsz is not None else 32
     os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
     float_model.eval()
     model_device = next(float_model.parameters()).device
-    dummy = torch.randn(1, 3, 32, 32, device=model_device)
+    dummy = torch.randn(1, 3, H, W, device=model_device)
 
     torch.onnx.export(
         float_model,
@@ -575,12 +658,9 @@ def export_onnx(float_model, onnx_path, opset=16):
         dynamo=False,
         input_names=["input"],
         output_names=["logits"],
-        dynamic_axes={
-            "input": {0: "batch_size"},
-            "logits": {0: "batch_size"},
-        },
+        # 无 dynamic_axes → 输入输出形状完全固定 / No dynamic_axes → all shapes fully fixed
     )
-    # onnxsim 简化（若已安装）
+    # onnxsim 简化（若已安装） / onnxsim simplification (if installed)
     try:
         import onnx
         from onnxsim import simplify as onnxsim_simplify
@@ -599,7 +679,7 @@ def export_onnx(float_model, onnx_path, opset=16):
 
 
 def _try_export_onnx(model, onnx_path):
-    """训练保存 best checkpoint 时同步导出 ONNX；失败仅告警，绝不影响训练。"""
+    """训练保存 best checkpoint 时同步导出 ONNX；失败仅告警，绝不影响训练 / Export ONNX alongside best checkpoint during training; failure only warns and never affects training."""
     try:
         export_onnx(model, onnx_path)
         print(f"      ONNX 已同步导出: {onnx_path}")
@@ -644,16 +724,18 @@ def verify(float_model, quant_model, onnx_path, quant_params):
     print(f"      量化参数完整性检查通过（{len(quant_params)} 个张量）")
 
 
-def save_quant_outputs(quant_model, prefix, num_classes=10, meta=None):
+def save_quant_outputs(quant_model, prefix, num_classes=10, meta=None, model_dir=None):
     quant_pkg.freeze_batch_init(quant_model)
     quant_model.eval()
 
-    quant_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_mobilenetv3_cifar10.pth")
+    if model_dir is None:
+        model_dir = _MODEL_DIR_BASE
+    quant_checkpoint = os.path.join(model_dir, f"{prefix}_mobilenetv3_cifar10.pth")
     save_checkpoint(quant_model, quant_checkpoint, **(meta or {}))
 
     quant_params = collect_quant_params(quant_model)
-    json_path = os.path.join(MODEL_DIR, f"{prefix}_quant_params.json")
-    pth_path = os.path.join(MODEL_DIR, f"{prefix}_quant_params.pth")
+    json_path = os.path.join(model_dir, f"{prefix}_quant_params.json")
+    pth_path = os.path.join(model_dir, f"{prefix}_quant_params.pth")
 
     with open(json_path, "w", encoding="utf-8") as file:
         json.dump(quant_params, file, indent=2, ensure_ascii=False)
@@ -672,11 +754,11 @@ def save_quant_outputs(quant_model, prefix, num_classes=10, meta=None):
     print(f"      共 {len(quant_params)} 个张量的 scale/zero_point")
 
     float_model = build_float_model(quant_model, num_classes=num_classes)
-    float_checkpoint = os.path.join(MODEL_DIR, f"{prefix}_mobilenetv3_cifar10_float.pth")
+    float_checkpoint = os.path.join(model_dir, f"{prefix}_mobilenetv3_cifar10_float.pth")
     save_checkpoint(float_model, float_checkpoint)
     print(f"[3/5] 正常 PyTorch 浮点权重已写出: {float_checkpoint}")
 
-    onnx_path = os.path.join(MODEL_DIR, f"{prefix}_mobilenetv3_cifar10_float.onnx")
+    onnx_path = os.path.join(model_dir, f"{prefix}_mobilenetv3_cifar10_float.onnx")
     export_onnx(float_model, onnx_path, opset=16)
     print(f"[4/5] 干净浮点 ONNX 已写出: {onnx_path}")
 
@@ -703,8 +785,9 @@ def float_train(batch_size=128, lr=1e-3, epochs=100, num_classes=10, num_workers
     best_acc = 0.0
     best_epoch = -1
     best_meta = {}
-    checkpoint_path = os.path.join(MODEL_DIR, "mobilenetv3_cifar10.pth")
-    last_checkpoint = os.path.join(MODEL_DIR, "mobilenetv3_cifar10_last.pth")
+    model_dir = _model_dir_for()
+    checkpoint_path = os.path.join(model_dir, "mobilenetv3_cifar10.pth")
+    last_checkpoint = os.path.join(model_dir, "mobilenetv3_cifar10_last.pth")
 
     for epoch in range(epochs):
         train_loss, train_acc = train_one_epoch(
@@ -715,7 +798,8 @@ def float_train(batch_size=128, lr=1e-3, epochs=100, num_classes=10, num_workers
             max_batches=max_train_batches,
         )
         test_loss, test_acc = evaluate(
-            float_model, test_loader, criterion, max_batches=max_eval_batches
+            float_model, test_loader, criterion, max_batches=max_eval_batches,
+            viz_dir=model_dir, viz_prefix=f"float_ep{epoch + 1:03d}"
         )
         scheduler.step()
 
@@ -746,7 +830,8 @@ def float_train(batch_size=128, lr=1e-3, epochs=100, num_classes=10, num_workers
 
     load_checkpoint(float_model, checkpoint_path)
     final_loss, final_acc = evaluate(
-        float_model, test_loader, criterion, max_batches=max_eval_batches
+        float_model, test_loader, criterion, max_batches=max_eval_batches,
+        viz_dir=model_dir, viz_prefix="float_best"
     )
     print(f"[Float] Best checkpoint: {checkpoint_path}")
     print(f"[Float] Last checkpoint: {last_checkpoint}")
@@ -782,7 +867,9 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, num_class
         calibration=True,
     )
 
-    float_checkpoint = os.path.join(MODEL_DIR, "mobilenetv3_cifar10.pth")
+    float_dir = _model_dir_for()
+    quant_dir = _model_dir_for(quant_method)
+    float_checkpoint = os.path.join(float_dir, "mobilenetv3_cifar10.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
 
@@ -800,7 +887,8 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, num_class
 
     criterion = nn.CrossEntropyLoss()
     test_loss, test_acc = evaluate(
-        ptq_model, test_loader, criterion, max_batches=max_eval_batches
+        ptq_model, test_loader, criterion, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix=f"ptq_{tag}"
     )
     print(f"[PTQ-{tag}] Test loss:{test_loss:.4f} acc:{test_acc:.4f}")
 
@@ -817,12 +905,13 @@ def PTQ_calibration(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, num_class
         "test_acc": float(test_acc),
     }
     ptq_checkpoint = save_quant_outputs(
-        ptq_model, f"ptq_{tag}", num_classes=num_classes, meta=ptq_meta
+        ptq_model, f"ptq_{tag}", num_classes=num_classes, meta=ptq_meta, model_dir=quant_dir
     )[0]
 
     load_checkpoint(ptq_model, ptq_checkpoint)
     final_loss, final_acc = evaluate(
-        ptq_model, test_loader, criterion, max_batches=max_eval_batches
+        ptq_model, test_loader, criterion, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix=f"ptq_{tag}_reload"
     )
     print(
         f"[PTQ] Final validation | "
@@ -847,7 +936,9 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, lr=1e-4, epo
         num_workers=num_workers,
     )
 
-    ptq_checkpoint = os.path.join(MODEL_DIR, f"ptq_{tag}_mobilenetv3_cifar10.pth")
+    float_dir = _model_dir_for()
+    quant_dir = _model_dir_for(quant_method)
+    ptq_checkpoint = os.path.join(quant_dir, f"ptq_{tag}_mobilenetv3_cifar10.pth")
     if not os.path.exists(ptq_checkpoint):
         raise FileNotFoundError(
             f"找不到 {tag} 的 PTQ 权重，请先运行 PTQ_calibration('{tag}'): {ptq_checkpoint}"
@@ -867,8 +958,8 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, lr=1e-4, epo
     best_acc = 0.0
     best_epoch = -1
     best_meta = {}
-    best_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_mobilenetv3_cifar10_best.pth")
-    last_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_mobilenetv3_cifar10_last.pth")
+    best_checkpoint = os.path.join(quant_dir, f"qat_{tag}_mobilenetv3_cifar10_best.pth")
+    last_checkpoint = os.path.join(quant_dir, f"qat_{tag}_mobilenetv3_cifar10_last.pth")
 
     for epoch in range(epochs):
         train_loss, train_acc = train_one_epoch(
@@ -879,7 +970,8 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, lr=1e-4, epo
             max_batches=max_train_batches,
         )
         test_loss, test_acc = evaluate(
-            qat_model, test_loader, criterion, max_batches=max_eval_batches
+            qat_model, test_loader, criterion, max_batches=max_eval_batches,
+            viz_dir=quant_dir, viz_prefix=f"qat_{tag}_ep{epoch + 1:03d}"
         )
         scheduler.step()
 
@@ -911,7 +1003,8 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, lr=1e-4, epo
 
     load_checkpoint(qat_model, best_checkpoint)
     final_loss, final_acc = evaluate(
-        qat_model, test_loader, criterion, max_batches=max_eval_batches
+        qat_model, test_loader, criterion, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix=f"qat_{tag}_best"
     )
     print(
         f"[QAT-{tag}] Final validation | "
@@ -921,7 +1014,7 @@ def QAT_training(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, lr=1e-4, epo
         f"Best: {best_checkpoint} | Last: {last_checkpoint}"
     )
     qat_checkpoint = save_quant_outputs(
-        qat_model, f"qat_{tag}", num_classes=num_classes, meta=best_meta
+        qat_model, f"qat_{tag}", num_classes=num_classes, meta=best_meta, model_dir=quant_dir
     )[0]
     return qat_checkpoint, final_acc, best_meta
 
@@ -933,8 +1026,10 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, num_cla
     print(f"========== Float vs QAT precision [{tag}] ==========")
     print(f"Device: {device}")
 
-    float_checkpoint = os.path.join(MODEL_DIR, "mobilenetv3_cifar10.pth")
-    qat_checkpoint = os.path.join(MODEL_DIR, f"qat_{tag}_mobilenetv3_cifar10.pth")
+    float_dir = _model_dir_for()
+    quant_dir = _model_dir_for(quant_method)
+    float_checkpoint = os.path.join(float_dir, "mobilenetv3_cifar10.pth")
+    qat_checkpoint = os.path.join(quant_dir, f"qat_{tag}_mobilenetv3_cifar10.pth")
     if not os.path.exists(float_checkpoint):
         raise FileNotFoundError(f"找不到浮点权重，请先运行 float_train(): {float_checkpoint}")
     if not os.path.exists(qat_checkpoint):
@@ -953,7 +1048,8 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, num_cla
         float_model, float_checkpoint, return_meta=True
     )
     float_loss, float_acc = evaluate(
-        float_model, test_loader, criterion, max_batches=max_eval_batches
+        float_model, test_loader, criterion, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix="compare_float"
     )
 
     qat_model = QuantMobileNetV3(num_classes=num_classes).to(device)
@@ -965,7 +1061,8 @@ def compare_precision(quant_method=DEFAULT_QUANT_METHOD, batch_size=128, num_cla
         print(f"      [warn] QAT checkpoint 记录的方法为 {saved_method}，当前为 {tag}")
     quant_pkg.freeze_batch_init(qat_model)
     qat_loss, qat_acc = evaluate(
-        qat_model, test_loader, criterion, max_batches=max_eval_batches
+        qat_model, test_loader, criterion, max_batches=max_eval_batches,
+        viz_dir=quant_dir, viz_prefix="compare_qat"
     )
 
     delta = qat_acc - float_acc
@@ -1017,13 +1114,14 @@ def build_arg_parser():
     parser.add_argument("--qat-lr", type=float, default=None,
                         help="默认 float-lr x 0.1")
     parser.add_argument("--calibration-batches", type=int, default=20)
-    # 冒烟/快速验证用：每个 epoch / 评估最多跑多少个 batch，默认不限制（完整训练）
+    # 冒烟/快速验证用：每个 epoch / 评估最多跑多少个 batch，默认不限制（完整训练） / For smoke test / quick validation: max batches per epoch / eval; unlimited by default (full training)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
     return parser
 
 
 if __name__ == "__main__":
+    quant_pkg.install_print_timestamp()  # print 加分钟级时间戳 / minute-precision timestamp for print
     args = build_arg_parser().parse_args()
     print(f"Python: {sys.executable}")
     print(f"torch: {torch.__version__} | Device: {device}")
