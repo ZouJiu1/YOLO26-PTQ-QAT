@@ -16,6 +16,7 @@ model/*/*/fvisualize
 dataset/depth8-png
 model
 dataset/detect
+datas
 dataset/dota8-multispectral
 dataset/pose
 dataset/seg
