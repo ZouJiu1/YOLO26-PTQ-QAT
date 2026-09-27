@@ -124,6 +124,11 @@ class MinMaxActivationQuantizer(nn.Module):
         q_a = quantize_minmax.apply(activation, scale, zero_point, qmin, qmax)
         return q_a
 
+    def clip_bounds(self):
+        """激活空间内的截断边界 (r_min, r_max)：导出"截断保留、舍入去除"的纯浮点参考图时使用 /
+        Clip bounds in activation space (r_min, r_max): used when exporting a clip-only (rounding-free) float reference graph."""
+        return self.r_min.detach(), self.r_max.detach()
+
 # W(权重)量化 / W(weight) quantization
 class MinMaxWeightQuantizer(nn.Module):
     def __init__(self, w_bits, all_positive=False, per_channel=False):
@@ -170,12 +175,13 @@ class QuantConv2d(nn.Conv2d):
                  w_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False):
         super(QuantConv2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups,
                                           bias, padding_mode)
         self.quant_inference = quant_inference
         self.activation_quantizer = MinMaxActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
-        self.weight_quantizer = MinMaxWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel)
+        self.weight_quantizer = MinMaxWeightQuantizer(w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel)
 
     def forward(self, inputs):
         quant_input = self.activation_quantizer(inputs)
@@ -206,14 +212,15 @@ class QuantConvTranspose2d(nn.ConvTranspose2d):
                  w_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False):
         # 注意: ConvTranspose2d 的参数顺序为 (..., output_padding, groups, bias, dilation, padding_mode)
         # / Note: ConvTranspose2d parameter order is (..., output_padding, groups, bias, dilation, padding_mode)
         super(QuantConvTranspose2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, output_padding,
                                                    groups, bias, dilation, padding_mode)
         self.quant_inference = quant_inference
         self.activation_quantizer = MinMaxActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
-        self.weight_quantizer = MinMaxWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel)
+        self.weight_quantizer = MinMaxWeightQuantizer(w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel)
 
     def forward(self, inputs):
         quant_input = self.activation_quantizer(inputs)
@@ -235,11 +242,12 @@ class QuantLinear(nn.Linear):
                  w_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False):
         super(QuantLinear, self).__init__(in_features, out_features, bias)
         self.quant_inference = quant_inference
         self.activation_quantizer = MinMaxActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
-        self.weight_quantizer = MinMaxWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel)
+        self.weight_quantizer = MinMaxWeightQuantizer(w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel)
 
     def forward(self, inputs):
         quant_input = self.activation_quantizer(inputs)

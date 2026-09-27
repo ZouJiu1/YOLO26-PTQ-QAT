@@ -132,6 +132,11 @@ class LSQActivationQuantizer(nn.Module):
             # q_a = Round.apply((activation/alpha).clamp(Qn, Qp)) * alpha
         return q_a
 
+    def clip_bounds(self):
+        """激活空间内的截断边界 (Qn·s, Qp·s)：导出"截断保留、舍入去除"的纯浮点参考图时使用 /
+        Clip bounds in activation space (Qn·s, Qp·s): used when exporting a clip-only (rounding-free) float reference graph."""
+        return (self.Qn * self.s).detach(), (self.Qp * self.s).detach()
+
 # W(权重)量化 / W(weight) quantization
 class LSQWeightQuantizer(nn.Module):
     def __init__(self, w_bits, all_positive=False, per_channel=False, batch_init = 20, num_channels=None):
@@ -202,15 +207,16 @@ class QuantConv2d(nn.Conv2d):
                  padding_mode='zeros',
                  a_bits=8,
                  w_bits=8,
-                 quant_inference=False, 
-                 all_positive=False, 
-                 per_channel=False, 
+                 quant_inference=False,
+                 all_positive=False,
+                 per_channel=False,
+                 w_all_positive=False,
                  batch_init = 20):
         super(QuantConv2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups,
                                           bias, padding_mode)
         self.quant_inference = quant_inference
         self.activation_quantizer = LSQActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
-        self.weight_quantizer = LSQWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel,batch_init = batch_init, num_channels=out_channels)
+        self.weight_quantizer = LSQWeightQuantizer(w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel,batch_init = batch_init, num_channels=out_channels)
 
     def forward(self, input):
         quant_input = self.activation_quantizer(input)
@@ -239,9 +245,10 @@ class QuantConvTranspose2d(nn.ConvTranspose2d):
                  padding_mode='zeros',
                  a_bits=8,
                  w_bits=8,
-                 quant_inference=False, 
-                 all_positive=False, 
-                 per_channel=False, 
+                 quant_inference=False,
+                 all_positive=False,
+                 per_channel=False,
+                 w_all_positive=False,
                  batch_init = 20):
         # 注意: ConvTranspose2d 的参数顺序为 (..., output_padding, groups, bias, dilation, padding_mode)
         # / Note: ConvTranspose2d parameter order is (..., output_padding, groups, bias, dilation, padding_mode)
@@ -249,7 +256,7 @@ class QuantConvTranspose2d(nn.ConvTranspose2d):
                                                    groups, bias, dilation, padding_mode)
         self.quant_inference = quant_inference
         self.activation_quantizer = LSQActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
-        self.weight_quantizer = LSQWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel,batch_init = batch_init, num_channels=in_channels)
+        self.weight_quantizer = LSQWeightQuantizer(w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel,batch_init = batch_init, num_channels=in_channels)
 
     def forward(self, input):
         quant_input = self.activation_quantizer(input)
@@ -269,14 +276,15 @@ class QuantLinear(nn.Linear):
                  bias=True,
                  a_bits=8,
                  w_bits=8,
-                 quant_inference=False, 
-                 all_positive=False, 
-                 per_channel=False, 
+                 quant_inference=False,
+                 all_positive=False,
+                 per_channel=False,
+                 w_all_positive=False,
                  batch_init = 20):
         super(QuantLinear, self).__init__(in_features, out_features, bias)
         self.quant_inference = quant_inference
         self.activation_quantizer = LSQActivationQuantizer(a_bits=a_bits, all_positive=all_positive,batch_init = batch_init)
-        self.weight_quantizer = LSQWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel,batch_init = batch_init, num_channels=out_features)
+        self.weight_quantizer = LSQWeightQuantizer(w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel,batch_init = batch_init, num_channels=out_features)
 
     def forward(self, input):
         quant_input = self.activation_quantizer(input)

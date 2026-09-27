@@ -35,6 +35,7 @@ import importlib
 import json
 import math
 import os
+import random
 import sys
 from types import SimpleNamespace
 
@@ -65,12 +66,16 @@ MODEL_DIR = _MODEL_DIR_BASE
 
 
 def _model_dir_for(scale=None, quant_method=None):
-    """按网络名 + 尺度 + 量化后端返回产物目录 / Return artifact directory by net name + scale + quant backend."""
+    """按网络名 + 尺度 + 量化后端(+量化配置标签+运行变体后缀)返回产物目录 /
+    Return artifact directory by net name + scale + quant backend (+ quant config tag + run variant suffix)."""
     path = _MODEL_DIR_BASE
     if scale is not None:
         path = os.path.join(path, scale)
     if quant_method is not None:
-        path = os.path.join(path, quant_method)
+        # seed/run_tag 变体后缀：多种子与校准敏感度实验避免覆盖主实验产物 /
+        # seed/run_tag variant suffix: multi-seed & calibration-sensitivity runs never overwrite main artifacts
+        suffix = (f"_seed{RUN_SEED}" if RUN_SEED else "") + (f"_{RUN_TAG}" if RUN_TAG else "")
+        path = os.path.join(path, quant_method + _quant_cfg_tag() + suffix)
     os.makedirs(path, exist_ok=True)
     return path
 ULTRA_DIR = os.path.join(BASE_DIR, "ultralytics", "ultralytics")
@@ -200,6 +205,102 @@ YOLO26_SCALES = {
 DEFAULT_SCALE = "n"
 MODEL_CHOICES = tuple(f"yolo26{s}" for s in YOLO26_SCALES)
 
+# ---------------------------------------------------------------------------
+# 量化超参：禁止在量化层构建处硬编码，统一从此处读取（由 CLI 在构建量化模型前写入） /
+# Quantization hyperparameters: must NOT be hardcoded at quant-layer construction;
+# all layers read them from here (written from CLI before the quantized model is built).
+#   a_bits       激活量化位宽 / activation quantization bit-width
+#   w_bits       权重量级化位宽 / weight quantization bit-width
+#   per_channel  权重 per-channel(True) 或 per-tensor(False) / weight per-channel vs per-tensor
+#   all_positive 激活无符号量化（默认 True：SiLU 后激活非负）；权重是否无符号由 w_all_positive 单独控制 /
+#                unsigned activation quantization (default True: post-SiLU activations are non-negative);
+#                weight unsigned-ness is controlled separately by w_all_positive
+#   w_all_positive 权重无符号量化（默认 False：权重有符号。对有符号权重开 True 会破坏符号平衡，仅用于对照实验）/
+#                unsigned weight quantization (default False = signed weights; enabling on signed weights breaks sign balance, for ablation only)
+#   mixed_quant  混合量化(True)：首层 stem 与任务头保持 FP32，其余层按上面的位宽量化；False=整网统一量化 /
+#                mixed quantization: stem (layer 0) and task head stay FP32, other layers use above bit-width; False = uniform quantization
+#   pact_w_quant PACT 后端的权重量级化器选择（仅 quant=pact 时生效）：lsqplus_v1(默认)/dorefa(原始 PACT 实现)/minmax/lsqplus_v2 /
+#                weight quantizer for the pact backend only: lsqplus_v1 (default) / dorefa (original PACT impl) / minmax / lsqplus_v2
+# ---------------------------------------------------------------------------
+QUANT_CFG = SimpleNamespace(a_bits=8, w_bits=8, per_channel=True,
+                            all_positive=True, w_all_positive=False, mixed_quant=False,
+                            pact_w_quant='lsqplus_v1')
+# 历史/当前默认参数仅用于 CLI 默认值；所有实验目录都强制带显式配置标签，避免新旧默认互相覆盖 /
+# Defaults below only seed the CLI; every experiment dir gets an explicit config tag so old/new defaults never overwrite each other.
+DEFAULT_QUANT_CFG = SimpleNamespace(a_bits=8, w_bits=8, per_channel=True,
+                                    all_positive=True, w_all_positive=False, mixed_quant=False,
+                                    pact_w_quant='lsqplus_v1')
+
+# 运行级变体（与量化配置无关，由 --seed/--run-tag 设置）：非默认时产物目录自动加后缀，避免覆盖主实验 /
+# Run-level variants (set via --seed/--run-tag, independent of quant config): non-default values add a directory suffix
+RUN_SEED = 0
+RUN_TAG = ""
+
+
+def _quant_cfg_tag(cfg=None):
+    """生成量化配置目录/日志标签；始终显式携带完整配置名称 / Build quant-config tag with full names.
+
+    标签组成 / Tag parts:
+      _a{ab}w{wb}_{per_channel|per_tensor}{_act_unsigned|_act_signed}[_weight_unsigned][_mixed][_wquant_{method}]
+      act_unsigned = 激活无符号（unsigned activations）；act_signed = 激活有符号（signed activations）
+      weight_unsigned = 权重无符号（unsigned weights；缺省为有符号 signed）
+      _wquant_{method} = pact 后端权重量级化器非默认(lsqplus_v1)时追加 / appended when pact weight quantizer differs from default (lsqplus_v1)
+    """
+    cfg = cfg if cfg is not None else QUANT_CFG
+    return (
+        f"_a{cfg.a_bits}w{cfg.w_bits}_"
+        f"{'per_channel' if cfg.per_channel else 'per_tensor'}"
+        f"{'_act_unsigned' if cfg.all_positive else '_act_signed'}"
+        f"{'_weight_unsigned' if cfg.w_all_positive else ''}"
+        f"{'_mixed' if cfg.mixed_quant else ''}"
+        f"{'' if getattr(cfg, 'pact_w_quant', DEFAULT_QUANT_CFG.pact_w_quant) == DEFAULT_QUANT_CFG.pact_w_quant else '_wquant_' + cfg.pact_w_quant}"
+    )
+
+
+def add_quant_cfg_args(parser):
+    """给 argparse 注册量化超参（a_bits/w_bits/per_channel/all_positive），所有任务共用 /
+    Register quant hyperparameter CLI args shared by all tasks."""
+    parser.add_argument("--a-bits", type=int, default=DEFAULT_QUANT_CFG.a_bits,
+                        help="激活量化位宽（默认 8）/ activation quantization bits (default 8)")
+    parser.add_argument("--w-bits", type=int, default=DEFAULT_QUANT_CFG.w_bits,
+                        help="权重量级化位宽（默认 8）/ weight quantization bits (default 8)")
+    parser.add_argument("--per-channel", action=argparse.BooleanOptionalAction,
+                        default=DEFAULT_QUANT_CFG.per_channel,
+                        help="权重 per-channel 量化；--no-per-channel 表示 per-tensor（默认 per-channel）/ "
+                             "weight per-channel quant; --no-per-channel = per-tensor (default per-channel)")
+    parser.add_argument("--all-positive", action=argparse.BooleanOptionalAction,
+                        default=DEFAULT_QUANT_CFG.all_positive,
+                        help="激活无符号量化（默认开启：SiLU 后非负特征）；--no-all-positive 改回有符号 / unsigned activation quant (default on for post-SiLU features); --no-all-positive forces signed")
+    parser.add_argument("--w-all-positive", action=argparse.BooleanOptionalAction,
+                        default=DEFAULT_QUANT_CFG.w_all_positive,
+                        help="权重无符号量化；默认关闭（权重有符号，开启易导致精度崩溃，仅对照用）/ unsigned weight quant; default off (signed weights; enabling may wreck accuracy, ablation only)")
+    parser.add_argument("--mixed-quant", action=argparse.BooleanOptionalAction,
+                        default=DEFAULT_QUANT_CFG.mixed_quant,
+                        help="混合量化：首层 stem + 任务头保持 FP32，其余按 --a-bits/--w-bits 量化；默认关闭（整网 int8）/ "
+                             "mixed quant: stem + task head stay FP32, rest quantized; default off (uniform int8)")
+    parser.add_argument("--pact-w-quant", type=str, default=DEFAULT_QUANT_CFG.pact_w_quant,
+                        choices=['dorefa', 'minmax', 'lsqplus_v1', 'lsqplus_v2'],
+                        help="PACT 后端的权重量级化器（仅 --quant pact 生效，默认 lsqplus_v1；dorefa 与原始 PACT 实现一致）/ "
+                             "weight quantizer for pact backend (only with --quant pact; default lsqplus_v1; dorefa matches original PACT)")
+
+
+def apply_quant_cfg_args(args):
+    """把 CLI 量化超参写入 QUANT_CFG（必须在量化模型构建前调用）/ Write CLI quant args into QUANT_CFG (call before building quant model)."""
+    QUANT_CFG.a_bits = args.a_bits
+    QUANT_CFG.w_bits = args.w_bits
+    QUANT_CFG.per_channel = args.per_channel
+    QUANT_CFG.all_positive = args.all_positive
+    QUANT_CFG.w_all_positive = args.w_all_positive
+    QUANT_CFG.mixed_quant = args.mixed_quant
+    QUANT_CFG.pact_w_quant = args.pact_w_quant
+    tag = _quant_cfg_tag()
+    print(f"量化配置 / quant cfg: a_bits={QUANT_CFG.a_bits} w_bits={QUANT_CFG.w_bits} "
+          f"per_channel={QUANT_CFG.per_channel} act_all_positive={QUANT_CFG.all_positive} "
+          f"w_all_positive={QUANT_CFG.w_all_positive} mixed_quant={QUANT_CFG.mixed_quant} "
+          f"pact_w_quant={QUANT_CFG.pact_w_quant}"
+          f"{f' 标签/tag={tag}' if tag else ''}")
+
+
 
 def get_scale(scale=DEFAULT_SCALE):
     """归一化模型尺度名：允许传 'n' / 'yolo26n' / 'YOLO26n' /
@@ -303,6 +404,18 @@ def make_bn(channels):
     return nn.BatchNorm2d(channels, eps=1e-3, momentum=0.03)
 
 
+def _quant_layer_kwargs():
+    """量化卷积层公共构造参数；pact 后端额外注入 w_quant（其余后端类不接受该参数，按鸭子类型跳过）/
+    Common kwargs for quantized conv layers; pact backend additionally gets w_quant (skipped for backends whose signature lacks it)."""
+    kw = dict(a_bits=QUANT_CFG.a_bits, w_bits=QUANT_CFG.w_bits,
+              per_channel=QUANT_CFG.per_channel, all_positive=QUANT_CFG.all_positive,
+              w_all_positive=QUANT_CFG.w_all_positive)
+    import inspect
+    if 'w_quant' in inspect.signature(QuantConv2d.__init__).parameters:
+        kw['w_quant'] = QUANT_CFG.pact_w_quant
+    return kw
+
+
 class Conv(nn.Module):
     """Conv + BN + SiLU；quant=True 时卷积换成 QuantConv2d / Conv + BN + SiLU; quant=True replaces conv with QuantConv2d.
 
@@ -315,13 +428,14 @@ class Conv(nn.Module):
         if quant:
             self.conv = QuantConv2d(
                 c1, c2, kernel_size=k, stride=s, padding=autopad(k, p, d),
-                dilation=d, groups=g, bias=bias, a_bits=8, w_bits=8, per_channel=True,
+                dilation=d, groups=g, bias=bias,
+                **_quant_layer_kwargs(),
             )
         else:
             self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=bias)
         self.bn = make_bn(c2)
         if quant and QuantSiLU is not None:
-            self.act = QuantSiLU(a_bits=8, quant_inference=False) if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+            self.act = QuantSiLU(a_bits=QUANT_CFG.a_bits, quant_inference=False) if act is True else act if isinstance(act, nn.Module) else nn.Identity()
         else:
             self.act = nn.SiLU() if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
@@ -339,7 +453,7 @@ class Bottleneck(nn.Module):
         self.cv1 = Conv(c1, c_, k[0], 1, quant=quant)
         self.cv2 = Conv(c_, c2, k[1], 1, g=g, quant=quant)
         self.has_add = shortcut and c1 == c2
-        self.add_op = QuantAdd(a_bits=8, quant_inference=True) if quant else FloatAdd()
+        self.add_op = QuantAdd(a_bits=QUANT_CFG.a_bits, quant_inference=True) if quant else FloatAdd()
 
     def forward(self, x):
         out = self.cv2(self.cv1(x))
@@ -358,7 +472,7 @@ class C3(nn.Module):
         self.m = nn.Sequential(
             *(Bottleneck(c_, c_, shortcut, g, k=(3, 3), e=1.0, quant=quant) for _ in range(n))
         )
-        self.cat_op = QuantCat(2, a_bits=8) if quant else torch.cat
+        self.cat_op = QuantCat(2, a_bits=QUANT_CFG.a_bits) if quant else torch.cat
 
     def forward(self, x):
         return self.cv3(self._cat([self.m(self.cv1(x)), self.cv2(x)], 1))
@@ -387,7 +501,7 @@ class C2f(nn.Module):
         self.c = int(c2 * e)
         self.cv1 = Conv(c1, 2 * self.c, 1, 1, quant=quant)
         self.cv2 = Conv((2 + n) * self.c, c2, 1, 1, quant=quant)
-        self.cat_op = QuantCat(n + 2, a_bits=8) if quant else torch.cat
+        self.cat_op = QuantCat(n + 2, a_bits=QUANT_CFG.a_bits) if quant else torch.cat
 
     def _cat(self, tensors, dim=1):
         return self.cat_op(tensors, dim) if isinstance(self.cat_op, QuantCat) else torch.cat(tensors, dim)
@@ -453,8 +567,8 @@ class PSABlock(nn.Module):
         self.attn = Attention(c, attn_ratio=attn_ratio, num_heads=num_heads, quant=quant)
         self.ffn = nn.Sequential(Conv(c, c * 2, 1, quant=quant), Conv(c * 2, c, 1, act=False, quant=quant))
         self.add = shortcut
-        self.add1 = QuantAdd(a_bits=8, quant_inference=True) if quant else FloatAdd()
-        self.add2 = QuantAdd(a_bits=8, quant_inference=True) if quant else FloatAdd()
+        self.add1 = QuantAdd(a_bits=QUANT_CFG.a_bits, quant_inference=True) if quant else FloatAdd()
+        self.add2 = QuantAdd(a_bits=QUANT_CFG.a_bits, quant_inference=True) if quant else FloatAdd()
 
     def forward(self, x):
         x = self.add1(x, self.attn(x)) if self.add else self.attn(x)
@@ -474,7 +588,7 @@ class C2PSA(nn.Module):
         self.m = nn.Sequential(
             *(PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1), quant=quant) for _ in range(n))
         )
-        self.cat_op = QuantCat(2, a_bits=8) if quant else torch.cat
+        self.cat_op = QuantCat(2, a_bits=QUANT_CFG.a_bits) if quant else torch.cat
 
     def _cat(self, tensors, dim=1):
         return self.cat_op(tensors, dim) if isinstance(self.cat_op, QuantCat) else torch.cat(tensors, dim)
@@ -495,13 +609,13 @@ class SPPF(nn.Module):
         self.cv1 = Conv(c1, c_, 1, 1, act=False, quant=quant)
         self.cv2 = Conv(c_ * (n + 1), c2, 1, 1, quant=quant)
         if quant:
-            self.m = QuantMaxPool(kernel_size=k, stride=1, padding=k // 2, a_bits=8, quant_inference=True)
+            self.m = QuantMaxPool(kernel_size=k, stride=1, padding=k // 2, a_bits=QUANT_CFG.a_bits, quant_inference=True)
         else:
             self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
         self.n = n
         self.add = shortcut and c1 == c2
-        self.cat_op = QuantCat(n + 1, a_bits=8) if quant else torch.cat
-        self.add_op = QuantAdd(a_bits=8, quant_inference=True) if quant else FloatAdd()
+        self.cat_op = QuantCat(n + 1, a_bits=QUANT_CFG.a_bits) if quant else torch.cat
+        self.add_op = QuantAdd(a_bits=QUANT_CFG.a_bits, quant_inference=True) if quant else FloatAdd()
 
     def _cat(self, tensors, dim=1):
         return self.cat_op(tensors, dim) if isinstance(self.cat_op, QuantCat) else torch.cat(tensors, dim)
@@ -520,7 +634,7 @@ class Concat(nn.Module):
     def __init__(self, dimension=1, quant=False):
         super().__init__()
         self.d = dimension
-        self.op = QuantConcat(a_bits=8, quant_inference=True) if quant else None
+        self.op = QuantConcat(a_bits=QUANT_CFG.a_bits, quant_inference=True) if quant else None
 
     def forward(self, xs):
         if self.op is not None:
@@ -545,23 +659,27 @@ class Detect(nn.Module):
         self.reg_max = reg_max
         self.no = nc + reg_max * 4
         self.stride = torch.zeros(self.nl)
+        # 混合量化时整个检测头保持 FP32（quant=True 但 hq=False）；seg/pose 子类复用此标志 /
+        # Under mixed quantization the whole head stays FP32 (quant=True but hq=False); reused by seg/pose subclasses.
+        hq = quant and not QUANT_CFG.mixed_quant
+        self.head_quant = hq
         c2 = max((16, ch[0] // 4, reg_max * 4))
         c3 = max(ch[0], min(nc, 100))
         self.cv2 = nn.ModuleList(
             nn.Sequential(
-                Conv(x, c2, 3, quant=quant),
-                Conv(c2, c2, 3, quant=quant),
-                QuantConv2d(c2, 4 * reg_max, 1, a_bits=8, w_bits=8, per_channel=True)
-                if quant else nn.Conv2d(c2, 4 * reg_max, 1),
+                Conv(x, c2, 3, quant=hq),
+                Conv(c2, c2, 3, quant=hq),
+                QuantConv2d(c2, 4 * reg_max, 1, **_quant_layer_kwargs())
+                if hq else nn.Conv2d(c2, 4 * reg_max, 1),
             )
             for x in ch
         )
         self.cv3 = nn.ModuleList(
             nn.Sequential(
-                nn.Sequential(Conv(x, x, 3, g=x, quant=quant), Conv(x, c3, 1, quant=quant)),
-                nn.Sequential(Conv(c3, c3, 3, g=c3, quant=quant), Conv(c3, c3, 1, quant=quant)),
-                QuantConv2d(c3, nc, 1, a_bits=8, w_bits=8, per_channel=True)
-                if quant else nn.Conv2d(c3, nc, 1),
+                nn.Sequential(Conv(x, x, 3, g=x, quant=hq), Conv(x, c3, 1, quant=hq)),
+                nn.Sequential(Conv(c3, c3, 3, g=c3, quant=hq), Conv(c3, c3, 1, quant=hq)),
+                QuantConv2d(c3, nc, 1, **_quant_layer_kwargs())
+                if hq else nn.Conv2d(c3, nc, 1),
             )
             for x in ch
         )
@@ -583,9 +701,15 @@ class Detect(nn.Module):
         # 推理：ltrb 距离 -> xywh 框（×stride），分类 sigmoid / Inference: ltrb distances -> xywh bbox (×stride), class sigmoid
         shape = x[0].shape
         if self._feat_shape != shape:
-            self._anchors, self._strides_tensor = (
-                a.transpose(0, 1) for a in make_anchors(x, self.stride, 0.5)
-            )
+            # 注册为非持久 buffer：随 .cpu()/.cuda()/deepcopy 正确迁移，且不写入 state_dict /
+            # Register as non-persistent buffers so .cpu()/.cuda()/deepcopy move them, without entering state_dict
+            _anchors, _strides = (a.transpose(0, 1) for a in make_anchors(x, self.stride, 0.5))
+            # 可能已以普通属性存在（__init__ 置 None / 旧版缓存）或已注册（特征尺寸变化），先清理 /
+            # May pre-exist as a plain attr (None from __init__ / legacy cache) or be registered (feature-shape change): clear first
+            self.__dict__.pop('_anchors', None); self.__dict__.pop('_strides_tensor', None)
+            self._buffers.pop('_anchors', None); self._buffers.pop('_strides_tensor', None)
+            self.register_buffer('_anchors', _anchors, persistent=False)
+            self.register_buffer('_strides_tensor', _strides, persistent=False)
             self._feat_shape = shape
         dbox = dist2bbox(self.dfl(preds["boxes"]), self._anchors.unsqueeze(0), xywh=True, dim=1)
         dbox = dbox * self._strides_tensor
@@ -635,7 +759,9 @@ class YOLO26(nn.Module):
         layers = []
 
         # ---------------- backbone ----------------
-        layers += [_tag(Conv(3, C(64), 3, 2, quant=quant), 0, -1)]               # P1/2
+        # 混合量化：首层 stem（3→64）保持 FP32，其余层正常量化 / Mixed quant: stem (3→64) stays FP32, other layers quantized
+        stem_quant = quant and not QUANT_CFG.mixed_quant
+        layers += [_tag(Conv(3, C(64), 3, 2, quant=stem_quant), 0, -1)]               # P1/2
         layers += [_tag(Conv(C(64), C(128), 3, 2, quant=quant), 1, -1)]          # P2/4
         layers += [_tag(C3k2(C(128), C(256), n=N(2), c3k=c3k_all, e=0.25, quant=quant), 2, -1)]
         layers += [_tag(Conv(C(256), C(256), 3, 2, quant=quant), 3, -1)]         # P3/8
@@ -1087,29 +1213,21 @@ def copy_float_to_quant(float_model, quant_model):
     return quant_model
 
 
-def build_float_model(quant_model, nc=NUM_CLASSES, scale=DEFAULT_SCALE):
-    """把量化模型的反量化权重灌进同结构的干净浮点模型（用于导出纯浮点 ONNX） /
-    Inject dequantized weights from quant model into a clean float model of same architecture (for pure-float ONNX export)."""
-    quant_pkg.freeze_batch_init(quant_model)
-    quant_model.eval()
+def build_float_model(quant_model, nc=NUM_CLASSES, scale=DEFAULT_SCALE, use_clip=False):
+    """构建纯浮点参考模型（用于导出纯浮点 ONNX）/
+    Build the pure-float reference model (for pure-float ONNX export).
 
-    quant_state = quant_model.state_dict()
-    for name, module in quant_model.named_modules():
-        if quant_pkg.is_weight_quant_module(module):
-            quant_state[f"{name}.weight"] = quant_pkg.dequantized_weight(module)
-
-    float_model = FloatYOLO26(nc=nc, scale=scale)
-    float_state = float_model.state_dict()
-    missing = []
-    for key in float_state:
-        if key in quant_state and quant_state[key].shape == float_state[key].shape:
-            float_state[key] = quant_state[key].detach().cpu().clone()
-        else:
-            missing.append(key)
-    if missing:
-        raise RuntimeError(f"浮点模型缺少对应参数: {missing}")
-    float_model.load_state_dict(float_state)
-    return float_model
+    直接委托 quantization.build_float_model：在量化模型深拷贝上烘焙反量化权重，
+    激活量化器按 use_clip 替换——False（默认）换恒等（彻底去伪量化，交付给板端 PTQ
+    工具自校准）；True 换仅截断算子（保留 clip、去掉 round，参考图与真实整型推理
+    数值行为一致）。nc/scale 参数仅为兼容旧调用签名，不再使用。
+    / Delegates to quantization.build_float_model: bake dequantized weights on a deep
+    copy; activation quantizers are replaced per use_clip — False (default) identity
+    (fully de-fake-quantized, for board-side PTQ calibration); True clip-only ops
+    (keep clip, drop rounding; reference graph matches real integer inference).
+    nc/scale are kept only for signature compatibility and are unused.
+    """
+    return quant_pkg.build_float_model(quant_model, use_clip=use_clip)
 
 
 def collect_quant_params(quant_model):
@@ -1189,26 +1307,12 @@ def verify(float_model, quant_model, onnx_path, quant_params):
     except ImportError:
         print("      [skip] 未安装 onnx，跳过结构检查")
 
-    try:
-        ort = importlib.import_module("onnxruntime")
-        session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-        torch.manual_seed(0)
-        float_model.cpu().eval()
-        x = torch.randn(1, 3, IMGSZ, IMGSZ)
-        with torch.no_grad():
-            y_torch = float_model(x).numpy()
-        y_onnx = session.run(["preds"], {"images": x.numpy()})[0]
-        max_diff = float(np.abs(y_torch - y_onnx).max())
-        ref_mag = float(np.abs(y_torch).max())
-        print(f"      onnxruntime vs PyTorch 最大绝对误差: {max_diff:.3e}（参考幅度 {ref_mag:.3e}）")
-        # 输出含大数量级解码坐标（如 0~imgsz 的 box 值），纯绝对阈值过严： /
-        # Output contains large-magnitude decoded coordinates (e.g. 0~imgsz box values); pure abs threshold too strict:
-        # 改为 max(1e-3 绝对, 1e-5 相对)，仍足以抓住导出结构错误 / change to max(1e-3 abs, 1e-5 rel), still sufficient to catch export structural errors
-        assert max_diff < max(1e-3, 1e-5 * ref_mag), (
-            f"ONNX 数值误差过大: {max_diff}（参考幅度 {ref_mag:.3e}）"
-        )
-    except ImportError:
-        print("      [skip] 未安装 onnxruntime，跳过数值比对")
+    # 不做「导出 ONNX vs PyTorch 浮点」数值比对：导出的 ONNX 不含 scale/zero_point
+    # （板端 NPU/TPU 的 PTQ 工具会自行校准），该比对不构成部署口径；量化精度对比由
+    # compare 阶段的 QAT-vs-float 指标承担 / No exported-ONNX-vs-float numeric check:
+    # the exported ONNX carries no scale/zero_point (board NPU/TPU PTQ tools calibrate
+    # them), so the comparison is not deployment-meaningful; quant accuracy is compared
+    # by the compare stage's QAT-vs-float metrics.
 
     required_keys = quant_pkg.required_quant_keys(quant_model)
     missing = [key for key in required_keys if key not in quant_params]
@@ -2242,6 +2346,8 @@ def build_arg_parser():
     parser.add_argument("--qat-lr", type=float, default=None,
                         help="默认 float auto lr x 0.1")
     parser.add_argument("--calibration-batches", type=int, default=20)
+    # 量化超参（不再硬编码）：--a-bits/--w-bits/--per-channel/--all-positive / Quant hyperparameters (no longer hardcoded)
+    add_quant_cfg_args(parser)
     # 冒烟/快速验证用：每个 epoch / 评估最多跑多少个 batch，默认不限制（完整训练） / Smoke test / quick validation: max batches per epoch / eval, default unlimited (full training)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
@@ -2252,12 +2358,33 @@ def build_arg_parser():
     )
     parser.add_argument("--resume", action="store_true",
                         help="从 _last.pth checkpoint 接续训练")
+    # 运行级变体：多种子 / 校准敏感度等补充实验，目录自动加后缀不覆盖主实验 /
+    # Run-level variants for multi-seed / calibration-sensitivity runs; auto dir suffix, never overwrite main runs
+    parser.add_argument("--seed", type=int, default=0,
+                        help="随机种子（默认 0；非 0 时产物目录加 _seed{N} 后缀）/ random seed (default 0; non-zero adds _seed{N} dir suffix)")
+    parser.add_argument("--run-tag", type=str, default="",
+                        help="额外产物目录后缀（如 calib5；默认空）/ extra artifact dir suffix (e.g. calib5; default empty)")
     return parser
 
 
 if __name__ == "__main__":
     quant_pkg.install_print_timestamp()  # print 加分钟级时间戳 / minute-precision timestamp for print
     args = build_arg_parser().parse_args()
+
+    # 写入量化超参（须在任何量化模型构建之前）/ Apply quant hyperparameters before any quantized model is built
+    apply_quant_cfg_args(args)
+
+    # 运行级变体：设置随机种子与目录后缀标签 / Run-level variants: set random seed and directory suffix tag
+    RUN_SEED = args.seed
+    RUN_TAG = args.run_tag.strip().lstrip("_")
+    if RUN_SEED:
+        random.seed(RUN_SEED)
+        np.random.seed(RUN_SEED)
+        torch.manual_seed(RUN_SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(RUN_SEED)
+    if RUN_SEED or RUN_TAG:
+        print(f"运行变体 / Run variant: seed={RUN_SEED} run_tag={RUN_TAG or '-'}")
 
     # 根据 --data 动态覆盖全局 NUM_CLASSES 和 DATA_YAML（默认走自动下载） /
     # Override global NUM_CLASSES / DATA_YAML per --data (default auto-downloads)

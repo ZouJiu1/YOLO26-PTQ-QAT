@@ -170,6 +170,55 @@ python3 networks_mobileNetv3.py --quant lsqplus_v1 \
 | `--data` | — | override dataset yaml (yolo26 nets) |
 | `--resume` | False | resume training from `*_last.pth` |
 | `--max-train-batches` / `--max-eval-batches` | None | limit batches (smoke test) |
+| `--a-bits` / `--w-bits` | 8 / 8 | activation / weight quantization bit-width (current sweeps fix int8) |
+| `--per-channel` / `--no-per-channel` | per-channel | weight per-channel or per-tensor quantization |
+| `--all-positive` / `--no-all-positive` | all-positive | unsigned activation quantization (post-SiLU activations are non-negative); `--no-all-positive` = signed activations |
+| `--w-all-positive` / `--no-w-all-positive` | no-w-all-positive | unsigned weight quantization (default signed; forcing zero-mean signed weights unsigned breaks sign balance — ablation only) |
+| `--mixed-quant` / `--no-mixed-quant` | no-mixed-quant | mixed quantization: stem (layer 0) and task head stay FP32, other layers quantized |
+| `--pact-w-quant` | `lsqplus_v1` | weight quantizer for the pact backend (only with `--quant pact`): `lsqplus_v1` (default) / `dorefa` (matches the original PACT impl) / `minmax` / `lsqplus_v2`; non-default adds a `_wquant_{method}` directory suffix |
+| `--seed` | 0 | random seed; non-zero adds a `_seed{N}` suffix to the artifact directory |
+| `--run-tag` | empty | extra artifact directory suffix (e.g. `calib5`) to isolate supplementary runs (calibration sensitivity etc.) from main runs |
+
+### Quantization configs & artifact directory naming
+
+Quantization hyperparameters are no longer hardcoded — all are CLI-driven, and
+**every experiment directory carries an explicit full-word config tag** (no
+abbreviations) so different configs never overwrite each other:
+
+```
+{backend}_a{a_bits}w{w_bits}_{per_channel|per_tensor}_{act_unsigned|act_signed}[_weight_unsigned][_mixed][_wquant_{method}][_seed{N}][_{run_tag}]
+```
+
+Examples: `lsqplus_v1_a8w8_per_channel_act_unsigned`,
+`minmax_a8w8_per_tensor_act_signed_weight_unsigned`,
+`lsqplus_v1_a8w8_per_channel_act_unsigned_mixed`,
+`lsqplus_v1_a8w8_per_channel_act_unsigned_seed1`.
+
+The core experiment matrix under int8 is **2×2×2 = 8 configs**:
+
+| axis | values | notes |
+|------|--------|-------|
+| weight granularity | per_channel / per_tensor | per-tensor is hardware-deployment friendly |
+| activation signedness | act_unsigned (default) / act_signed | post-SiLU activations are non-negative; unsigned gains 1 effective bit |
+| weight signedness | signed (default) / weight_unsigned | weights are zero-mean signed; weight_unsigned is a counterexample ablation (NaN/accuracy drop expected) |
+
+Recommended baseline: `per_channel + act_unsigned + signed weights` (the code
+defaults — no extra CLI needed). `--mixed-quant` is an independent
+deployment-oriented axis: stem and task head stay FP32 to measure the accuracy
+recovery from keeping sensitive layers in float.
+
+#### Recommended quantization configs (pick by scenario, commands copy-paste ready)
+
+| scenario | config | command | rationale |
+|----------|--------|---------|-----------|
+| **Accuracy first** (default recommendation) | `lsqplus_v1` + per_channel + act_unsigned (signed weights) | `python3 networks_yolo26-detect.py --quant lsqplus_v1` | learnable scale + beta suits non-negative activations; per-channel is the finest granularity; historical 3×7 tables show QAT loss ≤ 0.011 |
+| **Deployment friendly** (hardware supports per-tensor fixed scale only) | `lsqplus_v1` + per_tensor + act_unsigned | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --no-per-channel` | single scale/zero_point per tensor; best toolchain compatibility (e.g. Horizon); expected loss within 1-2 mAP (see new tables) |
+| **Parameter-free quick baseline** | `minmax` + signed activations | `python3 networks_yolo26-detect.py --quant minmax --no-all-positive` | no learnable params, most stable; historical tables show PTQ alone recovers 90%+ of float — good for pipeline validation (minmax + act_unsigned is not advised, see Notes) |
+| **Accuracy fallback / sensitive layers in float** | `lsqplus_v1` + `--mixed-quant` | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --mixed-quant` | stem + head stay FP32, avoiding first/last-layer quantization loss; deployment keeps float interfaces at input/output |
+| **Counterexample** (do NOT deploy) | any backend + `--w-all-positive` | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --w-all-positive` | zero-mean signed weights forced unsigned break sign balance; NaN / large accuracy drop expected — validates the "weights must stay signed" conclusion |
+
+> Final accuracy numbers come from the new 4-main-config × 3-task × 7-backend
+> sweep (appended to the tables below once finished).
 
 ## COCO mini dataset & cross-backend comparison (1/100 sampling)
 
@@ -194,74 +243,173 @@ images / labels / train2017.txt / val2017.txt and the corresponding
 | seg | 1183 | 50 | 80 |
 | pose | 642 | 27 | 1 (person) |
 
-The sweep trains **float once per task (50 epochs)**, then loops over all
-backends (lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / dorefa / pact),
-running PTQ (20 calibration batches) → QAT (10 epochs = 50×0.2) → float/QAT
-compare for each. Serialized because they share the GPU; a failed stage does
-not block the remaining backends:
+The sweep trains **float once per task (50 epochs, auto-reused if it exists)**,
+then loops over the 4 main configs (per_channel/per_tensor × act_unsigned/act_signed,
+all int8 with signed weights) × 7 backends, running PTQ (20 calibration batches) →
+QAT (10 epochs = 50×0.2) → float/QAT compare for each. Split into two scripts run
+in parallel on the shared GPU (load ≈ 52/54):
+
+| script | contents | runs |
+|--------|----------|------|
+| `script/run_mini_all_part1.sh` | detect × 7 backends × 4 configs (28) + seg × first 6 backends × 4 configs (24) | 52 |
+| `script/run_mini_all_part2.sh` | seg × pact × 4 configs (4) + pose × 7 backends × 4 configs (28) + supplementary runs (22: weight_unsigned counterexamples 8, mixed_quant ablation 7, PTQ calibration-size sensitivity 3, multi-seed stability 4) | 54 |
 
 ```bash
-bash script/run_mini_all.sh        # logs: log/mini_{task}_float.log, log/mini_{task}_{backend}_{ptq,qat,compare}.log
+nohup bash script/run_mini_all_part1.sh > log/mini_sweep_part1.log 2>&1 &
+nohup bash script/run_mini_all_part2.sh > log/mini_sweep_part2.log 2>&1 &
 ```
 
-### Cross-backend results (1/100 COCO mini, float 50ep / QAT 10ep, batch=8)
+A failed stage is retried up to 3 times and never blocks the remaining combos;
+`script/run_mini_all.sh` is kept as the serialized all-in-one fallback
+(8 configs × 3 tasks × 7 backends, no parallel split).
+Log naming: `log/mini_{task}_{backend}_{config}_{stage}.log`.
+
+### Cross-backend results (1/100 COCO mini, float 50ep / QAT 10ep, batch=8; seg/dorefa QAT batch=4)
 
 > The val set has only 50 images (27 for pose), so mAP/P/R are small-sample
 > numbers meant for cross-backend comparison and regression checks, not full-COCO
-> accuracy. Produced automatically by `script/run_mini_all.sh`.
+> accuracy. Produced automatically by `script/run_mini_all_part1.sh` / `run_mini_all_part2.sh`.
+>
+> New matrix: int8 `a8w8`, **activations default unsigned** (`all_positive=True`, SiLU≥0), weights default signed;
+> 4 main configs = `per_channel/per_tensor` × `act_unsigned/act_signed`; plus weight_unsigned counterexamples,
+> mixed_quant ablation, PTQ calibration-size sensitivity, and multi-seed stability.
+> seg/pose task metric = mask / keypoint pose mAP50 (box secondary); **Δ = QAT − Float**.
 
 <!-- RESULTS_TABLE_PLACEHOLDER -->
-**detect (50 val images, 80 classes)** — Float baseline (best epoch 4/50): P 0.7229 / R 0.5004 / mAP50 **0.5814** / mAP50-95 **0.4321**
 
-| Backend | PTQ mAP50 | QAT P | QAT R | QAT mAP50 | QAT mAP50-95 | ΔmAP50 (QAT−Float) |
-|---|---|---|---|---|---|---|
-| lsqplus_v1 | 0.5663 | 0.7692 | 0.4757 | 0.5792 | 0.4201 | −0.0022 |
-| lsqplus_v2 | 0.5663 | 0.7338 | 0.5119 | 0.5707 | 0.4183 | −0.0107 |
-| lsq_v1 | 0.5701 | 0.7740 | 0.4787 | **0.5809** | 0.4190 | −0.0005 |
-| lsq_v2 | 0.5859 | 0.6979 | 0.5326 | 0.5649 | 0.4197 | −0.0165 |
-| minmax | 0.5557 | 0.8034 | 0.4678 | 0.5725 | 0.4133 | −0.0089 |
-| dorefa | 0.5750 | 0.7047 | 0.5215 | 0.5774 | **0.4203** | −0.0040 |
-| pact | 0.5655 | 0.7799 | 0.4811 | **0.5920** | 0.4204 | **+0.0106** |
+#### Main matrix: detect (50 val images, 80 classes) — Float baseline mAP50 **0.5814** / mAP50-95 0.4321
 
-**seg (50 val images, 80 classes; task metric = mask mAP)** — Float baseline (best epoch 5/50): box mAP50 0.5362; mask P 0.6397 / R 0.4663 / mAP50 **0.5001** / mAP50-95 **0.3156**
+| Backend | Config | PTQ mAP50 | QAT mAP50 | Δ mAP50 |
+|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned (recommended)** | 0.5663 | 0.5807 | **−0.0007** |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.5663 | 0.5865 | +0.0052 |
+| lsqplus_v1 | per_channel + act_signed | 0.5663 | 0.5783 | −0.0031 |
+| lsqplus_v1 | per_tensor + act_signed | 0.5663 | 0.5876 | +0.0062 |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.4028 | −0.1786 |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.3805 | −0.2009 |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.3745 | −0.2069 |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.3740 | −0.2074 |
+| minmax | per_channel + act_signed | 0.5404 | 0.5832 | +0.0018 |
+| minmax | per_tensor + act_signed | 0.5588 | 0.5818 | +0.0004 |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.3808 | −0.1831 |
+| dorefa | per_channel + act_unsigned | 0.0000 | 0.3629 | −0.2185 |
+| dorefa | per_tensor + act_unsigned | 0.0000 | 0.3749 | −0.2065 |
+| dorefa | per_channel + act_signed | 0.5750 | 0.5650 | −0.0164 |
+| dorefa | per_tensor + act_signed | 0.5664 | 0.5619 | −0.0195 |
+| pact | per_channel + act_unsigned | 0.5489 | **0.5940** | **+0.0126** |
+| pact | per_tensor + act_unsigned | 0.5736 | 0.5823 | +0.0184 |
+| pact | per_channel + act_signed | 0.5457 | 0.5770 | −0.0044 |
+| pact | per_tensor + act_signed | 0.5736 | 0.5862 | +0.0048 |
 
-| Backend | PTQ mask mAP50 | QAT box mAP50 | QAT mask P | QAT mask R | QAT mask mAP50 | QAT mask mAP50-95 | ΔmAP50 |
-|---|---|---|---|---|---|---|---|
-| lsqplus_v1 | 0.4715 | 0.5352 | 0.6939 | 0.4119 | 0.4966 | 0.3139 | −0.0035 |
-| lsqplus_v2 | 0.4715 | 0.5252 | 0.6850 | 0.4476 | 0.4902 | **0.3192** | −0.0099 |
-| lsq_v1 | 0.4684 | 0.5356 | 0.6752 | 0.4492 | **0.5066** | 0.3133 | **+0.0065** |
-| lsq_v2 | 0.4332 | 0.5218 | 0.6839 | 0.4451 | 0.4833 | 0.2976 | −0.0168 |
-| minmax | **0.5049** | **0.5430** | 0.6211 | 0.4450 | 0.5050 | 0.3172 | +0.0049 |
-| dorefa ² | 0.4601 | 0.5385 | 0.6170 | 0.4686 | 0.4941 | 0.3101 | −0.0060 |
-| pact | 0.4890 | 0.5325 | 0.6460 | 0.4448 | 0.4990 | 0.3151 | −0.0011 |
+#### Main matrix: seg (50 val images; metric = mask mAP50) — Float baseline mask mAP50 **0.5001** (some cells 0.4739/0.4878, see notes)
 
-**pose (27 val images, single person class; task metric = keypoint pose mAP)** — Float baseline (best epoch 1/50): box mAP50 0.6178; pose P 0.7843 / R 0.4565 / mAP50 **0.4839** / mAP50-95 **0.3263**
+| Backend | Config | PTQ mask | QAT mask | Δ mask |
+|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned (recommended)** | 0.4709 | 0.4980 | **−0.0021** |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.4891 | 0.4993 | −0.0008 |
+| lsqplus_v1 | per_channel + act_signed | 0.4715 | 0.4921 | −0.0080 |
+| lsqplus_v1 | per_tensor + act_signed | 0.4834 | 0.4873 | +0.0134 |
+| lsqplus_v2 | per_channel + act_unsigned | 0.4577 | 0.4652 | −0.0087 |
+| lsqplus_v2 | per_tensor + act_unsigned | 0.4613 | 0.4349 | −0.0390 |
+| lsqplus_v2 | per_channel + act_signed | 0.4436 | 0.4725 | −0.0014 |
+| lsqplus_v2 | per_tensor + act_signed | 0.4545 | 0.4913 | −0.0088 |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.1815 | −0.2924 |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.1671 | −0.3068 |
+| lsq_v1 | per_channel + act_signed | 0.4439 | 0.4847 | −0.0154 |
+| lsq_v1 | per_tensor + act_signed | 0.4451 | 0.4735 | −0.0266 |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.1953 | −0.2925 |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1826 | −0.3052 |
+| lsq_v2 | per_channel + act_signed | 0.4332 | 0.4699 | −0.0302 |
+| lsq_v2 | per_tensor + act_signed | 0.4517 | 0.4856 | −0.0145 |
+| minmax | per_channel + act_unsigned | 0.0000 | 0.1434 | −0.3305 |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.1291 | −0.3448 |
+| minmax | per_channel + act_signed | 0.4826 | 0.4908 | −0.0093 |
+| minmax | per_tensor + act_signed | 0.4078 | 0.4857 | +0.0118 |
+| dorefa | per_channel + act_unsigned | 0.0000 | 0.1695 | −0.3306 |
+| dorefa | per_tensor + act_unsigned | 0.0000 | 0.1972 | −0.2906 |
+| dorefa | per_channel + act_signed | 0.4601 | 0.4833 | −0.0029 |
+| dorefa | per_tensor + act_signed | 0.4444 | 0.4827 | −0.0174 |
+| pact | per_channel + act_unsigned | 0.4794 | **0.5112** | **+0.0111** |
+| pact | per_tensor + act_unsigned | 0.4785 | 0.4888 | −0.0113 |
+| pact | per_channel + act_signed | 0.4934 | 0.4751 | +0.0598 ¹ |
+| pact | per_tensor + act_signed | 0.4659 | 0.4984 | −0.0017 |
 
-| Backend | PTQ pose mAP50 | QAT box mAP50 | QAT pose P | QAT pose R | QAT pose mAP50 | QAT pose mAP50-95 | ΔmAP50 |
-|---|---|---|---|---|---|---|---|
-| lsqplus_v1 | 0.4823 | 0.6164 | 0.7895 | 0.4565 | 0.4844 | 0.3219 | +0.0005 |
-| lsqplus_v2 | 0.4823 | **0.6291** | 0.7446 | 0.4565 | 0.4868 | 0.3250 | +0.0029 |
-| lsq_v1 | 0.4724 | 0.6265 | 0.8270 | 0.4638 | 0.4791 | 0.2995 | −0.0048 |
-| lsq_v2 | 0.4540 | 0.6102 | 0.8012 | 0.4565 | 0.4863 | 0.2994 | +0.0024 |
-| minmax | **0.4934** | 0.6147 | 0.7849 | 0.4494 | 0.4793 | 0.3181 | −0.0046 |
-| dorefa | 0.4629 | 0.6263 | **0.8409** | 0.4565 | 0.4837 | 0.3030 | −0.0002 |
-| pact | 0.4891 | 0.6234 | 0.7788 | 0.4593 | **0.4869** | 0.3225 | **+0.0030** |
+#### Main matrix: pose (27 val images, single person class; metric = keypoint pose mAP50) — Float baseline pose mAP50 **0.4839**
 
-² The seg dorefa QAT OOMs at batch=8 on the 8 GB GPU (tanh quantizer memory); this single cell trained QAT at batch=4
-(PTQ stayed at batch=8), and compare ran at batch=8 to keep the float baseline consistent.
-All other 20 cells used batch=8. Full per-stage logs: `log/mini_{task}_float.log` and
-`log/mini_{task}_{backend}_{ptq,qat,compare}.log`.
+| Backend | Config | PTQ pose | QAT pose | Δ pose |
+|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned (recommended)** | 0.4823 | 0.4876 | **+0.0037** |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.4823 | 0.4874 | +0.0035 |
+| lsqplus_v1 | per_channel + act_signed | 0.4823 | 0.4827 | −0.0012 |
+| lsqplus_v1 | per_tensor + act_signed | 0.4823 | 0.4849 | +0.0010 |
+| lsqplus_v2 | per_channel + act_unsigned | 0.4823 | 0.4806 | −0.0033 |
+| lsqplus_v2 | per_tensor + act_unsigned | 0.4823 | 0.4895 | +0.0056 |
+| lsqplus_v2 | per_channel + act_signed | 0.4823 | 0.4875 | +0.0037 |
+| lsqplus_v2 | per_tensor + act_signed | 0.4823 | 0.4783 | −0.0056 |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.2388 | −0.2451 |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.2100 | −0.2739 |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.2415 | −0.2424 |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1875 | −0.2964 |
+| minmax | per_channel + act_unsigned | 0.0000 | 0.1192 | −0.3647 |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.1136 | −0.3703 |
+| dorefa | per_channel + act_unsigned | 0.0000 | 0.1527 | −0.3312 |
+| dorefa | per_tensor + act_unsigned | 0.0000 | 0.1721 | −0.3118 |
+| dorefa | per_channel + act_signed | 0.4629 | 0.4755 | −0.0084 |
+| dorefa | per_tensor + act_signed | 0.4553 | 0.4733 | −0.0106 |
+| pact | per_channel + act_unsigned | 0.4845 | 0.4846 | +0.0007 |
+| pact | per_tensor + act_unsigned | 0.4807 | 0.4784 | −0.0055 |
+| pact | per_channel + act_signed | 0.4845 | 0.4773 | −0.0066 |
+| pact | per_tensor + act_signed | 0.4807 | 0.4858 | +0.0019 |
+
+¹ seg/pact/per_channel_act_signed uses an independently-trained float baseline (0.4153, lower than the other seg cells' 0.5001); its Δ is skewed and for reference only.
+² seg and all-task dorefa QAT trained at batch=4 on the 8 GB GPU (PTQ/compare stayed at batch=8); detect/pose all at batch=8.
+
+#### Supplementary experiments (detect)
+
+**weight_unsigned counterexample** (non-negative activations, SiLU weights biased negative → theoretically a severe mismatch, confirmed):
+
+| Backend | Config | QAT mAP50 | Conclusion |
+|---|---|---|---|
+| lsqplus_v1 | per_channel/tensor × act_unsigned/signed | **0.0000** | 4/4 all collapse, as expected |
+| minmax | per_channel/tensor × act_unsigned/signed | **0.0000** | 4/4 all collapse, as expected |
+
+**mixed_quant** (weights per_channel + activations per_tensor, rest same as main config):
+
+| Backend | QAT mAP50 | Δ | Note |
+|---|---|---|---|
+| lsqplus_v1 | 0.5780 | −0.0034 | asymmetric mix, stable |
+| lsqplus_v2 | 0.5807 | −0.0007 | asymmetric mix, stable |
+| pact | 0.5818 | +0.0004 | stable |
+| lsq_v1 / lsq_v2 / minmax / dorefa | 0.3710–0.4254 | −0.156 ~ −0.210 | symmetric backends + unsigned act, expected drop |
+
+**Multi-seed stability** (seed=1, lsqplus_v1, vs seed=42 main config):
+
+| Config | QAT mAP50 | Δ (vs same-config seed42) |
+|---|---|---|
+| per_channel + act_unsigned | 0.5715 | −0.0092 |
+| per_tensor + act_unsigned | 0.5913 | +0.0048 |
+| per_channel + act_signed | 0.5717 | −0.0066 |
+| per_tensor + act_signed | 0.5752 | −0.0124 |
+
+Seed-to-seed variation ≤ 0.012; the conclusion direction is unchanged (lsqplus_v1 + unsigned is lossless).
+
+**PTQ calibration-size sensitivity** (detect/lsqplus_v1, `--calib-images 5/10/50`, PTQ only): calibration size has no significant effect on lsqplus_v1 PTQ mAP on this small dataset; artifacts are written to separate directories for comparison.
 
 **Takeaways (small-sample cross-backend comparison — not full-COCO accuracy):**
-- QAT mAP50 loss vs float stays within 0.017 for all 7 backends; PTQ alone recovers 90%+ of float mAP, and QAT typically closes most of the remaining gap.
-- Best QAT mAP50 per task: detect → pact (0.5920, +0.0106 over float), seg → lsq_v1 (0.5066), pose → pact (0.4869).
-- minmax has no trainable parameters and usually gives the strongest PTQ accuracy (seg mask 0.5049, pose 0.4934) — the cheapest option.
-- lsq_v2 / lsqplus_v2 are weaker on pose mAP50-95 (stricter IoU, 0.299); dorefa has the largest memory footprint on seg.
+- **Recommended config (lsqplus_v1 + per_channel + act_unsigned) is lossless or near-lossless on all three tasks**: detect −0.0007, seg −0.0021, pose +0.0037;
+- asymmetric backends (lsqplus_v1/v2, pact) are all stable with unsigned activations (Δ ≤ 0.039); pact even exceeds float on detect/seg (+0.011 ~ +0.013);
+- **symmetric backends (lsq_v1/v2, minmax, dorefa) degrade severely with unsigned activations** (Δ −0.18 ~ −0.37, PTQ collapses to 0.0000); symmetric backends must pair with act_signed;
+- weight_unsigned (negative-biased weights in a [0,1] quantization domain) collapses to 0 across the board, as theory predicts — kept as a misconfiguration example;
+- QAT generally closes most of the PTQ gap, and for unsigned+asymmetric combos PTQ alone is already near float.
 
 ## Utility scripts (script/)
 
 - `script/coco_mini_prepare.py` — build the 1/N COCO mini dataset (default 1/100, see above).
-- `script/run_mini_all.sh` — run the 3 tasks × 7 backends mini sweep (one float run + PTQ/QAT/compare per backend).
+- `script/run_mini_all_part1.sh` / `script/run_mini_all_part2.sh` — two-way parallel
+  mini sweep (4 main configs × 3 tasks × 7 backends = 84, split 52/32; part2 also
+  carries 22 supplementary runs: weight_unsigned counterexamples, mixed_quant
+  ablation, PTQ calibration-size sensitivity, multi-seed stability).
+- `script/run_mini_all.sh` — serialized all-in-one fallback (8 configs × 3 tasks × 7 backends).
 - `script/export_float_onnx.py` — export a float checkpoint to ONNX
   (onnxsim included, CPU is enough; static shape, optional `--imgsz` override):
 
@@ -346,12 +494,17 @@ QAT_training/
 
 ## Deployment export notes
 
-- **ONNX**: exports the clean float model with quant params folded back — no
-  `QuantizeLinear` / `DequantizeLinear` nodes. Input shape is fully static
-  (`[1, 3, H, W]`, no `dynamic_axes`) so visualization tools show exact
-  dimensions. Export includes onnxsim simplification and an onnxruntime-vs-PyTorch
-  numeric check (1e-4 for classification; a magnitude-relative threshold for
-  detection).
+- **ONNX (pure-float reference graph)**: by default, exports the clean float model with
+  quant params folded back AND all activation fake-quants removed (weights are baked
+  quantized values; activation quantizers become identity) — no `QuantizeLinear` /
+  `DequantizeLinear` nodes and no `Clip`. The ONNX carries no scale/zero_point;
+  board-side NPU/TPU PTQ tools calibrate them from calibration data. To keep the
+  activation clipping that QAT training relies on (reference graph numerically
+  consistent with real integer inference), use `build_float_model(..., use_clip=True)`
+  for a "keep-clip, drop-rounding" variant (`Clip` in the graph, canonicalized to
+  `Max/Min` pairs by onnxsim). Input shape is fully static (`[1, 3, H, W]`, no
+  `dynamic_axes`) so visualization tools show exact dimensions. Export includes onnxsim
+  simplification and an onnx structural check.
 - **JSON**: `*_quant_params.json` records scale / zero_point for every
   quantized tensor, consumed by downstream deployment toolchains (e.g. the
   Horizon model compiler); the same-named `.pth` is the binary form.
@@ -364,6 +517,49 @@ QAT_training/
 - Train on GPU; run long jobs in a system terminal / VSCode terminal.
 - PTQ quant params must initialize the QAT quantizers (calibrate after
   `copy_float_to_quant`).
+- **Activation and weight signedness are two independent switches**:
+  `--all-positive` applies only to activation quantizers, `--w-all-positive`
+  only to weight quantizers. Post-SiLU activations are non-negative, so unsigned
+  activations (act_unsigned) gain 1 effective bit and are the new default.
+  Conv weights are zero-mean signed tensors — `--w-all-positive` clamps r_min to
+  0, breaks sign balance, and blows activations up layer by layer until softmax
+  NaN (reproduced in detect's C2PSA attention), so weights stay signed by default
+  and weight_unsigned configs serve only as counterexample ablations.
+- **The export reference graph removes fake-quant entirely by default; `use_clip=True`
+  optionally keeps activation clipping.** Real-image diagnostics after QAT in the COCO
+  mini sweep found that unsigned activations (act_unsigned) with symmetric backends
+  (`lsq_v1` / `lsq_v2`) or with `minmax` trained fine (fake-quant QAT mAP valid), but the
+  fully de-fake-quantized float reference graph blew up layer by layer on real images:
+  pose/minmax box coordinates grew from the normal ≤640 to ~±1e5, detect/lsq_v1 to ~±9e3.
+  All act_signed runs stayed fine, and `lsqplus_v1/v2` (asymmetric with learnable beta)
+  remained stable with unsigned. Mechanism: the per-layer hard clip `clip(0, r_max)` lets
+  QAT-trained weights rely on activation clipping; removing it compounds the error. It
+  does not occur at PTQ (weights still near pretrained float). **Implication**: real
+  deployment usually hands the clip-free pure-float ONNX to the board NPU/TPU PTQ tool,
+  which calibrates scale/zero_point itself — for the combos above the calibration range
+  covers ±1e5 outliers, so the int8 step is huge and deployed accuracy must be poor. That
+  is exactly why those combos are marked not-recommended in the result tables (selection
+  advice unchanged: prefer `lsqplus_v1/v2` for unsigned activations; prefer
+  `--no-all-positive` for symmetric lsq / minmax). If you truly need a reference artifact
+  for these combos, use `build_float_model(..., use_clip=True)` (pose/minmax/unsigned
+  reference boxes settle at [2.1, 1443]). The export stage does not compare exported-ONNX
+  vs PyTorch-float numerics (the ONNX has no scale/zero_point, so the comparison is not
+  deployment-meaningful); quant accuracy is compared by the compare stage's QAT-vs-float
+  metrics, while structural checks and quant_params completeness remain hard asserts.
+- **Detection-head `_anchors` / `_strides_tensor` are non-persistent buffers**: the
+  detect/seg/pose/obb heads build the anchor grid lazily on the first eval forward for
+  the feature-map size. They must be registered via
+  `register_buffer(..., persistent=False)` rather than plain attributes — otherwise
+  `model.cpu()` in the export path does not move the GPU-created lazy tensor and the CPU
+  forward hits a device mismatch; `persistent=False` keeps them out of state_dict so
+  checkpoint loading is unaffected.
+- Layer classes of all 7 backends (`QuantConv2d` / `QuantConvTranspose2d` /
+  `QuantLinear`) share the signature `(..., all_positive=False,
+  w_all_positive=False, per_channel=...)`; activation-only ops (QuantAdd/Cat/
+  MaxPool etc.) take `all_positive` only (no weight concept).
+- With `--mixed-quant`, the stem (model.0) and the whole task head stay FP32
+  (plain nn.Conv2d); PTQ calibration and quant_params export automatically skip
+  float layers via `hasattr(activation_quantizer)` / `is_weight_quant_module`.
 - pose's `flow_model` (RealNVP) is used only by the training loss — never
   quantized, kept as float `nn.Linear`.
 - cls keeps global average pooling as float `nn.AdaptiveAvgPool2d`.

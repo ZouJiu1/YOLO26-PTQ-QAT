@@ -97,6 +97,12 @@ class DorefaActivationQuantizer(nn.Module):
         q_a = Round.apply(bounded * self.Qp).clamp(self.Qn, self.Qp) / self.Qp
         return q_a * self.s
 
+    def clip_bounds(self):
+        """激活空间内的截断边界：无符号 (0, s) / 有符号 (-s, s)；导出"截断保留、舍入去除"的纯浮点参考图时使用 /
+        Clip bounds in activation space: unsigned (0, s) / signed (-s, s); used when exporting a clip-only (rounding-free) float reference graph."""
+        lower = torch.zeros_like(self.s) if self.all_positive else -self.s
+        return lower.detach(), self.s.detach()
+
 # W(权重)量化 / W(weight) quantization
 class DorefaWeightQuantizer(nn.Module):
     def __init__(self, w_bits, all_positive=False, per_channel=False):
@@ -151,12 +157,13 @@ class QuantConv2d(nn.Conv2d):
                  w_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False):
         super(QuantConv2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups,
                                           bias, padding_mode)
         self.quant_inference = quant_inference
         self.activation_quantizer = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
-        self.weight_quantizer = DorefaWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel)
+        self.weight_quantizer = DorefaWeightQuantizer(w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel)
 
     def forward(self, input):
         quant_input = self.activation_quantizer(input)
@@ -187,14 +194,15 @@ class QuantConvTranspose2d(nn.ConvTranspose2d):
                  w_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False):
         # 注意: ConvTranspose2d 的参数顺序为 (..., output_padding, groups, bias, dilation, padding_mode)
         # / Note: ConvTranspose2d parameter order is (..., output_padding, groups, bias, dilation, padding_mode)
         super(QuantConvTranspose2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, output_padding,
                                                    groups, bias, dilation, padding_mode)
         self.quant_inference = quant_inference
         self.activation_quantizer = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
-        self.weight_quantizer = DorefaWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel)
+        self.weight_quantizer = DorefaWeightQuantizer(w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel)
 
     def forward(self, input):
         quant_input = self.activation_quantizer(input)
@@ -216,11 +224,12 @@ class QuantLinear(nn.Linear):
                  w_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False):
         super(QuantLinear, self).__init__(in_features, out_features, bias)
         self.quant_inference = quant_inference
         self.activation_quantizer = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
-        self.weight_quantizer = DorefaWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel)
+        self.weight_quantizer = DorefaWeightQuantizer(w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel)
 
     def forward(self, input):
         quant_input = self.activation_quantizer(input)
@@ -237,7 +246,8 @@ class QuantAdd(nn.Module):
                  a_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False):
         super(QuantAdd, self).__init__()
         self.quant_inference = quant_inference
         self.activation_quantizer0 = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
@@ -256,7 +266,8 @@ class QuantSub(nn.Module):
                  a_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False):
         super(QuantSub, self).__init__()
         self.quant_inference = quant_inference
         self.activation_quantizer0 = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
@@ -275,7 +286,8 @@ class QuantMultiply(nn.Module):
                  a_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False):
         super(QuantMultiply, self).__init__()
         self.quant_inference = quant_inference
         self.activation_quantizer0 = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
@@ -294,7 +306,8 @@ class QuantDiv(nn.Module):
                  a_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False):
         super(QuantDiv, self).__init__()
         self.quant_inference = quant_inference
         self.activation_quantizer0 = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
@@ -315,7 +328,8 @@ class QuantConcat(nn.Module):
                  a_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False):
         super(QuantConcat, self).__init__()
         self.quant_inference = quant_inference
         self.activation_quantizer0 = DorefaActivationQuantizer(a_bits=a_bits, all_positive=all_positive)

@@ -21,6 +21,7 @@ logic — freeze/reset/scale/zero_point extraction — is handled here with cros
 compatibility, so network code does not need to care about per-backend attribute differences.
 """
 
+import copy
 import datetime
 import importlib
 import re
@@ -184,6 +185,125 @@ def dequantized_weight(module):
     """对带权量化层做一次 weight_quantizer 前向，拿到反量化后的权重 / Run weight_quantizer forward once on a weight-quantized layer to obtain dequantized weights."""
     with torch.no_grad():
         return module.weight_quantizer(module.weight).detach().clone()
+
+
+class _IdentityQuantizer(torch.nn.Module):
+    """恒等量化器（占位）：权重已反量化并原地灌回，前向直通 /
+    Identity placeholder: weights are already dequantized in place, forward is a pass-through."""
+
+    def forward(self, x):
+        return x
+
+
+class _ClipOnlyQuantizer(torch.nn.Module):
+    """仅保留量化器的截断（clip）、去掉舍入（round）的激活算子 /
+    Activation op that keeps only the quantizer's clip and removes rounding.
+
+    硬件整型量化推理必然先把激活截断到 [Qn,Qp] 对应的区间再取整；导出纯浮点参考
+    ONNX 时保留截断、去掉取整，可使参考图与真实部署数值行为一致，避免 QAT 后的权重
+    "依赖激活钳位"在去伪量化图中逐层放大（unsigned + 对称量化后端上曾观测到输出爆炸）。
+    / Hardware integer quantization always clips activations to the interval mapped
+    from [Qn,Qp] before rounding. Keeping the clip and dropping rounding in the exported
+    pure-float reference ONNX makes the reference graph numerically consistent with real
+    deployment, and avoids post-QAT weights that "rely on activation clipping" blowing up
+    layer by layer in the de-fake-quantized graph (observed with unsigned + symmetric backends).
+    """
+
+    def __init__(self, lower, upper):
+        super().__init__()
+        self.register_buffer('lower', lower.detach().reshape(1).clone())
+        self.register_buffer('upper', upper.detach().reshape(1).clone())
+
+    def forward(self, x):
+        # 不在前向里做 .to()（tracing 会产生 aten::copy_，无法导出 ONNX）；
+        # buffer 随模型 .to(device)/.half() 一起迁移，(1,) 形状自动按通道广播 /
+        # No .to() in forward (tracing emits aten::copy_, breaking ONNX export);
+        # buffers move with the model, the (1,) shape broadcasts over channels.
+        return torch.clamp(x, self.lower, self.upper)
+
+
+def build_float_model(quant_model, use_clip=False):
+    """从量化模型构建纯浮点参考模型（深拷贝，不改原模型） /
+    Build a pure-float reference model from a quantized model (deep copy; untouched).
+
+    三步 / Three steps:
+      1) 所有带 quant_inference 开关的模块置 True（走"权重已烘焙"的推理路径）/
+         Set quant_inference=True everywhere (baked-weight inference path);
+      2) 带权层用反量化权重原地覆盖 .weight，weight_quantizer 换成恒等（必须在替换前完成反量化）/
+         Overwrite .weight in place with dequantized weights and replace weight_quantizer by
+         identity (dequantization must happen before replacement);
+      3) 激活量化器按 use_clip 处理 / activation quantizers by use_clip:
+         - use_clip=False（默认）：全部换成恒等（彻底去伪量化）。导出的 ONNX 无 scale/zero_point，
+           部署时由板端 NPU/TPU 的 PTQ 工具自行校准，这是最常见的部署交付物。
+           注意：unsigned 激活 + 对称量化后端（lsq_v1/v2、minmax）时，QAT 权重依赖激活钳位，
+           无 clip 的参考图在真实图片上数值发散（box 可达 ±1e5），仅作权重交付/指标参考，
+           不建议直接喂给板端校准 / replace all by identity (fully de-fake-quantized).
+           The exported ONNX has no scale/zero_point; board-side NPU/TPU PTQ tools calibrate
+           them — the usual deployment deliverable. CAUTION: with unsigned activations +
+           symmetric backends (lsq_v1/v2, minmax), QAT weights rely on activation clipping,
+           and a clip-free reference graph diverges on real images (boxes up to ±1e5);
+         - use_clip=True：换成 _ClipOnlyQuantizer（保留截断、去掉舍入），参考图数值行为与
+           真实量化部署一致（QAT 权重依赖激活钳位时不会爆炸）/
+           replace by _ClipOnlyQuantizer (keep clip, drop rounding): the reference graph
+           stays numerically consistent with real quantized deployment (no blow-up when
+           QAT weights rely on activation clipping).
+    """
+    _orig_device = next(quant_model.parameters()).device
+    # 训练时部分量化层会把带梯度的中间张量存成普通属性（如 lsqplus QuantConv2d 的
+    # input / quant_input / quant_weight，见 lsqplus_quantize_V1.py），deepcopy 遇到
+    # 非叶张量（requires_grad 且有 grad_fn）会直接 RuntimeError，这正是 QAT 训完后
+    # 导出处 exit=1 的元凶。深拷贝前统一 detach 这些普通属性（仅实例属性，不碰
+    # _parameters/_buckets 注册项；导出只读权重与量化参数，detach 无副作用）/
+    # Training caches grad-carrying intermediates as plain module attributes (e.g.
+    # lsqplus QuantConv2d input/quant_input/quant_weight in lsqplus_quantize_V1.py);
+    # deepcopy raises RuntimeError on non-leaf tensors — the cause of exit=1 at export
+    # right after QAT finishes. Detach plain tensor attributes before copying (instance
+    # attrs only; registered params/buffers untouched; export only reads weights/params).
+    for module in quant_model.modules():
+        for attr_name, value in list(vars(module).items()):
+            if isinstance(value, torch.Tensor) and value.requires_grad:
+                setattr(module, attr_name, value.detach())
+    model = copy.deepcopy(quant_model.cpu())  # CPU 上深拷贝，避免整图复制占用显存 / deep-copy on CPU
+    quant_model.to(_orig_device)  # 原模型搬回，调用方契约不变 / restore caller's model device
+    model.cpu()
+    freeze_batch_init(model)
+    model.eval()
+
+    with torch.no_grad():
+        # 1) 推理路径开关 / inference-path switch
+        for module in model.modules():
+            if hasattr(module, 'quant_inference'):
+                module.quant_inference = True
+
+        # 2) 反量化权重烘焙 + 权重量级化器恒等 / bake dequantized weights + identity weight quantizers
+        for module in list(model.modules()):
+            if is_weight_quant_module(module) and hasattr(module, 'weight'):
+                module.weight.copy_(module.weight_quantizer(module.weight).detach())
+                module.weight_quantizer = _IdentityQuantizer()
+
+        # 3) 激活量化器按 use_clip 替换。递归遍历（不依赖属性名）：各后端挂载方式不同，
+        #    可能是 activation_quantizer / activation_quantizer0/1，
+        #    也可能是 QuantCat 里的 self.quantizers = ModuleList([...])。
+        #    鸭子类型：只有激活量化器实现了 clip_bounds()，权重量级化器没有。
+        # / activation quantizers → identity (default) or clip-only (use_clip=True).
+        #   Recurse by duck type instead of attr names: backends mount them as
+        #   activation_quantizer / activation_quantizer0/1, or inside QuantCat as
+        #   self.quantizers = ModuleList([...]). Only activation quantizers implement
+        #   clip_bounds(); weight quantizers do not.
+        def _replace_activation_quantizers(parent):
+            for child_name, child in list(parent.named_children()):
+                if hasattr(child, 'clip_bounds'):
+                    if use_clip:
+                        lower, upper = child.clip_bounds()
+                        setattr(parent, child_name, _ClipOnlyQuantizer(lower, upper))
+                    else:
+                        setattr(parent, child_name, _IdentityQuantizer())
+                else:
+                    _replace_activation_quantizers(child)
+
+        _replace_activation_quantizers(model)
+
+    return model
 
 
 # ----------------------------------------------------------------------------

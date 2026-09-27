@@ -57,12 +57,13 @@ MODEL_DIR = _MODEL_DIR_BASE
 
 
 def _model_dir_for(scale=None, quant_method=None):
-    """按网络名 + 尺度 + 量化后端返回产物目录。 / Return output directory by network name + scale + quantization backend."""
+    """按网络名 + 尺度 + 量化后端(+非默认量化配置标签)返回产物目录 /
+    Return artifact directory by net name + scale + quant backend (+ non-default quant config tag)."""
     path = _MODEL_DIR_BASE
     if scale is not None:
         path = os.path.join(path, scale)
     if quant_method is not None:
-        path = os.path.join(path, quant_method)
+        path = os.path.join(path, quant_method + det._quant_cfg_tag())
     os.makedirs(path, exist_ok=True)
     return path
 ULTRA_DIR = os.path.join(BASE_DIR, "ultralytics", "ultralytics")
@@ -138,6 +139,8 @@ class DepthHead(nn.Module):
 
     def __init__(self, ch=(256, 512, 1024), c_mid=256, quant=False):
         super().__init__()
+        # 混合量化时整个深度头保持 FP32 / Under mixed quant the whole depth head stays FP32
+        quant = quant and not det.QUANT_CFG.mixed_quant
         self.nl = len(ch)  # 金字塔层数 / number of pyramid levels
 
         # 每层 1x1 Conv 投影到 c_mid / per-level 1x1 Conv projection to c_mid
@@ -150,16 +153,17 @@ class DepthHead(nn.Module):
         )
         # 量化模型中融合残差加法用 QuantAdd；浮点模型用普通加法（None 占位） / fusion residual add uses QuantAdd in quant model; plain add in float model (None placeholder)
         self.fuse_adds = (
-            nn.ModuleList(det.QuantAdd(a_bits=8, quant_inference=True) for _ in ch[:-1])
+            nn.ModuleList(det.QuantAdd(a_bits=det.QUANT_CFG.a_bits, quant_inference=True) for _ in ch[:-1])
             if quant else None
         )
 
         if quant:
             upsample = QuantConvTranspose2d(
                 c_mid // 2, c_mid // 2, kernel_size=2, stride=2, padding=0, bias=True,
-                a_bits=8, w_bits=8, per_channel=True,
+                **det._quant_layer_kwargs(),
             )
-            last_conv = QuantConv2d(c_mid // 4, 1, kernel_size=1, a_bits=8, w_bits=8, per_channel=True)
+            last_conv = QuantConv2d(c_mid // 4, 1, kernel_size=1,
+                                    **det._quant_layer_kwargs())
         else:
             upsample = nn.ConvTranspose2d(c_mid // 2, c_mid // 2, kernel_size=2, stride=2, bias=True)
             last_conv = nn.Conv2d(c_mid // 4, 1, kernel_size=1)
@@ -428,28 +432,11 @@ def copy_float_to_quant(float_model, quant_model):
     return det.copy_float_to_quant(float_model, quant_model)
 
 
-def build_float_model(quant_model, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
+def build_float_model(quant_model, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE, use_clip=False):
     """把量化模型的反量化权重灌进同结构的干净浮点模型（用于导出纯浮点 ONNX）。 / Inject dequantized weights from quantized model into a clean float model of same structure (for exporting pure-float ONNX)."""
-    quant_pkg.freeze_batch_init(quant_model)
-    quant_model.eval()
-
-    quant_state = quant_model.state_dict()
-    for name, module in quant_model.named_modules():
-        if quant_pkg.is_weight_quant_module(module):
-            quant_state[f"{name}.weight"] = quant_pkg.dequantized_weight(module)
-
-    float_model = FloatYOLO26Depth(nc=nc, scale=scale)
-    float_state = float_model.state_dict()
-    missing = []
-    for key in float_state:
-        if key in quant_state and quant_state[key].shape == float_state[key].shape:
-            float_state[key] = quant_state[key].detach().cpu().clone()
-        else:
-            missing.append(key)
-    if missing:
-        raise RuntimeError(f"浮点模型缺少对应参数: {missing}")
-    float_model.load_state_dict(float_state)
-    return float_model
+    # 委托通用构建器（烘焙反量化权重；use_clip 控制激活伪量化换恒等或仅截断），nc/scale 仅兼容旧签名 /
+    # Delegates to the generic builder (bakes dequantized weights; use_clip selects identity vs clip-only activation replacement); nc/scale kept for signature compatibility.
+    return quant_pkg.build_float_model(quant_model, use_clip=use_clip)
 
 
 def collect_quant_params(quant_model):
@@ -528,28 +515,12 @@ def verify(float_model, quant_model, onnx_path, quant_params):
     except ImportError:
         print("      [skip] 未安装 onnx，跳过结构检查")
 
-    try:
-        ort = importlib.import_module("onnxruntime")
-        session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-        torch.manual_seed(0)
-        float_model.cpu().eval()
-        head = float_model.model[-1]
-        head.export = True  # 与导出的 ONNX 输出分辨率一致（H, W） / match exported ONNX output resolution (H, W)
-        x = torch.randn(1, 3, IMGSZ, IMGSZ)
-        with torch.no_grad():
-            y_torch = float_model(x).numpy()
-        head.export = False
-        y_onnx = session.run(["depth"], {"images": x.numpy()})[0]
-        max_diff = float(np.abs(y_torch - y_onnx).max())
-        ref_mag = float(np.abs(y_torch).max())
-        print(f"      onnxruntime vs PyTorch 最大绝对误差: {max_diff:.3e}（参考幅度 {ref_mag:.3e}）")
-        # 深度输出为 exp 后的正数（米），量级随场景变化，纯绝对阈值过严：max(1e-3 绝对, 1e-5 相对) /
-        # Depth output is positive (meters) after exp, magnitude varies with scene; pure abs threshold too strict: max(1e-3 abs, 1e-5 rel)
-        assert max_diff < max(1e-3, 1e-5 * ref_mag), (
-            "ONNX 数值误差过大"
-        )
-    except ImportError:
-        print("      [skip] 未安装 onnxruntime，跳过数值比对")
+    # 不做「导出 ONNX vs PyTorch 浮点」数值比对：导出的 ONNX 不含 scale/zero_point
+    # （板端 NPU/TPU 的 PTQ 工具会自行校准），该比对不构成部署口径；量化精度对比由
+    # compare 阶段的 QAT-vs-float 指标承担 / No exported-ONNX-vs-float numeric check:
+    # the exported ONNX carries no scale/zero_point (board NPU/TPU PTQ tools calibrate
+    # them), so the comparison is not deployment-meaningful; quant accuracy is compared
+    # by the compare stage's QAT-vs-float metrics.
 
     required_keys = quant_pkg.required_quant_keys(quant_model)
     missing = [key for key in required_keys if key not in quant_params]
@@ -1058,6 +1029,8 @@ def build_arg_parser():
     parser.add_argument("--qat-lr", type=float, default=None,
                         help="默认 float auto lr x 0.1")
     parser.add_argument("--calibration-batches", type=int, default=20)
+    # 量化超参（不再硬编码）：--a-bits/--w-bits/--per-channel/--all-positive/--mixed-quant / Quant hyperparameters (no longer hardcoded)
+    det.add_quant_cfg_args(parser)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
     parser.add_argument(
@@ -1073,6 +1046,9 @@ def build_arg_parser():
 if __name__ == "__main__":
     quant_pkg.install_print_timestamp()  # print 加分钟级时间戳 / minute-precision timestamp for print
     args = build_arg_parser().parse_args()
+
+    # 写入量化超参（det.QUANT_CFG 是所有量化层读取的唯一来源）/ Apply quant hyperparameters (single source read by all quant layers)
+    det.apply_quant_cfg_args(args)
 
     # 根据 --data 动态覆盖全局 NUM_CLASSES 和 DATA_YAML（默认走自动下载） /
     # Override global NUM_CLASSES / DATA_YAML per --data (default auto-downloads)

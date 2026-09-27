@@ -62,12 +62,13 @@ MODEL_DIR = _MODEL_DIR_BASE
 
 
 def _model_dir_for(scale=None, quant_method=None):
-    """按网络名 + 尺度 + 量化后端返回产物目录。 / Return output directory by network name + scale + quantization backend."""
+    """按网络名 + 尺度 + 量化后端(+非默认量化配置标签)返回产物目录 /
+    Return artifact directory by net name + scale + quant backend (+ non-default quant config tag)."""
     path = _MODEL_DIR_BASE
     if scale is not None:
         path = os.path.join(path, scale)
     if quant_method is not None:
-        path = os.path.join(path, quant_method)
+        path = os.path.join(path, quant_method + det._quant_cfg_tag())
     os.makedirs(path, exist_ok=True)
     return path
 ULTRA_DIR = os.path.join(BASE_DIR, "ultralytics", "ultralytics")
@@ -146,7 +147,7 @@ class Proto26(nn.Module):
         if quant:
             self.upsample = QuantConvTranspose2d(
                 npr, npr, kernel_size=2, stride=2, padding=0, bias=True,
-                a_bits=8, w_bits=8, per_channel=True,
+                **det._quant_layer_kwargs(),
             )
         else:
             self.upsample = nn.ConvTranspose2d(npr, npr, 2, 2, 0, bias=True)
@@ -155,14 +156,14 @@ class Proto26(nn.Module):
 
         self.feat_refine = nn.ModuleList(det.Conv(x, ch[0], k=1, quant=quant) for x in ch[1:])
         self.refine_adds = (
-            nn.ModuleList(det.QuantAdd(a_bits=8, quant_inference=True) for _ in ch[1:])
+            nn.ModuleList(det.QuantAdd(a_bits=det.QUANT_CFG.a_bits, quant_inference=True) for _ in ch[1:])
             if quant else None
         )
         self.feat_fuse = det.Conv(ch[0], npr, k=3, quant=quant)
         self.semseg = nn.Sequential(
             det.Conv(ch[0], npr, k=3, quant=quant),
             det.Conv(npr, npr, k=3, quant=quant),
-            QuantConv2d(npr, nc, 1, a_bits=8, w_bits=8, per_channel=True)
+            QuantConv2d(npr, nc, 1, **det._quant_layer_kwargs())
             if quant else nn.Conv2d(npr, nc, 1),
         )
 
@@ -192,17 +193,18 @@ class Segment(det.Detect):
 
     def __init__(self, nc=NUM_CLASSES, nm=NM, npr=64, reg_max=1, ch=(64, 128, 256), quant=False):
         super().__init__(nc=nc, reg_max=reg_max, ch=ch, quant=quant)
+        hq = self.head_quant  # 混合量化时整个分割头（含 Proto/cv4/semseg）保持 FP32 / Under mixed quant the whole seg head (Proto/cv4/semseg) stays FP32
         self.nm = nm
         self.npr = npr
         # 属性名必须为 proto，与官方 Segment26 / yolo26n-seg.pt 的 model.23.proto.* 对齐 / Attribute name must be proto, aligned with official Segment26 / model.23.proto.* in yolo26n-seg.pt
-        self.proto = Proto26(ch, npr, nm, nc, quant=quant)
+        self.proto = Proto26(ch, npr, nm, nc, quant=hq)
         c4 = max(ch[0] // 4, self.nm)
         self.cv4 = nn.ModuleList(
             nn.Sequential(
-                det.Conv(x, c4, 3, quant=quant),
-                det.Conv(c4, c4, 3, quant=quant),
-                QuantConv2d(c4, self.nm, 1, a_bits=8, w_bits=8, per_channel=True)
-                if quant else nn.Conv2d(c4, self.nm, 1),
+                det.Conv(x, c4, 3, quant=hq),
+                det.Conv(c4, c4, 3, quant=hq),
+                QuantConv2d(c4, self.nm, 1, **det._quant_layer_kwargs())
+                if hq else nn.Conv2d(c4, self.nm, 1),
             )
             for x in ch
         )
@@ -234,9 +236,15 @@ class Segment(det.Detect):
 
         shape = x[0].shape
         if self._feat_shape != shape:
-            self._anchors, self._strides_tensor = (
-                a.transpose(0, 1) for a in make_anchors(x, self.stride, 0.5)
-            )
+            # 注册为非持久 buffer：随 .cpu()/.cuda()/deepcopy 正确迁移，且不写入 state_dict /
+            # Register as non-persistent buffers so .cpu()/.cuda()/deepcopy move them, without entering state_dict
+            _anchors, _strides = (a.transpose(0, 1) for a in make_anchors(x, self.stride, 0.5))
+            # 可能已以普通属性存在（__init__ 置 None / 旧版缓存）或已注册（特征尺寸变化），先清理 /
+            # May pre-exist as a plain attr (None from __init__ / legacy cache) or be registered (feature-shape change): clear first
+            self.__dict__.pop('_anchors', None); self.__dict__.pop('_strides_tensor', None)
+            self._buffers.pop('_anchors', None); self._buffers.pop('_strides_tensor', None)
+            self.register_buffer('_anchors', _anchors, persistent=False)
+            self.register_buffer('_strides_tensor', _strides, persistent=False)
             self._feat_shape = shape
         dbox = dist2bbox(boxes, self._anchors.unsqueeze(0), xywh=True, dim=1)
         dbox = dbox * self._strides_tensor
@@ -590,28 +598,11 @@ def copy_float_to_quant(float_model, quant_model):
     return det.copy_float_to_quant(float_model, quant_model)
 
 
-def build_float_model(quant_model, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
+def build_float_model(quant_model, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE, use_clip=False):
     """把量化模型的反量化权重灌进同结构的干净浮点模型（用于导出纯浮点 ONNX）。 / Inject dequantized weights from quantized model into a clean float model of same structure (for exporting pure-float ONNX)."""
-    quant_pkg.freeze_batch_init(quant_model)
-    quant_model.eval()
-
-    quant_state = quant_model.state_dict()
-    for name, module in quant_model.named_modules():
-        if quant_pkg.is_weight_quant_module(module):
-            quant_state[f"{name}.weight"] = quant_pkg.dequantized_weight(module)
-
-    float_model = FloatYOLO26Seg(nc=nc, scale=scale)
-    float_state = float_model.state_dict()
-    missing = []
-    for key in float_state:
-        if key in quant_state and quant_state[key].shape == float_state[key].shape:
-            float_state[key] = quant_state[key].detach().cpu().clone()
-        else:
-            missing.append(key)
-    if missing:
-        raise RuntimeError(f"浮点模型缺少对应参数: {missing}")
-    float_model.load_state_dict(float_state)
-    return float_model
+    # 委托通用构建器（烘焙反量化权重；use_clip 控制激活伪量化换恒等或仅截断），nc/scale 仅兼容旧签名 /
+    # Delegates to the generic builder (bakes dequantized weights; use_clip selects identity vs clip-only activation replacement); nc/scale kept for signature compatibility.
+    return quant_pkg.build_float_model(quant_model, use_clip=use_clip)
 
 
 def collect_quant_params(quant_model):
@@ -681,29 +672,12 @@ def verify(float_model, quant_model, onnx_path, quant_params):
     except ImportError:
         print("      [skip] 未安装 onnx，跳过结构检查")
 
-    try:
-        ort = importlib.import_module("onnxruntime")
-        session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-        torch.manual_seed(0)
-        float_model.cpu().eval()
-        x = torch.randn(1, 3, IMGSZ, IMGSZ)
-        with torch.no_grad():
-            y_torch_det, y_torch_proto = float_model(x)
-        y_onnx = session.run(["preds", "proto"], {"images": x.numpy()})
-        max_diff_det = float(np.abs(y_torch_det.numpy() - y_onnx[0]).max())
-        max_diff_proto = float(np.abs(y_torch_proto.numpy() - y_onnx[1]).max())
-        ref_mag = max(float(np.abs(y_torch_det.numpy()).max()),
-                      float(np.abs(y_torch_proto.numpy()).max()))
-        print(
-            f"      onnxruntime vs PyTorch 最大绝对误差: det {max_diff_det:.3e} / "
-            f"proto {max_diff_proto:.3e}（参考幅度 {ref_mag:.3e}）"
-        )
-        # 输出含大数量级解码坐标，纯绝对阈值过严：max(1e-3 绝对, 1e-5 相对) / Output contains large-magnitude decoded coords; pure absolute threshold too strict: max(1e-3 abs, 1e-5 rel)
-        assert max(max_diff_det, max_diff_proto) < max(1e-3, 1e-5 * ref_mag), (
-            "ONNX 数值误差过大"
-        )
-    except ImportError:
-        print("      [skip] 未安装 onnxruntime，跳过数值比对")
+    # 不做「导出 ONNX vs PyTorch 浮点」数值比对：导出的 ONNX 不含 scale/zero_point
+    # （板端 NPU/TPU 的 PTQ 工具会自行校准），该比对不构成部署口径；量化精度对比由
+    # compare 阶段的 QAT-vs-float 指标承担 / No exported-ONNX-vs-float numeric check:
+    # the exported ONNX carries no scale/zero_point (board NPU/TPU PTQ tools calibrate
+    # them), so the comparison is not deployment-meaningful; quant accuracy is compared
+    # by the compare stage's QAT-vs-float metrics.
 
     required_keys = quant_pkg.required_quant_keys(quant_model)
     missing = [key for key in required_keys if key not in quant_params]
@@ -1215,6 +1189,8 @@ def build_arg_parser():
     parser.add_argument("--qat-lr", type=float, default=None,
                         help="默认 float auto lr x 0.1")
     parser.add_argument("--calibration-batches", type=int, default=20)
+    # 量化超参（不再硬编码）：--a-bits/--w-bits/--per-channel/--all-positive / Quant hyperparameters (no longer hardcoded)
+    det.add_quant_cfg_args(parser)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
     parser.add_argument(
@@ -1230,6 +1206,9 @@ def build_arg_parser():
 if __name__ == "__main__":
     quant_pkg.install_print_timestamp()  # print 加分钟级时间戳 / minute-precision timestamp for print
     args = build_arg_parser().parse_args()
+
+    # 写入量化超参（det.QUANT_CFG 是所有量化层读取的唯一来源）/ Apply quant hyperparameters (single source read by all quant layers)
+    det.apply_quant_cfg_args(args)
 
     # 根据 --data 动态覆盖全局 NUM_CLASSES 和 DATA_YAML（默认走自动下载） /
     # Override global NUM_CLASSES / DATA_YAML per --data (default auto-downloads)

@@ -66,12 +66,13 @@ MODEL_DIR = _MODEL_DIR_BASE
 
 
 def _model_dir_for(scale=None, quant_method=None):
-    """按网络名 + 尺度 + 量化后端返回产物目录。 / Return the artifact directory by network name + scale + quantization backend."""
+    """按网络名 + 尺度 + 量化后端(+非默认量化配置标签)返回产物目录 /
+    Return artifact directory by net name + scale + quant backend (+ non-default quant config tag)."""
     path = _MODEL_DIR_BASE
     if scale is not None:
         path = os.path.join(path, scale)
     if quant_method is not None:
-        path = os.path.join(path, quant_method)
+        path = os.path.join(path, quant_method + det._quant_cfg_tag())
     os.makedirs(path, exist_ok=True)
     return path
 ULTRA_DIR = os.path.join(BASE_DIR, "ultralytics", "ultralytics")
@@ -136,12 +137,14 @@ class Classify(nn.Module):
 
     def __init__(self, c1=256, c2=NUM_CLASSES, c_=CLS_HIDDEN, quant=False):
         super().__init__()
-        self.conv = det.Conv(c1, c_, k=1, quant=quant)
+        # 混合量化时分类头保持 FP32 / Under mixed quant the classification head stays FP32
+        hq = quant and not det.QUANT_CFG.mixed_quant
+        self.conv = det.Conv(c1, c_, k=1, quant=hq)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.drop = nn.Dropout(p=0.0, inplace=True)
         self.linear = (
-            QuantLinear(c_, c2, a_bits=8, w_bits=8, per_channel=True)
-            if quant else nn.Linear(c_, c2)
+            QuantLinear(c_, c2, **det._quant_layer_kwargs())
+            if hq else nn.Linear(c_, c2)
         )
 
     def forward(self, x):
@@ -180,7 +183,9 @@ class YOLO26Cls(nn.Module):
         layers = []
 
         # ---------------- backbone（与 yolo26-cls.yaml 对齐，无 SPPF） / backbone (aligned with yolo26-cls.yaml, no SPPF) ----------------
-        layers += [det._tag(det.Conv(3, C(64), 3, 2, quant=quant), 0, -1)]               # P1/2
+        # 混合量化：首层 stem（3→64）保持 FP32 / Mixed quant: stem (3→64) stays FP32
+        stem_quant = quant and not det.QUANT_CFG.mixed_quant
+        layers += [det._tag(det.Conv(3, C(64), 3, 2, quant=stem_quant), 0, -1)]               # P1/2
         layers += [det._tag(det.Conv(C(64), C(128), 3, 2, quant=quant), 1, -1)]          # P2/4
         layers += [det._tag(det.C3k2(C(128), C(256), n=N(2), c3k=c3k_all, e=0.25, quant=quant), 2, -1)]
         layers += [det._tag(det.Conv(C(256), C(256), 3, 2, quant=quant), 3, -1)]         # P3/8
@@ -388,28 +393,11 @@ def copy_float_to_quant(float_model, quant_model):
     return det.copy_float_to_quant(float_model, quant_model)
 
 
-def build_float_model(quant_model, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE):
+def build_float_model(quant_model, nc=NUM_CLASSES, scale=det.DEFAULT_SCALE, use_clip=False):
     """把量化模型的反量化权重灌进同结构的干净浮点模型（用于导出纯浮点 ONNX）。 / Pour dequantized weights from quantized model into a clean float model of the same structure (for exporting pure float ONNX)."""
-    quant_pkg.freeze_batch_init(quant_model)
-    quant_model.eval()
-
-    quant_state = quant_model.state_dict()
-    for name, module in quant_model.named_modules():
-        if quant_pkg.is_weight_quant_module(module):
-            quant_state[f"{name}.weight"] = quant_pkg.dequantized_weight(module)
-
-    float_model = FloatYOLO26Cls(nc=nc, scale=scale)
-    float_state = float_model.state_dict()
-    missing = []
-    for key in float_state:
-        if key in quant_state and quant_state[key].shape == float_state[key].shape:
-            float_state[key] = quant_state[key].detach().cpu().clone()
-        else:
-            missing.append(key)
-    if missing:
-        raise RuntimeError(f"浮点模型缺少对应参数: {missing}")
-    float_model.load_state_dict(float_state)
-    return float_model
+    # 委托通用构建器（烘焙反量化权重；use_clip 控制激活伪量化换恒等或仅截断），nc/scale 仅兼容旧签名 /
+    # Delegates to the generic builder (bakes dequantized weights; use_clip selects identity vs clip-only activation replacement); nc/scale kept for signature compatibility.
+    return quant_pkg.build_float_model(quant_model, use_clip=use_clip)
 
 
 def collect_quant_params(quant_model):
@@ -480,22 +468,12 @@ def verify(float_model, quant_model, onnx_path, quant_params):
     except ImportError:
         print("      [skip] 未安装 onnx，跳过结构检查")
 
-    try:
-        ort = importlib.import_module("onnxruntime")
-        session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-        torch.manual_seed(0)
-        float_model.cpu().eval()
-        x = torch.randn(1, 3, IMGSZ, IMGSZ)
-        with torch.no_grad():
-            y_torch = float_model(x)
-        y_onnx = session.run(["preds"], {"images": x.numpy()})[0]
-        max_diff = float(np.abs(y_torch.numpy() - y_onnx).max())
-        ref_mag = float(np.abs(y_torch.numpy()).max())
-        print(f"      onnxruntime vs PyTorch 最大绝对误差: preds {max_diff:.3e}（参考幅度 {ref_mag:.3e}）")
-        # 输出含大数量级解码坐标，纯绝对阈值过严：max(1e-3 绝对, 1e-5 相对) / Outputs contain large magnitude decoded coordinates, pure absolute threshold too strict: max(1e-3 absolute, 1e-5 relative)
-        assert max_diff < max(1e-3, 1e-5 * ref_mag), "ONNX 数值误差过大"
-    except ImportError:
-        print("      [skip] 未安装 onnxruntime，跳过数值比对")
+    # 不做「导出 ONNX vs PyTorch 浮点」数值比对：导出的 ONNX 不含 scale/zero_point
+    # （板端 NPU/TPU 的 PTQ 工具会自行校准），该比对不构成部署口径；量化精度对比由
+    # compare 阶段的 QAT-vs-float 指标承担 / No exported-ONNX-vs-float numeric check:
+    # the exported ONNX carries no scale/zero_point (board NPU/TPU PTQ tools calibrate
+    # them), so the comparison is not deployment-meaningful; quant accuracy is compared
+    # by the compare stage's QAT-vs-float metrics.
 
     required_keys = quant_pkg.required_quant_keys(quant_model)
     missing = [key for key in required_keys if key not in quant_params]
@@ -907,6 +885,8 @@ def build_arg_parser():
     parser.add_argument("--float-lr", type=float, default=1e-3)
     parser.add_argument("--qat-lr", type=float, default=1e-4)
     parser.add_argument("--calibration-batches", type=int, default=20)
+    # 量化超参（不再硬编码）：--a-bits/--w-bits/--per-channel/--all-positive/--mixed-quant / Quant hyperparameters (no longer hardcoded)
+    det.add_quant_cfg_args(parser)
     parser.add_argument("--max-train-batches", type=int, default=None)
     parser.add_argument("--max-eval-batches", type=int, default=None)
     parser.add_argument(
@@ -922,6 +902,9 @@ def build_arg_parser():
 if __name__ == "__main__":
     quant_pkg.install_print_timestamp()  # print 加分钟级时间戳 / minute-precision timestamp for print
     args = build_arg_parser().parse_args()
+
+    # 写入量化超参（det.QUANT_CFG 是所有量化层读取的唯一来源）/ Apply quant hyperparameters (single source read by all quant layers)
+    det.apply_quant_cfg_args(args)
 
     # 根据 --data 动态覆盖全局 DATASET / NUM_CLASSES / Dynamically override global DATASET / NUM_CLASSES based on --data
     DATASET = args.data

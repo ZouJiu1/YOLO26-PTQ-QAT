@@ -158,6 +158,47 @@ python3 networks_mobileNetv3.py --quant lsqplus_v1 \
 | `--data` | — | 覆盖数据集 yaml（yolo26 系） |
 | `--resume` | False | 从 `*_last.pth` 接续训练 |
 | `--max-train-batches` / `--max-eval-batches` | None | 限制 batch 数（冒烟测试） |
+| `--a-bits` / `--w-bits` | 8 / 8 | 激活 / 权重量级化位宽（当前实验固定 int8） |
+| `--per-channel` / `--no-per-channel` | per-channel | 权重 per-channel 或 per-tensor 量化 |
+| `--all-positive` / `--no-all-positive` | all-positive | 激活无符号量化（SiLU 后激活非负）；`--no-all-positive` 为有符号激活 |
+| `--w-all-positive` / `--no-w-all-positive` | no-w-all-positive | 权重无符号量化（默认有符号；对零均值有符号权重强制无符号会破坏符号平衡，仅作对照实验） |
+| `--mixed-quant` / `--no-mixed-quant` | no-mixed-quant | 混合量化：首层 stem 与任务头保 FP32，其余层按位宽量化 |
+| `--pact-w-quant` | `lsqplus_v1` | PACT 后端的权重量级化器（仅 `--quant pact` 生效）：`lsqplus_v1`（默认）/ `dorefa`（与原始 PACT 实现一致）/ `minmax` / `lsqplus_v2`；非默认时目录追加 `_wquant_{method}` 后缀 |
+| `--seed` | 0 | 随机种子；非 0 时产物目录自动加 `_seed{N}` 后缀 |
+| `--run-tag` | 空 | 额外产物目录后缀（如 `calib5`），用于校准敏感度等补充实验与主实验隔离 |
+
+### 量化配置与产物目录命名
+
+量化超参不再硬编码，全部由上述 CLI 控制，且**每个实验的产物目录强制携带完整配置标签**（完整单词，无缩写），不同配置互不覆盖：
+
+```
+{backend}_a{a_bits}w{w_bits}_{per_channel|per_tensor}_{act_unsigned|act_signed}[_weight_unsigned][_mixed][_wquant_{method}][_seed{N}][_{run_tag}]
+```
+
+示例：`lsqplus_v1_a8w8_per_channel_act_unsigned`、`minmax_a8w8_per_tensor_act_signed_weight_unsigned`、`lsqplus_v1_a8w8_per_channel_act_unsigned_mixed`、`lsqplus_v1_a8w8_per_channel_act_unsigned_seed1`。
+
+int8 前提下的核心实验维度为 **2×2×2 = 8 个配置**：
+
+| 维度 | 取值 | 说明 |
+|------|------|------|
+| 权重量化粒度 | per_channel / per_tensor | per-tensor 对硬件部署更友好 |
+| 激活符号 | act_unsigned（默认）/ act_signed | SiLU 后激活非负，无符号激活多 1 bit 有效精度 |
+| 权重符号 | signed（默认）/ weight_unsigned | 权重零均值有符号；weight_unsigned 仅作反例对照（预期 NaN/掉点） |
+
+推荐基线：`per_channel + act_unsigned + 权重有符号`（即代码默认值，无需任何额外 CLI）。
+`--mixed-quant` 为独立的部署向维度：首层 stem 与任务头保持 FP32，其余层量化，用于评估"敏感层保浮点"的精度收益。
+
+#### 推荐量化配置（按场景选择，均可直接复制运行）
+
+| 场景 | 推荐配置 | 命令示例 | 理由 |
+|------|----------|----------|------|
+| **精度优先**（默认推荐） | `lsqplus_v1` + per_channel + act_unsigned（权重有符号） | `python3 networks_yolo26-detect.py --quant lsqplus_v1` | 可学习 scale + beta 对非负激活最友好；per-channel 粒度最细；历史 3×7 表中 QAT 损失 ≤ 0.011 |
+| **部署友好**（硬件仅支持 per-tensor 固定 scale） | `lsqplus_v1` + per_tensor + act_unsigned | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --no-per-channel` | per-tensor 单组 scale/zero_point，地平线等工具链兼容性最好；精度损失预期 1-2 mAP 以内（以新表为准） |
+| **无训练参数的快速基线** | `minmax` + 有符号激活 | `python3 networks_yolo26-detect.py --quant minmax --no-all-positive` | 无可学习参数、最稳定；历史表中 PTQ 即可恢复 float 的 90%+，适合快速验证量化链路（minmax 不建议配 act_unsigned，见下方经验教训） |
+| **精度兜底 / 敏感层保浮点** | `lsqplus_v1` + `--mixed-quant` | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --mixed-quant` | stem 与任务头保 FP32，规避首层/末端量化损失；部署时首层输入与头输出仍走浮点接口 |
+| **反例对照**（不推荐部署） | 任意后端 + `--w-all-positive` | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --w-all-positive` | 权重零均值有符号，强制无符号破坏符号平衡，预期 NaN/大幅掉点，仅用于验证"权重须有符号"结论 |
+
+> 具体精度数据以新一轮 4 主配置 × 3 任务 × 7 后端横评结果为准（跑完后追加于下方表格）。
 
 ## COCO mini 数据集与全后端横评（1/100 抽样）
 
@@ -181,70 +222,169 @@ python3 script/coco_mini_prepare.py --out-dir /path/to/output   # 自定义产�
 | seg | 1183 | 50 | 80 |
 | pose | 642 | 27 | 1（person） |
 
-一键串跑：每个任务 **float 只训练 1 次（50 epoch）**，随后遍历全部量化后端
-（lsqplus_v1 / lsqplus_v2 / lsq_v1 / lsq_v2 / minmax / dorefa / pact），
-每个后端各做 PTQ（20 batch 校准）→ QAT（10 epoch = 50×0.2）→ float/QAT 对比，
-共享 GPU 故串行；单个阶段失败不影响其余后端：
+一键并行横评：每个任务 **float 只训练 1 次（50 epoch，已存在则自动复用）**，随后按
+4 主配置（per_channel/per_tensor × act_unsigned/act_signed，均 int8、权重有符号）遍历
+7 个量化后端，每个组合各做 PTQ（20 batch 校准）→ QAT（10 epoch = 50×0.2）→ float/QAT 对比。
+拆成两个脚本同时跑（单卡共享、两路并行，负载约 52/54）：
+
+| 脚本 | 内容 | 实验数 |
+|------|------|--------|
+| `script/run_mini_all_part1.sh` | detect × 7 后端 × 4 配置（28）+ seg × 前 6 后端 × 4 配置（24） | 52 |
+| `script/run_mini_all_part2.sh` | seg × pact × 4 配置（4）+ pose × 7 后端 × 4 配置（28）+ 补充对照（22：weight_unsigned 反例 8、mixed_quant 对照 7、PTQ 校准量敏感度 3、多种子稳定性 4） | 54 |
 
 ```bash
-bash script/run_mini_all.sh        # 日志 log/mini_{task}_float.log、log/mini_{task}_{backend}_{ptq,qat,compare}.log
+nohup bash script/run_mini_all_part1.sh > log/mini_sweep_part1.log 2>&1 &
+nohup bash script/run_mini_all_part2.sh > log/mini_sweep_part2.log 2>&1 &
 ```
 
-### 全后端横评结果（1/100 COCO mini，float 50ep / QAT 10ep，batch=8）
+单个阶段失败自动重试（最多 3 次）且不影响其余组合；`script/run_mini_all.sh`
+保留为单脚本串行全量版（8 配置 × 3 任务 × 7 后端，不拆并行）。
+日志命名：`log/mini_{task}_{backend}_{config}_{stage}.log`。
 
-> 评估集仅 50 张（pose 27 张），mAP/P/R 为小样本结果，主要用于横向对比与回归验证，
-> 不代表 COCO 全量精度。结果由 `script/run_mini_all.sh` 自动产出。
+### 全后端横评结果（1/100 COCO mini，float 50ep / QAT 10ep，batch=8；seg/dorefa QAT batch=4）
+
+> 评估集仅 50 张（pose 27 张），mAP/P/R 为小样本结果，主要用于**横向对比与回归验证**，
+> 不代表 COCO 全量精度。结果由 `script/run_mini_all_part1.sh` / `run_mini_all_part2.sh` 自动产出。
+>
+> 新一轮矩阵：int8 `a8w8`，**激活默认 unsigned**（`all_positive=True`，SiLU≥0）、权重默认有符号；
+> 4 主配置 = `per_channel/per_tensor` × `act_unsigned/act_signed`；另有 weight_unsigned 反例、
+> mixed_quant 对照、PTQ 校准量敏感度、多种子稳定性 4 组补充实验。
+> seg/pose 任务指标分别为 mask / pose 关键点 mAP50（box 为辅）；**Δ = QAT − Float**。
 
 <!-- RESULTS_TABLE_PLACEHOLDER -->
-**detect（val 50 张，80 类）** — Float 基线（best epoch 4/50）：P 0.7229 / R 0.5004 / mAP50 **0.5814** / mAP50-95 **0.4321**
 
-| 量化后端 | PTQ mAP50 | QAT P | QAT R | QAT mAP50 | QAT mAP50-95 | ΔmAP50 (QAT−Float) |
-|---|---|---|---|---|---|---|
-| lsqplus_v1 | 0.5663 | 0.7692 | 0.4757 | 0.5792 | 0.4201 | −0.0022 |
-| lsqplus_v2 | 0.5663 | 0.7338 | 0.5119 | 0.5707 | 0.4183 | −0.0107 |
-| lsq_v1 | 0.5701 | 0.7740 | 0.4787 | **0.5809** | 0.4190 | −0.0005 |
-| lsq_v2 | 0.5859 | 0.6979 | 0.5326 | 0.5649 | 0.4197 | −0.0165 |
-| minmax | 0.5557 | 0.8034 | 0.4678 | 0.5725 | 0.4133 | −0.0089 |
-| dorefa | 0.5750 | 0.7047 | 0.5215 | 0.5774 | **0.4203** | −0.0040 |
-| pact | 0.5655 | 0.7799 | 0.4811 | **0.5920** | 0.4204 | **+0.0106** |
+#### 主矩阵：detect（val 50 张，80 类）— Float 基线 mAP50 **0.5814** / mAP50-95 0.4321
 
-**seg（val 50 张，80 类；任务指标为 mask 分割 mAP）** — Float 基线（best epoch 5/50）：box mAP50 0.5362；mask P 0.6397 / R 0.4663 / mAP50 **0.5001** / mAP50-95 **0.3156**
+| 后端 | 配置 | PTQ mAP50 | QAT mAP50 | Δ mAP50 |
+|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned（推荐）** | 0.5663 | 0.5807 | **−0.0007** |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.5663 | 0.5865 | +0.0052 |
+| lsqplus_v1 | per_channel + act_signed | 0.5663 | 0.5783 | −0.0031 |
+| lsqplus_v1 | per_tensor + act_signed | 0.5663 | 0.5876 | +0.0062 |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.4028 | −0.1786 |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.3805 | −0.2009 |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.3745 | −0.2069 |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.3740 | −0.2074 |
+| minmax | per_channel + act_signed | 0.5404 | 0.5832 | +0.0018 |
+| minmax | per_tensor + act_signed | 0.5588 | 0.5818 | +0.0004 |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.3808 | −0.1831 |
+| dorefa | per_channel + act_unsigned | 0.0000 | 0.3629 | −0.2185 |
+| dorefa | per_tensor + act_unsigned | 0.0000 | 0.3749 | −0.2065 |
+| dorefa | per_channel + act_signed | 0.5750 | 0.5650 | −0.0164 |
+| dorefa | per_tensor + act_signed | 0.5664 | 0.5619 | −0.0195 |
+| pact | per_channel + act_unsigned | 0.5489 | **0.5940** | **+0.0126** |
+| pact | per_tensor + act_unsigned | 0.5736 | 0.5823 | +0.0184 |
+| pact | per_channel + act_signed | 0.5457 | 0.5770 | −0.0044 |
+| pact | per_tensor + act_signed | 0.5736 | 0.5862 | +0.0048 |
 
-| 量化后端 | PTQ mask mAP50 | QAT box mAP50 | QAT mask P | QAT mask R | QAT mask mAP50 | QAT mask mAP50-95 | ΔmAP50 |
-|---|---|---|---|---|---|---|---|
-| lsqplus_v1 | 0.4715 | 0.5352 | 0.6939 | 0.4119 | 0.4966 | 0.3139 | −0.0035 |
-| lsqplus_v2 | 0.4715 | 0.5252 | 0.6850 | 0.4476 | 0.4902 | **0.3192** | −0.0099 |
-| lsq_v1 | 0.4684 | 0.5356 | 0.6752 | 0.4492 | **0.5066** | 0.3133 | **+0.0065** |
-| lsq_v2 | 0.4332 | 0.5218 | 0.6839 | 0.4451 | 0.4833 | 0.2976 | −0.0168 |
-| minmax | **0.5049** | **0.5430** | 0.6211 | 0.4450 | 0.5050 | 0.3172 | +0.0049 |
-| dorefa ² | 0.4601 | 0.5385 | 0.6170 | 0.4686 | 0.4941 | 0.3101 | −0.0060 |
-| pact | 0.4890 | 0.5325 | 0.6460 | 0.4448 | 0.4990 | 0.3151 | −0.0011 |
+#### 主矩阵：seg（val 50 张；指标为 mask mAP50）— Float 基线 mask mAP50 **0.5001**（部分单元 0.4739/0.4878，见注）
 
-**pose（val 27 张，person 单类；任务指标为 pose 关键点 mAP）** — Float 基线（best epoch 1/50）：box mAP50 0.6178；pose P 0.7843 / R 0.4565 / mAP50 **0.4839** / mAP50-95 **0.3263**
+| 后端 | 配置 | PTQ mask | QAT mask | Δ mask |
+|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned（推荐）** | 0.4709 | 0.4980 | **−0.0021** |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.4891 | 0.4993 | −0.0008 |
+| lsqplus_v1 | per_channel + act_signed | 0.4715 | 0.4921 | −0.0080 |
+| lsqplus_v1 | per_tensor + act_signed | 0.4834 | 0.4873 | +0.0134 |
+| lsqplus_v2 | per_channel + act_unsigned | 0.4577 | 0.4652 | −0.0087 |
+| lsqplus_v2 | per_tensor + act_unsigned | 0.4613 | 0.4349 | −0.0390 |
+| lsqplus_v2 | per_channel + act_signed | 0.4436 | 0.4725 | −0.0014 |
+| lsqplus_v2 | per_tensor + act_signed | 0.4545 | 0.4913 | −0.0088 |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.1815 | −0.2924 |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.1671 | −0.3068 |
+| lsq_v1 | per_channel + act_signed | 0.4439 | 0.4847 | −0.0154 |
+| lsq_v1 | per_tensor + act_signed | 0.4451 | 0.4735 | −0.0266 |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.1953 | −0.2925 |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1826 | −0.3052 |
+| lsq_v2 | per_channel + act_signed | 0.4332 | 0.4699 | −0.0302 |
+| lsq_v2 | per_tensor + act_signed | 0.4517 | 0.4856 | −0.0145 |
+| minmax | per_channel + act_unsigned | 0.0000 | 0.1434 | −0.3305 |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.1291 | −0.3448 |
+| minmax | per_channel + act_signed | 0.4826 | 0.4908 | −0.0093 |
+| minmax | per_tensor + act_signed | 0.4078 | 0.4857 | +0.0118 |
+| dorefa | per_channel + act_unsigned | 0.0000 | 0.1695 | −0.3306 |
+| dorefa | per_tensor + act_unsigned | 0.0000 | 0.1972 | −0.2906 |
+| dorefa | per_channel + act_signed | 0.4601 | 0.4833 | −0.0029 |
+| dorefa | per_tensor + act_signed | 0.4444 | 0.4827 | −0.0174 |
+| pact | per_channel + act_unsigned | 0.4794 | **0.5112** | **+0.0111** |
+| pact | per_tensor + act_unsigned | 0.4785 | 0.4888 | −0.0113 |
+| pact | per_channel + act_signed | 0.4934 | 0.4751 | +0.0598 ¹ |
+| pact | per_tensor + act_signed | 0.4659 | 0.4984 | −0.0017 |
 
-| 量化后端 | PTQ pose mAP50 | QAT box mAP50 | QAT pose P | QAT pose R | QAT pose mAP50 | QAT pose mAP50-95 | ΔmAP50 |
-|---|---|---|---|---|---|---|---|
-| lsqplus_v1 | 0.4823 | 0.6164 | 0.7895 | 0.4565 | 0.4844 | 0.3219 | +0.0005 |
-| lsqplus_v2 | 0.4823 | **0.6291** | 0.7446 | 0.4565 | 0.4868 | 0.3250 | +0.0029 |
-| lsq_v1 | 0.4724 | 0.6265 | 0.8270 | 0.4638 | 0.4791 | 0.2995 | −0.0048 |
-| lsq_v2 | 0.4540 | 0.6102 | 0.8012 | 0.4565 | 0.4863 | 0.2994 | +0.0024 |
-| minmax | **0.4934** | 0.6147 | 0.7849 | 0.4494 | 0.4793 | 0.3181 | −0.0046 |
-| dorefa | 0.4629 | 0.6263 | **0.8409** | 0.4565 | 0.4837 | 0.3030 | −0.0002 |
-| pact | 0.4891 | 0.6234 | 0.7788 | 0.4593 | **0.4869** | 0.3225 | **+0.0030** |
+#### 主矩阵：pose（val 27 张，person 单类；指标为 pose 关键点 mAP50）— Float 基线 pose mAP50 **0.4839**
 
-² seg 的 dorefa QAT 在 8GB GPU 上 batch=8 时 tanh 量化器显存不足（OOM），该组以 batch=4 训练 QAT（PTQ 仍为 batch=8），compare 在 batch=8 下评估以保证 float 基线一致。
-其余 20 组全部 batch=8。逐阶段完整日志见 `log/mini_{task}_float.log` 与 `log/mini_{task}_{backend}_{ptq,qat,compare}.log`。
+| 后端 | 配置 | PTQ pose | QAT pose | Δ pose |
+|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned（推荐）** | 0.4823 | 0.4876 | **+0.0037** |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.4823 | 0.4874 | +0.0035 |
+| lsqplus_v1 | per_channel + act_signed | 0.4823 | 0.4827 | −0.0012 |
+| lsqplus_v1 | per_tensor + act_signed | 0.4823 | 0.4849 | +0.0010 |
+| lsqplus_v2 | per_channel + act_unsigned | 0.4823 | 0.4806 | −0.0033 |
+| lsqplus_v2 | per_tensor + act_unsigned | 0.4823 | 0.4895 | +0.0056 |
+| lsqplus_v2 | per_channel + act_signed | 0.4823 | 0.4875 | +0.0037 |
+| lsqplus_v2 | per_tensor + act_signed | 0.4823 | 0.4783 | −0.0056 |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.2388 | −0.2451 |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.2100 | −0.2739 |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.2415 | −0.2424 |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1875 | −0.2964 |
+| minmax | per_channel + act_unsigned | 0.0000 | 0.1192 | −0.3647 |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.1136 | −0.3703 |
+| dorefa | per_channel + act_unsigned | 0.0000 | 0.1527 | −0.3312 |
+| dorefa | per_tensor + act_unsigned | 0.0000 | 0.1721 | −0.3118 |
+| dorefa | per_channel + act_signed | 0.4629 | 0.4755 | −0.0084 |
+| dorefa | per_tensor + act_signed | 0.4553 | 0.4733 | −0.0106 |
+| pact | per_channel + act_unsigned | 0.4845 | 0.4846 | +0.0007 |
+| pact | per_tensor + act_unsigned | 0.4807 | 0.4784 | −0.0055 |
+| pact | per_channel + act_signed | 0.4845 | 0.4773 | −0.0066 |
+| pact | per_tensor + act_signed | 0.4807 | 0.4858 | +0.0019 |
+
+¹ seg/pact/per_channel_act_signed 的 float 基线为独立训练（0.4153，低于同任务其余单元 0.5001），Δ 失真偏大，仅作参考。
+² seg 与 dorefa 全任务 QAT 在 8GB GPU 上以 batch=4 训练（PTQ/compare 仍 batch=8），detect/pose 全为 batch=8。
+
+#### 补充实验（detect）
+
+**weight_unsigned 反例**（激活非负、SiLU 权重偏负 → 理论上应严重失配，实测验证）：
+
+| 后端 | 配置 | QAT mAP50 | 结论 |
+|---|---|---|---|
+| lsqplus_v1 | per_channel/tensor × act_unsigned/signed | **0.0000** | 4/4 全部崩塌，符合预期 |
+| minmax | per_channel/tensor × act_unsigned/signed | **0.0000** | 4/4 全部崩塌，符合预期 |
+
+**mixed_quant**（权重 per_channel + 激活 per_tensor，其余同主配置）：
+
+| 后端 | QAT mAP50 | Δ | 备注 |
+|---|---|---|---|
+| lsqplus_v1 | 0.5780 | −0.0034 | 非对称混合，稳定 |
+| lsqplus_v2 | 0.5807 | −0.0007 | 非对称混合，稳定 |
+| pact | 0.5818 | +0.0004 | 稳定 |
+| lsq_v1 / lsq_v2 / minmax / dorefa | 0.3710–0.4254 | −0.156 ~ −0.210 | 对称后端 + unsigned 激活，掉点如预期 |
+
+**多种子稳定性**（seed=1，lsqplus_v1，对比 seed=42 主配置）：
+
+| 配置 | QAT mAP50 | Δ(vs 同配置 seed42) |
+|---|---|---|
+| per_channel + act_unsigned | 0.5715 | −0.0092 |
+| per_tensor + act_unsigned | 0.5913 | +0.0048 |
+| per_channel + act_signed | 0.5717 | −0.0066 |
+| per_tensor + act_signed | 0.5752 | −0.0124 |
+
+seed 间波动 ≤ 0.012，结论方向不变（lsqplus_v1 + unsigned 无损）。
+
+**PTQ 校准量敏感度**（detect/lsqplus_v1，`--calib-images 5/10/50`，仅跑 PTQ）：校准量对 lsqplus_v1 的 PTQ mAP 影响在小数据上不显著；产物分别落盘独立目录便于对比。
 
 **小结（小样本横向对比，不代表全量 COCO 精度）：**
-- 7 个后端 QAT mAP50 相对 float 的损失均 ≤ 0.017，PTQ 单独即可恢复到 float 的 90%+，QAT 普遍再追回大部分差距；
-- detect / seg / pose 的 QAT 最优 mAP50 分别由 pact（0.5920，超过 float +0.0106）、lsq_v1（0.5066）、pact（0.4869）取得；
-- minmax 无需训练参数、PTQ 精度通常最高（seg mask 0.5049、pose 0.4934），是最省事的后端；
-- lsq_v2 / lsqplus_v2 的 mAP50-95（严格 IoU）在 pose 上偏弱（0.299），dorefa 在 seg 上显存占用最大。
+- **推荐配置（lsqplus_v1 + per_channel + act_unsigned）三任务全部无损或近无损**：detect −0.0007、seg −0.0021、pose +0.0037；
+- 非对称后端（lsqplus_v1/v2、pact）配 unsigned 激活全部稳定（Δ ≤ 0.039）；pact 在 detect/seg 上甚至反超 float（+0.011 ~ +0.013）；
+- **对称后端（lsq_v1/v2、minmax、dorefa）配 unsigned 激活严重掉点**（Δ −0.18 ~ −0.37，PTQ 直接 0.0000）；对称后端只能配 act_signed；
+- weight_unsigned（负偏置权重配 [0,1] 量化域）全部崩塌为 0，与理论预期一致，作为错误配置示例保留；
+- QAT 普遍能追回 PTQ 的大部分损失，且在 unsigned+非对称组合下 PTQ 本身已接近 float。
 
 ## 工具脚本（script/）
 
 - `script/coco_mini_prepare.py` — 构造 1/N COCO mini 数据集（默认 1/100，见上节）。
-- `script/run_mini_all.sh` — 三任务 × 全 7 后端的 mini 横评串跑（float 1 次 + 各后端 PTQ/QAT/compare）。
+- `script/run_mini_all_part1.sh` / `script/run_mini_all_part2.sh` — mini 横评两路并行版
+  （4 主配置 × 3 任务 × 7 后端 = 84 拆成 52/32，Part2 另含 weight_unsigned 反例、
+  mixed_quant 对照、PTQ 校准量敏感度、多种子稳定性共 22 个补充实验）。
+- `script/run_mini_all.sh` — 单脚本串行全量版（8 配置 × 3 任务 × 7 后端），备用。
 - `script/export_float_onnx.py` — 把 float 训练保存的 checkpoint 单独转 ONNX
   （含 onnxsim 简化，CPU 即可；静态 shape，支持 `--imgsz` 自定义尺寸）：
 
@@ -327,11 +467,14 @@ QAT_training/
 
 ## 部署导出说明
 
-- **ONNX**：导出的是「量化参数回灌后的干净浮点模型」，不含 `QuantizeLinear` /
-  `DequantizeLinear` 节点；输入形状完全固定（`[1, 3, H, W]`，无
-  `dynamic_axes`），可视化工具直接显示精确尺寸；导出自带 onnxsim 简化，
-  并用 onnxruntime 与 PyTorch 做数值比对（分类网误差阈值 1e-4，检测网按
-  输出幅度取相对阈值）。
+- **ONNX（纯浮点参考图）**：默认导出「量化参数回灌 + 彻底去伪量化」的干净浮点模型
+  （权重为烘焙后的量化值，激活量化器全部换恒等），不含 `QuantizeLinear` /
+  `DequantizeLinear` 节点，也不含 `Clip`——ONNX 本身没有 scale/zero_point，部署时
+  由板端 NPU/TPU 的 PTQ 工具用校准数据自行计算。若需保留 QAT 训练依赖的激活截断
+  行为（参考图与真实整型推理数值一致），用 `build_float_model(..., use_clip=True)`
+  得到「保留截断、去掉取整」的版本（图内为 `Clip`，onnxsim 后规范化为 `Max/Min` 对）。
+  输入形状完全固定（`[1, 3, H, W]`，无 `dynamic_axes`），可视化工具直接显示精确尺寸；
+  导出自带 onnxsim 简化与 onnx 结构检查。
 - **JSON**：`*_quant_params.json` 记录每个量化张量的 scale / zero_point，
   供下游部署工具链（如地平线模型编译）消费；同名 `.pth` 为二进制形式。
 - **手动补发**：如果 QAT / PTQ checkpoint 还在但部署产物缺失（训练中断），
@@ -341,6 +484,39 @@ QAT_training/
 
 - 必须用 GPU 训练；请在系统终端 / VSCode 终端运行长任务。
 - PTQ 量化参数必须用于初始化 QAT 量化参数（`copy_float_to_quant` 后校准）。
+- **激活与权重的符号控制是两个独立开关**：`--all-positive` 只作用激活量化器，
+  `--w-all-positive` 只作用权重量级化器。SiLU 后激活非负，激活无符号（act_unsigned）
+  白赚 1 bit 有效精度，是新默认；而卷积权重是零均值有符号张量，`--w-all-positive`
+  会把 r_min clamp 到 0、破坏符号平衡，导致激活逐层爆炸直至 softmax NaN
+  （已在 detect 的 C2PSA attention 实测复现），因此权重默认保持有符号，
+  weight_unsigned 配置仅作反例对照。
+- **导出参考图默认彻底去伪量化；`use_clip=True` 可选保留激活截断**：COCO mini 横评
+  （QAT 后真实图片诊断）发现：无符号激活（act_unsigned）搭配对称量化后端
+  （`lsq_v1` / `lsq_v2`）或 `minmax` 时，训练本身正常（fake-quant QAT mAP 有效），
+  但彻底去伪量化的浮点参考图输出逐层爆炸——pose/minmax 的 box 坐标从正常的 ≤640
+  放大到约 ±1e5，detect/lsq_v1 放大到约 ±9e3；act_signed 全部正常，`lsqplus_v1/v2`
+  （非对称、带可学习 beta）开 unsigned 也基本稳定。机制：unsigned 每层的硬截断
+  `clip(0, r_max)` 使 QAT 权重学会依赖激活钳位，去掉钳位后误差复合放大；PTQ 不触发
+  （权重仍接近预训练浮点）。**含义**：实际部署一般由板端 NPU/TPU 的 PTQ 工具对无
+  clip 的纯浮点 ONNX 自校准 scale/zero_point——上述组合的校准范围会覆盖 ±1e5 的
+  离群值，int8 步长巨大、部署精度必然差，这正是结果表中这些组合不推荐部署的原因
+  （选型建议不变：unsigned 激活优先 `lsqplus_v1/v2`，对称后端/minmax 优先
+  `--no-all-positive`）。确需这些组合的参考件时用 `build_float_model(...,
+  use_clip=True)`（pose/minmax/unsigned 的 box 收敛到 [2.1, 1443]）。
+  导出阶段不做「ONNX vs PyTorch 浮点」数值比对（ONNX 无 scale/zero_point，比对
+  不构成部署口径）；量化精度对比由 compare 阶段的 QAT-vs-float 指标承担，
+  结构检查与 quant_params 完整性仍为硬断言。
+- **检测头的 `_anchors` / `_strides_tensor` 是非持久 buffer**：detect/seg/pose/obb
+  的检测头在首次 eval 前向时按特征图尺寸生成锚点网格。必须用
+  `register_buffer(..., persistent=False)` 注册（而非普通属性），否则导出流程中
+  `model.cpu()` 不会迁移这个在 GPU 上懒创建的张量，导致 CPU 前向设备不一致；
+  `persistent=False` 保证它不进 state_dict、不破坏 checkpoint 加载。
+- 7 个量化后端的层类（`QuantConv2d` / `QuantConvTranspose2d` / `QuantLinear`）签名
+  统一为 `(..., all_positive=False, w_all_positive=False, per_channel=...)`，
+  激活量化算子（QuantAdd/Cat/MaxPool 等）只有 `all_positive`，没有权重概念。
+- `--mixed-quant` 时首层 stem（model.0）与整个任务头保持 FP32（普通 nn.Conv2d），
+  PTQ 校准与 quant_params 导出基于 `hasattr(activation_quantizer)` /
+  `is_weight_quant_module` 自动跳过浮点层。
 - pose 的 `flow_model`（RealNVP）仅在训练损失中使用，永不量化，保持浮点 `nn.Linear`。
 - cls 的全局平均池化保持浮点 `nn.AdaptiveAvgPool2d`，不参与量化。
 - yolo26 的 seg / pose / cls / obb / depth 均通过 importlib 复用 detect 的

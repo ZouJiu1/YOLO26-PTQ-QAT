@@ -5,6 +5,35 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
 from quantization.dorefa import DorefaWeightQuantizer
+from quantization.minmax import MinMaxWeightQuantizer
+from quantization.lsqplus_quantize_V1 import LSQPlusWeightQuantizer as LSQPlusV1WeightQuantizer
+from quantization.lsqplus_quantize_V2 import LSQPlusWeightQuantizer as LSQPlusV2WeightQuantizer
+
+
+# PACT 论文中激活量化用 PACT（可学习截断阈值 alpha），权重量化器可替换。
+# 参考原始实现: https://github.com/ZouJiu1/Dorefa_Pact/blob/master/quantization/pact.py
+# / In the PACT paper, activations use PACT (learnable clipping threshold alpha)
+# / while the weight quantizer is pluggable.
+# / Reference: https://github.com/ZouJiu1/Dorefa_Pact/blob/master/quantization/pact.py
+def build_weight_quantizer(method, w_bits, all_positive=False, per_channel=False, num_channels=None):
+    """按名称构造权重量级化器 / Build weight quantizer by name.
+
+    method: 'lsqplus_v1'（默认）/ 'dorefa'（与原始 PACT 实现一致）/ 'minmax' / 'lsqplus_v2'
+    num_channels: lsqplus 系列 per-channel scale 的通道数（Conv2d=out_channels,
+        ConvTranspose2d=in_channels, Linear=out_features），其余后端忽略。
+    """
+    method = (method or 'lsqplus_v1').lower()
+    if method == 'dorefa':
+        return DorefaWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel)
+    elif method == 'minmax':
+        return MinMaxWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel)
+    elif method == 'lsqplus_v1':
+        return LSQPlusV1WeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel, num_channels=num_channels)
+    elif method == 'lsqplus_v2':
+        return LSQPlusV2WeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel, num_channels=num_channels)
+    else:
+        raise ValueError(f"未知的权重量级化方法 / unknown weight quantizer method: {method}"
+                         f"（可选 / choices: dorefa, minmax, lsqplus_v1, lsqplus_v2）")
 
 
 # ********************* quantizers（量化器，量化） *********************
@@ -87,6 +116,12 @@ class PactActivationQuantizer(nn.Module):
         q_a = quantize_pact.apply(activation, self.alpha, self.q_range, self.all_positive)
         return q_a
 
+    def clip_bounds(self):
+        """激活空间内的截断边界：无符号 (0, alpha) / 有符号 (-alpha, alpha)；导出"截断保留、舍入去除"的纯浮点参考图时使用 /
+        Clip bounds in activation space: unsigned (0, alpha) / signed (-alpha, alpha); used when exporting a clip-only (rounding-free) float reference graph."""
+        lower = torch.zeros_like(self.alpha) if self.all_positive else -self.alpha
+        return lower.detach(), self.alpha.detach()
+
 class QuantConv2d(nn.Conv2d):
     def __init__(self,
                  in_channels,
@@ -102,12 +137,14 @@ class QuantConv2d(nn.Conv2d):
                  w_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False,
+                 w_quant='lsqplus_v1'):
         super(QuantConv2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups,
                                           bias, padding_mode)
         self.quant_inference = quant_inference
         # self.activation_quantizer = PactActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
-        self.weight_quantizer = DorefaWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel)
+        self.weight_quantizer = build_weight_quantizer(w_quant, w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel, num_channels=out_channels)
 
     def forward(self, inputs):
         # quant_input = self.activation_quantizer(inputs)
@@ -138,14 +175,16 @@ class QuantConvTranspose2d(nn.ConvTranspose2d):
                  w_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False,
+                 w_quant='lsqplus_v1'):
         # 注意: ConvTranspose2d 的参数顺序为 (..., output_padding, groups, bias, dilation, padding_mode)
         # / Note: ConvTranspose2d parameter order is (..., output_padding, groups, bias, dilation, padding_mode)
         super(QuantConvTranspose2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, output_padding,
                                                    groups, bias, dilation, padding_mode)
         self.quant_inference = quant_inference
         # self.activation_quantizer = PactActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
-        self.weight_quantizer = DorefaWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel)
+        self.weight_quantizer = build_weight_quantizer(w_quant, w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel, num_channels=in_channels)
 
     def forward(self, inputs):
         # quant_input = self.activation_quantizer(inputs)
@@ -167,11 +206,13 @@ class QuantLinear(nn.Linear):
                  w_bits=8,
                  quant_inference=False,
                  all_positive=False,
-                 per_channel=False):
+                 per_channel=False,
+                 w_all_positive=False,
+                 w_quant='lsqplus_v1'):
         super(QuantLinear, self).__init__(in_features, out_features, bias)
         self.quant_inference = quant_inference
         # self.activation_quantizer = PactActivationQuantizer(a_bits=a_bits, all_positive=all_positive)
-        self.weight_quantizer = DorefaWeightQuantizer(w_bits=w_bits, all_positive=all_positive, per_channel=per_channel)
+        self.weight_quantizer = build_weight_quantizer(w_quant, w_bits=w_bits, all_positive=w_all_positive, per_channel=per_channel, num_channels=out_features)
 
     def forward(self, inputs):
         # quant_input = self.activation_quantizer(inputs)
@@ -328,7 +369,7 @@ class QuantCat(nn.Module):
 
 
 def add_quant_op(module, layer_counter, a_bits=8, w_bits=8, quant_inference=False,
-                 all_positive=False, per_channel=False):
+                 all_positive=False, per_channel=False, w_quant='lsqplus_v1'):
     for name, child in module.named_children():
         if isinstance(child, nn.Conv2d):
             layer_counter[0] += 1
@@ -338,14 +379,14 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8, quant_inference=Fals
                                              child.kernel_size, stride=child.stride,
                                              padding=child.padding, dilation=child.dilation,
                                              groups=child.groups, bias=True, padding_mode=child.padding_mode,
-                                             a_bits=a_bits, w_bits=w_bits, quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel)
+                                             a_bits=a_bits, w_bits=w_bits, quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel, w_quant=w_quant)
                     quant_conv.bias.data = child.bias
                 else:
                     quant_conv = QuantConv2d(child.in_channels, child.out_channels,
                                              child.kernel_size, stride=child.stride,
                                              padding=child.padding, dilation=child.dilation,
                                              groups=child.groups, bias=False, padding_mode=child.padding_mode,
-                                             a_bits=a_bits, w_bits=w_bits, quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel)
+                                             a_bits=a_bits, w_bits=w_bits, quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel, w_quant=w_quant)
                 quant_conv.weight.data = child.weight
                 module._modules[name] = quant_conv
         elif isinstance(child, nn.ReLU):
@@ -367,7 +408,7 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8, quant_inference=Fals
                                                                 padding_mode=child.padding_mode,
                                                                 a_bits=a_bits,
                                                                 w_bits=w_bits,
-                                                                quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel)
+                                                                quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel, w_quant=w_quant)
                     quant_conv_transpose.bias.data = child.bias
                 else:
                     quant_conv_transpose = QuantConvTranspose2d(child.in_channels,
@@ -381,7 +422,7 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8, quant_inference=Fals
                                                                 padding_mode=child.padding_mode,
                                                                 a_bits=a_bits,
                                                                 w_bits=w_bits,
-                                                                quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel)
+                                                                quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel, w_quant=w_quant)
                 quant_conv_transpose.weight.data = child.weight
                 module._modules[name] = quant_conv_transpose
         elif isinstance(child, nn.Linear):
@@ -390,25 +431,25 @@ def add_quant_op(module, layer_counter, a_bits=8, w_bits=8, quant_inference=Fals
                 if child.bias is not None:
                     quant_linear = QuantLinear(child.in_features, child.out_features,
                                                bias=True, a_bits=a_bits, w_bits=w_bits,
-                                               quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel)
+                                               quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel, w_quant=w_quant)
                     quant_linear.bias.data = child.bias
                 else:
                     quant_linear = QuantLinear(child.in_features, child.out_features,
                                                bias=False, a_bits=a_bits, w_bits=w_bits,
-                                               quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel)
+                                               quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel, w_quant=w_quant)
                 quant_linear.weight.data = child.weight
                 module._modules[name] = quant_linear
         else:
             add_quant_op(child, layer_counter, a_bits=a_bits, w_bits=w_bits,
-                         quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel)
+                         quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel, w_quant=w_quant)
 
 def prepare(model, inplace=False, a_bits=8, w_bits=8, quant_inference=False,
-            all_positive=False, per_channel=False):
+            all_positive=False, per_channel=False, w_quant='lsqplus_v1'):
     if not inplace:
         model = copy.deepcopy(model)
     layer_counter = [0]
     add_quant_op(model, layer_counter, a_bits=a_bits, w_bits=w_bits,
-                 quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel)
+                 quant_inference=quant_inference, all_positive=all_positive, per_channel=per_channel, w_quant=w_quant)
     return model
 
 class QuantSiLU(nn.Module):
