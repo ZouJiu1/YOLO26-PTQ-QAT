@@ -1,6 +1,9 @@
 # YOLO26 / MobileNetV3 / CIFAR-CNN 量化感知训练（QAT）
 
 > English version: [README.md](README.md)
+>
+> 设计文档（完整设计思路，通读 `quantization/` 与 `networks_yolo26-*.py` 全部源码写成）：
+> [docs/quantization_design_CN.md](docs/quantization_design_CN.md)（[English](docs/quantization_design_en.md)）
 
 本工程在 PyTorch 上为以下网络提供统一的「float 训练 → PTQ 校准 → QAT 微调 →
 精度对比 → 部署导出（ONNX + JSON 量化参数）」全流程：
@@ -153,7 +156,7 @@ python3 networks_mobileNetv3.py --quant lsqplus_v1 \
 | `--float-epochs` | 100 | 浮点训练轮数 |
 | `--qat-epochs` | float 的 1/5 | QAT 轮数 |
 | `--float-lr` / `--qat-lr` | — | 学习率（QAT 默认 float 的 1/10） |
-| `--float-batch-size` / `--ptq-batch-size` / `--qat-batch-size` | 16 (yolo) / 128 (cls) | 各阶段 batch size |
+| `--float-batch-size` / `--ptq-batch-size` / `--qat-batch-size` | 16/8/16 (yolo 系)；64 (yolo26-cls) | 各阶段 batch size（3 个 CIFAR 网络为单一 `--batch-size`，默认 128） |
 | `--calibration-batches` | 20 | PTQ 校准批数 |
 | `--data` | — | 覆盖数据集 yaml（yolo26 系） |
 | `--resume` | False | 从 `*_last.pth` 接续训练 |
@@ -192,13 +195,11 @@ int8 前提下的核心实验维度为 **2×2×2 = 8 个配置**：
 
 | 场景 | 推荐配置 | 命令示例 | 理由 |
 |------|----------|----------|------|
-| **精度优先**（默认推荐） | `lsqplus_v1` + per_channel + act_unsigned（权重有符号） | `python3 networks_yolo26-detect.py --quant lsqplus_v1` | 可学习 scale + beta 对非负激活最友好；per-channel 粒度最细；历史 3×7 表中 QAT 损失 ≤ 0.011 |
-| **部署友好**（硬件仅支持 per-tensor 固定 scale） | `lsqplus_v1` + per_tensor + act_unsigned | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --no-per-channel` | per-tensor 单组 scale/zero_point，地平线等工具链兼容性最好；精度损失预期 1-2 mAP 以内（以新表为准） |
-| **无训练参数的快速基线** | `minmax` + 有符号激活 | `python3 networks_yolo26-detect.py --quant minmax --no-all-positive` | 无可学习参数、最稳定；历史表中 PTQ 即可恢复 float 的 90%+，适合快速验证量化链路（minmax 不建议配 act_unsigned，见下方经验教训） |
+| **精度优先**（默认推荐） | `lsqplus_v1` + per_channel + act_unsigned（权重有符号） | `python3 networks_yolo26-detect.py --quant lsqplus_v1` | 可学习 scale + beta 对非负激活最友好；per-channel 粒度最细；下方横评中三任务 QAT 损失 ≤ 0.003（detect −0.0007 / seg −0.0021 / pose +0.0037） |
+| **部署友好**（硬件仅支持 per-tensor 固定 scale） | `lsqplus_v1` + per_tensor + act_unsigned | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --no-per-channel` | per-tensor 单组 scale/zero_point，地平线等工具链兼容性最好；实测三任务同样基本无损（Δ −0.0008 ~ +0.0052，见下方结果表） |
+| **无训练参数的快速基线** | `minmax` + 有符号激活 | `python3 networks_yolo26-detect.py --quant minmax --no-all-positive` | 无可学习参数、最稳定；下方表中 PTQ 即可恢复 float 的 93%+，适合快速验证量化链路（minmax 不建议配 act_unsigned，见下方经验教训） |
 | **精度兜底 / 敏感层保浮点** | `lsqplus_v1` + `--mixed-quant` | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --mixed-quant` | stem 与任务头保 FP32，规避首层/末端量化损失；部署时首层输入与头输出仍走浮点接口 |
 | **反例对照**（不推荐部署） | 任意后端 + `--w-all-positive` | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --w-all-positive` | 权重零均值有符号，强制无符号破坏符号平衡，预期 NaN/大幅掉点，仅用于验证"权重须有符号"结论 |
-
-> 具体精度数据以新一轮 4 主配置 × 3 任务 × 7 后端横评结果为准（跑完后追加于下方表格）。
 
 ## COCO mini 数据集与全后端横评（1/100 抽样）
 
@@ -246,12 +247,13 @@ nohup bash script/run_mini_all_part2.sh > log/mini_sweep_part2.log 2>&1 &
 > 评估集仅 50 张（pose 27 张），mAP/P/R 为小样本结果，主要用于**横向对比与回归验证**，
 > 不代表 COCO 全量精度。结果由 `script/run_mini_all_part1.sh` / `run_mini_all_part2.sh` 自动产出。
 >
-> 新一轮矩阵：int8 `a8w8`，**激活默认 unsigned**（`all_positive=True`，SiLU≥0）、权重默认有符号；
+> 矩阵设定：int8 `a8w8`，**激活默认 unsigned**（`all_positive=True`，SiLU≥0）、权重默认有符号；
 > 4 主配置 = `per_channel/per_tensor` × `act_unsigned/act_signed`；另有 weight_unsigned 反例、
 > mixed_quant 对照、PTQ 校准量敏感度、多种子稳定性 4 组补充实验。
 > seg/pose 任务指标分别为 mask / pose 关键点 mAP50（box 为辅）；**Δ = QAT − Float**。
-
-<!-- RESULTS_TABLE_PLACEHOLDER -->
+>
+> 表中留空的组合（如 pose 的 minmax/lsq 有符号激活）为裁剪掉的非必要实验；
+> 原始 PTQ/QAT 权重、量化参数 JSON 与可视化图均在 `model/yolo26-{task}/n/{配置目录}/` 下。
 
 #### 主矩阵：detect（val 50 张，80 类）— Float 基线 mAP50 **0.5814** / mAP50-95 0.4321
 
@@ -382,9 +384,12 @@ seed 间波动 ≤ 0.012，结论方向不变（lsqplus_v1 + unsigned 无损）�
 
 - `script/coco_mini_prepare.py` — 构造 1/N COCO mini 数据集（默认 1/100，见上节）。
 - `script/run_mini_all_part1.sh` / `script/run_mini_all_part2.sh` — mini 横评两路并行版
-  （4 主配置 × 3 任务 × 7 后端 = 84 拆成 52/32，Part2 另含 weight_unsigned 反例、
-  mixed_quant 对照、PTQ 校准量敏感度、多种子稳定性共 22 个补充实验）。
+  （84 个主实验 = 4 主配置 × 3 任务 × 7 后端，拆成 52/32；Part2 另含 weight_unsigned 反例、
+  mixed_quant 对照、PTQ 校准量敏感度、多种子稳定性共 22 个补充实验，合计 54）。
 - `script/run_mini_all.sh` — 单脚本串行全量版（8 配置 × 3 任务 × 7 后端），备用。
+- `script/run_mini_all_onebackend.sh` — 单后端（lsqplus_v1）串行旧版入口，保留备用。
+- `script/run_mini_remain_part1.sh` / `script/run_mini_remain_part2.sh` — 历史补跑脚本
+  （clip 折叠与 `_anchors` 设备修复后只重跑未完成单元 + 全部 pact 单元），带断点续跑，保留备查。
 - `script/export_float_onnx.py` — 把 float 训练保存的 checkpoint 单独转 ONNX
   （含 onnxsim 简化，CPU 即可；静态 shape，支持 `--imgsz` 自定义尺寸）：
 
@@ -457,11 +462,15 @@ QAT_training/
 ├── networks_cifarCNN.py         # CIFAR-CNN 分类
 ├── networks_example.py          # 最小量化算子示例
 ├── script/                      # 数据准备 / 编排 / ONNX 导出 / 可视化工具
+├── docs/                        # 设计文档（quantization_design_CN.md / quantization_design_en.md）
 ├── requirements.txt
 ├── README.md                    # English
 ├── README_CN.md                 # 本文件
 ├── dataset/                     # 自动下载的数据集（coco8 / depth8-png / dota8-multispectral 等，git 不跟踪）
+├── datas/                       # CIFAR-10 数据集（cifarCNN / mobileNetv3 / example 用，git 不跟踪）
 ├── model/                       # checkpoint + 量化参数 JSON + ONNX（git 不跟踪）
+├── log/                         # 训练与横评日志（git 不跟踪）
+├── results/                     # 单图/批量可视化输出目录
 └── ultralytics/                 # ultralytics 包与 yolo26n*.pt 预训练权重
 ```
 

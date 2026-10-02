@@ -1,6 +1,10 @@
 # YOLO26 / MobileNetV3 / CIFAR-CNN Quantization-Aware Training (QAT)
 
 > 中文版：[README_CN.md](README_CN.md)
+>
+> Design document (complete design rationale, written from a full read-through of
+> `quantization/` and `networks_yolo26-*.py`):
+> [docs/quantization_design_en.md](docs/quantization_design_en.md) ([中文](docs/quantization_design_CN.md))
 
 A PyTorch QAT framework providing a unified pipeline — **float training → PTQ
 calibration → QAT fine-tuning → precision comparison → deployment export
@@ -165,7 +169,7 @@ python3 networks_mobileNetv3.py --quant lsqplus_v1 \
 | `--float-epochs` | 100 | float-training epochs |
 | `--qat-epochs` | float/5 | QAT epochs |
 | `--float-lr` / `--qat-lr` | — | learning rates (QAT defaults to float/10) |
-| `--float-batch-size` / `--ptq-batch-size` / `--qat-batch-size` | 16 (yolo) / 128 (cls) | per-stage batch sizes |
+| `--float-batch-size` / `--ptq-batch-size` / `--qat-batch-size` | 16/8/16 (yolo nets); 64 (yolo26-cls) | per-stage batch sizes (the 3 CIFAR nets use a single `--batch-size`, default 128) |
 | `--calibration-batches` | 20 | PTQ calibration batches |
 | `--data` | — | override dataset yaml (yolo26 nets) |
 | `--resume` | False | resume training from `*_last.pth` |
@@ -211,14 +215,11 @@ recovery from keeping sensitive layers in float.
 
 | scenario | config | command | rationale |
 |----------|--------|---------|-----------|
-| **Accuracy first** (default recommendation) | `lsqplus_v1` + per_channel + act_unsigned (signed weights) | `python3 networks_yolo26-detect.py --quant lsqplus_v1` | learnable scale + beta suits non-negative activations; per-channel is the finest granularity; historical 3×7 tables show QAT loss ≤ 0.011 |
-| **Deployment friendly** (hardware supports per-tensor fixed scale only) | `lsqplus_v1` + per_tensor + act_unsigned | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --no-per-channel` | single scale/zero_point per tensor; best toolchain compatibility (e.g. Horizon); expected loss within 1-2 mAP (see new tables) |
-| **Parameter-free quick baseline** | `minmax` + signed activations | `python3 networks_yolo26-detect.py --quant minmax --no-all-positive` | no learnable params, most stable; historical tables show PTQ alone recovers 90%+ of float — good for pipeline validation (minmax + act_unsigned is not advised, see Notes) |
+| **Accuracy first** (default recommendation) | `lsqplus_v1` + per_channel + act_unsigned (signed weights) | `python3 networks_yolo26-detect.py --quant lsqplus_v1` | learnable scale + beta suits non-negative activations; per-channel is the finest granularity; in the sweep below the QAT loss is ≤ 0.003 on all three tasks (detect −0.0007 / seg −0.0021 / pose +0.0037) |
+| **Deployment friendly** (hardware supports per-tensor fixed scale only) | `lsqplus_v1` + per_tensor + act_unsigned | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --no-per-channel` | single scale/zero_point per tensor; best toolchain compatibility (e.g. Horizon); also near-lossless in practice (Δ −0.0008 ~ +0.0052, see tables below) |
+| **Parameter-free quick baseline** | `minmax` + signed activations | `python3 networks_yolo26-detect.py --quant minmax --no-all-positive` | no learnable params, most stable; PTQ alone recovers 93%+ of float in the tables below — good for pipeline validation (minmax + act_unsigned is not advised, see Notes) |
 | **Accuracy fallback / sensitive layers in float** | `lsqplus_v1` + `--mixed-quant` | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --mixed-quant` | stem + head stay FP32, avoiding first/last-layer quantization loss; deployment keeps float interfaces at input/output |
 | **Counterexample** (do NOT deploy) | any backend + `--w-all-positive` | `python3 networks_yolo26-detect.py --quant lsqplus_v1 --w-all-positive` | zero-mean signed weights forced unsigned break sign balance; NaN / large accuracy drop expected — validates the "weights must stay signed" conclusion |
-
-> Final accuracy numbers come from the new 4-main-config × 3-task × 7-backend
-> sweep (appended to the tables below once finished).
 
 ## COCO mini dataset & cross-backend comparison (1/100 sampling)
 
@@ -270,12 +271,14 @@ Log naming: `log/mini_{task}_{backend}_{config}_{stage}.log`.
 > numbers meant for cross-backend comparison and regression checks, not full-COCO
 > accuracy. Produced automatically by `script/run_mini_all_part1.sh` / `run_mini_all_part2.sh`.
 >
-> New matrix: int8 `a8w8`, **activations default unsigned** (`all_positive=True`, SiLU≥0), weights default signed;
+> Matrix setup: int8 `a8w8`, **activations default unsigned** (`all_positive=True`, SiLU≥0), weights default signed;
 > 4 main configs = `per_channel/per_tensor` × `act_unsigned/act_signed`; plus weight_unsigned counterexamples,
 > mixed_quant ablation, PTQ calibration-size sensitivity, and multi-seed stability.
 > seg/pose task metric = mask / keypoint pose mAP50 (box secondary); **Δ = QAT − Float**.
-
-<!-- RESULTS_TABLE_PLACEHOLDER -->
+>
+> Combos left blank in the tables (e.g. pose minmax/lsq with signed activations)
+> were pruned as non-essential; raw PTQ/QAT weights, quant-param JSONs and
+> visualizations live under `model/yolo26-{task}/n/{config_dir}/`.
 
 #### Main matrix: detect (50 val images, 80 classes) — Float baseline mAP50 **0.5814** / mAP50-95 0.4321
 
@@ -406,10 +409,15 @@ Seed-to-seed variation ≤ 0.012; the conclusion direction is unchanged (lsqplus
 
 - `script/coco_mini_prepare.py` — build the 1/N COCO mini dataset (default 1/100, see above).
 - `script/run_mini_all_part1.sh` / `script/run_mini_all_part2.sh` — two-way parallel
-  mini sweep (4 main configs × 3 tasks × 7 backends = 84, split 52/32; part2 also
-  carries 22 supplementary runs: weight_unsigned counterexamples, mixed_quant
-  ablation, PTQ calibration-size sensitivity, multi-seed stability).
+  mini sweep (84 main runs = 4 main configs × 3 tasks × 7 backends, split 52/32;
+  part2 also carries 22 supplementary runs — weight_unsigned counterexamples,
+  mixed_quant ablation, PTQ calibration-size sensitivity, multi-seed stability —
+  for 54 in total).
 - `script/run_mini_all.sh` — serialized all-in-one fallback (8 configs × 3 tasks × 7 backends).
+- `script/run_mini_all_onebackend.sh` — legacy single-backend (lsqplus_v1) serial entry, kept as fallback.
+- `script/run_mini_remain_part1.sh` / `script/run_mini_remain_part2.sh` — historical
+  rerun scripts (after the clip-folding and `_anchors` device fixes, reran only
+  unfinished units + all pact units), with breakpoint resume, kept for reference.
 - `script/export_float_onnx.py` — export a float checkpoint to ONNX
   (onnxsim included, CPU is enough; static shape, optional `--imgsz` override):
 
@@ -484,11 +492,15 @@ QAT_training/
 ├── networks_cifarCNN.py         # CIFAR-CNN classification
 ├── networks_example.py          # minimal quantized-op example
 ├── script/                      # data prep / orchestration / ONNX export / visualization tools
+├── docs/                        # design documents (quantization_design_en.md / quantization_design_CN.md)
 ├── requirements.txt
 ├── README.md                    # this file
 ├── README_CN.md                 # 中文版
 ├── dataset/                     # auto-downloaded datasets (coco8 / depth8-png / dota8-multispectral ..., not tracked)
+├── datas/                       # CIFAR-10 dataset (cifarCNN / mobileNetv3 / example, not tracked)
 ├── model/                       # checkpoints + quant-param JSONs + ONNX (not tracked)
+├── log/                         # training and sweep logs (not tracked)
+├── results/                     # single-image / batch visualization output
 └── ultralytics/                 # ultralytics package + yolo26n*.pt pretrained weights
 ```
 
