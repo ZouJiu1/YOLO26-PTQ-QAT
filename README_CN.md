@@ -31,6 +31,7 @@
 | pose | `coco8-pose.yaml` | <https://github.com/ultralytics/assets/releases/download/v0.0.0/coco8-pose.zip> |
 | obb | `dota8-multispectral.yaml` | <https://github.com/ultralytics/assets/releases/download/v0.0.0/dota8-multispectral.zip> |
 | depth | `depth8.yaml` | <https://github.com/ultralytics/assets/releases/download/v0.0.0/depth8-png.zip> |
+| cls | `imagenet10.yaml` | <https://github.com/ultralytics/assets/releases/download/v0.0.0/imagenet10.zip> |
 
 - 上游数据集定义：<https://github.com/ultralytics/ultralytics/tree/main/ultralytics/cfg/datasets>
 - 也可用 `--data /path/to/data.yaml`（或包含 yaml 的数据集目录）手动加载任意其他目录。
