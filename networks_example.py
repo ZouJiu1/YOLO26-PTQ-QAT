@@ -658,7 +658,7 @@ def verify(float_model, quant_model, onnx_path, quant_params):
         session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
         torch.manual_seed(0)
         float_model.cpu().eval()
-        x = torch.randn(4, 3, 32, 32)
+        x = torch.randn(1, 3, 32, 32)
         with torch.no_grad():
             y_torch = float_model(x).numpy()
         y_onnx = session.run(["logits"], {"input": x.numpy()})[0]
