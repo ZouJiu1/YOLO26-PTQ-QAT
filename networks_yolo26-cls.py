@@ -36,7 +36,6 @@ import importlib.util
 import json
 import os
 import sys
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -251,19 +250,20 @@ def _build_loader(cfg, path, data, batch_size, num_workers, augment, shuffle):
 
 
 def get_dataloaders(batch_size=64, num_workers=2, calibration=False):
-    """通过 dataset/imagenet10.yaml 拿到绝对目录路径，再调用 ultralytics 分类数据管道 /
-    Resolve absolute dataset dir from dataset/imagenet10.yaml, then call ultralytics cls pipeline.
-    与 det/seg/pose/obb/depth 保持一致：先读 yaml 再用 path 字段拿数据目录。 /
-    Consistent with det/seg/pose/obb/depth: read yaml first, then use path field for data dir.
+    """通过 dataset/imagenet10.yaml 拿到 path 字符串，再调用 ultralytics 分类数据管道。 /
+    Get path string from dataset/imagenet10.yaml, then call ultralytics cls pipeline.
+    与 det/seg/pose/obb/depth 保持一致：先读 yaml 再用 path 字段。
+    关键：传 path 字符串（如 "imagenet10"）而非绝对 Path 给 check_cls_dataset，
+    否则其内部会用字符串拼 download URL 时得到 /abs/path/imagenet10.zip（404）。 /
+    Consistent with det/seg/pose/obb/depth: read yaml first, then use path field.
+    IMPORTANT: pass path string (e.g. "imagenet10") NOT absolute Path to check_cls_dataset,
+    otherwise its internal download URL construction yields /abs/path/imagenet10.zip (404).
     """
-    det._patch_datasets_dir()  # 安全网：确保 ultralytics 全局 DATASETS_DIR 指向项目 dataset/ / safety net: ensure ultralytics DATASETS_DIR → project dataset/
+    det._patch_datasets_dir()  # 把 ultralytics 全局 DATASETS_DIR 指向项目 dataset/，配合 yaml 的相对 path 正确 resolve / point ultralytics DATASETS_DIR → project dataset/
     yaml_path = os.path.join(DATASET_DIR, DATASET)  # dataset/imagenet10.yaml（已 commit）
     cfg = YAML.load(yaml_path, append_filename=True)
-    # yaml 里 path 写相对目录（跨机器可移植），这里拼成绝对路径 / yaml uses relative dir (cross-machine portable), resolve to absolute here
-    yaml_path_dir = os.path.dirname(os.path.abspath(yaml_path))
-    raw_path = cfg.get("path", "imagenet10")
-    data_dir = Path(raw_path).resolve() if os.path.isabs(raw_path) else Path(yaml_path_dir, raw_path).resolve()
-    data = check_cls_dataset(data_dir)
+    path_str = cfg.get("path", "imagenet10")  # 传字符串给 check_cls_dataset，内部会拼 DATASETS_DIR / path_str / pass str, internally resolved as DATASETS_DIR / path_str
+    data = check_cls_dataset(path_str)
     cfg = _make_cfg(num_workers)
     if calibration:
         # 校准则用验证集、不做增强 / Calibration uses validation set, no augmentation
