@@ -63,6 +63,7 @@ from ultralytics.utils.plotting import plot_images
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _MODEL_DIR_BASE = os.path.join(BASE_DIR, "model", "yolo26-cls")
 MODEL_DIR = _MODEL_DIR_BASE
+DATASET_DIR = os.path.join(BASE_DIR, "dataset")  # 与 det/seg/pose/obb/depth 保持一致 / consistent with det/seg/pose/obb/depth
 
 
 def _model_dir_for(scale=None, quant_method=None):
@@ -250,6 +251,7 @@ def _build_loader(cfg, path, data, batch_size, num_workers, augment, shuffle):
 
 def get_dataloaders(batch_size=64, num_workers=2, calibration=False):
     """复用 ultralytics 官方 imagenet10 分类数据管道（图像已为 0~1 float）。 / Reuse ultralytics official imagenet10 classification data pipeline (images are already 0~1 float)."""
+    det._patch_datasets_dir()  # 把 ultralytics 的 DATASETS_DIR 重定向到项目 dataset/，与 det/seg/pose/obb/depth 一致 / redirect ultralytics DATASETS_DIR to project dataset/, consistent with det/seg/pose/obb/depth
     data = check_cls_dataset(DATASET)
     cfg = _make_cfg(num_workers)
     if calibration:
