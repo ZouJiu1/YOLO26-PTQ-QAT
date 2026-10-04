@@ -372,7 +372,7 @@ class_id  center_x  center_y  width  height
 
 ### 4.4 COCO mini：用 1/100 数据快速验证
 
-如果你不想先下载 118000 张 COCO 训练图（约 20GB），本项目提供了一个 `coco_mini_prepare.py` 脚本：
+如果你不想长时间等待 118000 张 COCO 训练完成（约 20GB），本项目提供了一个 `coco_mini_prepare.py` 脚本：
 
 ```bash
 python3 script/coco_mini_prepare.py
