@@ -54,7 +54,7 @@ det_spec.loader.exec_module(det)
 
 # ultralytics 提供分类数据管道 / Classification data pipeline provided by ultralytics
 from ultralytics.cfg import get_cfg
-from ultralytics.utils import DEFAULT_CFG
+from ultralytics.utils import DEFAULT_CFG, YAML
 from ultralytics.data.utils import check_cls_dataset
 from ultralytics.data import ClassificationDataset, build_dataloader
 from ultralytics.utils.torch_utils import model_info
@@ -63,6 +63,7 @@ from ultralytics.utils.plotting import plot_images
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _MODEL_DIR_BASE = os.path.join(BASE_DIR, "model", "yolo26-cls")
 MODEL_DIR = _MODEL_DIR_BASE
+DATASET_DIR = os.path.join(BASE_DIR, "dataset")  # 与 det/seg/pose/obb/depth 保持一致 / consistent with det/seg/pose/obb/depth
 
 
 def _model_dir_for(scale=None, quant_method=None):
@@ -78,7 +79,7 @@ def _model_dir_for(scale=None, quant_method=None):
 ULTRA_DIR = os.path.join(BASE_DIR, "ultralytics", "ultralytics")
 PRETRAINED_WEIGHTS = os.path.join(ULTRA_DIR, "yolo26n-cls.pt")
 
-DATASET = "imagenet10"   # check_cls_dataset 自动解析/下载（12 train / 12 val, 10 类） / auto-resolve/download (12 train / 12 val, 10 classes)
+DATASET = "imagenet10.yaml"   # dataset/ 下的便携 yaml（与 det/seg/pose/obb/depth 保持一致） / portable yaml under dataset/ (consistent with det/seg/pose/obb/depth)
 IMGSZ = 224
 NUM_CLASSES = 10
 CLS_HIDDEN = 1280        # 官方 Classify 头的 EfficientNet-B0 卷积通道数 / EfficientNet-B0 conv channels of the official Classify head
@@ -249,8 +250,20 @@ def _build_loader(cfg, path, data, batch_size, num_workers, augment, shuffle):
 
 
 def get_dataloaders(batch_size=64, num_workers=2, calibration=False):
-    """复用 ultralytics 官方 imagenet10 分类数据管道（图像已为 0~1 float）。 / Reuse ultralytics official imagenet10 classification data pipeline (images are already 0~1 float)."""
-    data = check_cls_dataset(DATASET)
+    """通过 dataset/imagenet10.yaml 拿到 path 字符串，再调用 ultralytics 分类数据管道。 /
+    Get path string from dataset/imagenet10.yaml, then call ultralytics cls pipeline.
+    与 det/seg/pose/obb/depth 保持一致：先读 yaml 再用 path 字段。
+    关键：传 path 字符串（如 "imagenet10"）而非绝对 Path 给 check_cls_dataset，
+    否则其内部会用字符串拼 download URL 时得到 /abs/path/imagenet10.zip（404）。 /
+    Consistent with det/seg/pose/obb/depth: read yaml first, then use path field.
+    IMPORTANT: pass path string (e.g. "imagenet10") NOT absolute Path to check_cls_dataset,
+    otherwise its internal download URL construction yields /abs/path/imagenet10.zip (404).
+    """
+    det._patch_datasets_dir()  # 把 ultralytics 全局 DATASETS_DIR 指向项目 dataset/，配合 yaml 的相对 path 正确 resolve / point ultralytics DATASETS_DIR → project dataset/
+    yaml_path = os.path.join(DATASET_DIR, DATASET)  # dataset/imagenet10.yaml（已 commit）
+    cfg = YAML.load(yaml_path, append_filename=True)
+    path_str = cfg.get("path", "imagenet10")  # 传字符串给 check_cls_dataset，内部会拼 DATASETS_DIR / path_str / pass str, internally resolved as DATASETS_DIR / path_str
+    data = check_cls_dataset(path_str)
     cfg = _make_cfg(num_workers)
     if calibration:
         # 校准则用验证集、不做增强 / Calibration uses validation set, no augmentation

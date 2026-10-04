@@ -1,0 +1,23 @@
+# Ultralytics imagenet10 classification dataset (mini ImageNet-10 subset)
+# 10 ImageNet classes × 12 train / 12 val images (24 images total)
+# 自动下载到 {repo}/dataset/imagenet10/
+
+path: imagenet10
+train: train
+val: val
+nc: 10
+
+# 10 imagenet10 classes (ImageNet synset IDs)
+names:
+  0: n01440764  # tench
+  1: n01443537  # goldfish
+  2: n01484850  # great white shark
+  3: n01491361  # tiger shark
+  4: n01494475  # hammerhead shark
+  5: n01496331  # electric ray
+  6: n01498041  # stingray
+  7: n01514668  # cock
+  8: n01514859  # hen
+  9: n01518878  # ostrich
+
+download: https://github.com/ultralytics/assets/releases/download/v0.0.0/imagenet10.zip

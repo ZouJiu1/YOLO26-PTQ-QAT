@@ -1,4 +1,4 @@
-path: /home/zoujiu/Desktop/projects/aLSQplus/QAT_training/dataset/coco8-pose
+path: /home/zoujiu/Desktop/projects/aLSQplus/QAT_training/tmp/YOLO26-PTQ-QAT/dataset/coco8-pose
 train: images/train
 val: images/val
 test: null

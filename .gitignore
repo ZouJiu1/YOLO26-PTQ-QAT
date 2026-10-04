@@ -35,6 +35,7 @@ model/*.json
 # auto-downloaded datasets (coco8 / depth8-png / dota8-multispectral ...) / 自动下载的数据集
 dataset/
 ultralytics
+tmp
 *.log
 _smoke*
 # Windows Installer files

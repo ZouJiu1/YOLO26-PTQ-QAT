@@ -1,4 +1,4 @@
-path: /home/zoujiu/Desktop/projects/aLSQplus/QAT_training/dataset/dota8-multispectral
+path: /home/zoujiu/Desktop/projects/aLSQplus/QAT_training/tmp/YOLO26-PTQ-QAT/dataset/dota8-multispectral
 train: images/train
 val: images/val
 channels: 10
