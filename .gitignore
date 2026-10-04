@@ -17,6 +17,7 @@ dataset/depth8-png
 model
 dataset/detect
 datas
+tmp
 log
 dataset/dota8-multispectral
 dataset/pose
