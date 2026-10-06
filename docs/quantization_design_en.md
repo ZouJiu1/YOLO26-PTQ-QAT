@@ -175,15 +175,12 @@ Key points:
 | lsq_v1 | `lsqquantize_V1.py` | symmetric | `LSQActivationQuantizer` / `LSQWeightQuantizer` | lightweight, symmetric HW |
 | lsq_v2 | `lsqquantize_V2.py` | symmetric | same (activation s init = const 1) | ablation |
 | minmax | `minmax.py` | asymmetric | `MinMaxActivationQuantizer` / `MinMaxWeightQuantizer` | baseline |
-| dorefa | `dorefa.py` | symmetric | `DorefaActivationQuantizer` / `DorefaWeightQuantizer` | research comparison |
+| dorefa | `dorefa.py` | activation asymmetric / weight symmetric | `DorefaActivationQuantizer` / `DorefaWeightQuantizer` | **2026-10 new version** stable (see notes below) |
 | pact | `pact.py` | asymmetric (learns clip α) | `PactActivationQuantizer` + `build_weight_quantizer()` | comparison / partial deploy |
 
 ### 4.1 Quantizer forward math differences
 
-- **dorefa**: the activation quantizer learns a scale `s`, quantizes onto a fixed
-  grid (signed `[-1,1]` / unsigned `[0,1]`), `all_positive` selects the range;
-  the weight uses the `tanh(weight)` domain for magnitude statistics,
-  `per_channel` per output channel.
+- **dorefa (new version, 2026-10)**: the activation quantizer follows the standard asymmetric formula (`scale` + `beta`, zero_point implicitly represented by beta), identical to lsqplus; the weight quantizer uses a linear symmetric grid `q_w = maxvalue × round(w/maxvalue × Qp) / Qp` with step `maxvalue/Qp`, `per_channel` per output channel. The **v1 version** used tanh-domain nonlinear quantization (weights) and `clamp(±1)` hard truncation (activations); both were removed in 2026-10. See the [dorefa.py implementation notes](../quantization/dorefa.py) for details.
 - **lsq_v1/v2**: learns scale `s`; `all_positive` sets `Qn/Qp` (negative/positive
   levels); the first 20 batches do scale init/smoothing (`batch_init` state
   machine), then fixed. Classic LSQ STE.
@@ -268,6 +265,13 @@ clean float graph (see §7.3).
 | `*_float.onnx` | compiler input | clean float graph (no Q/DQ nodes), weights are post-quantization values |
 | quant `.pth` | training/re-export | fake-quant trained model checkpoint |
 
+> **Important note**: the scale / zero_point values in the JSON are **for
+> cross-validation reference only**. Embedded board-side PTQ tools (Horizon NPU,
+> TPU, etc.) **recalculate** scale and zero_point from their own calibration data;
+> the board-side recomputed values take precedence at deployment time. The JSON is
+> there to let you compare training-side vs board-side parameters before compiling,
+> not to be applied directly during deployment.
+
 Export order: `collect_quant_params` saves the JSON first, then
 `build_float_model` produces the ONNX. Both come from the same quantizer state in
 one save, so they are consistent by construction.
@@ -276,7 +280,7 @@ one save, so they are consistent by construction.
 
 Walk the quantized model and, for each quantizer, extract scale/zero_point with
 `activation_scale_zp` / `weight_scale_zp` (internally handling per-backend
-differences: lsqplus β, minmax zp, pact α, dorefa s), packing into
+differences: lsqplus β, minmax zp, pact α, **new dorefa activation via lsqplus scale/beta path + linear symmetric weights (amax/Qp)**), packing into
 `{layer: {scale, zero_point}}`. `required_quant_keys` validates export
 completeness (hard assert).
 
@@ -336,9 +340,10 @@ Unsigned ([0,255]) uses the full positive range better than signed
 
 - **Asymmetric backends** (lsqplus_v1/v2, pact, minmax): natively supported,
   stable and lossless
-- **Symmetric backends** (lsq_v1/v2, dorefa): the zero point is forced outside
+- **Symmetric backends** (lsq_v1/v2, minmax): the zero point is forced outside
   the bound, unsigned activations get severely clipped → **0.18–0.37 drop, PTQ
   collapses**. Symmetric backends must pair with `act_signed`
+  (**2026-10**: dorefa now uses asymmetric activations and no longer belongs here; minmax technically supports zero_point for unsigned but the PTQ loss is still large without dynamic scaling)
 
 ### 8.2 Signed weights (`w_all_positive=False`, default)
 
@@ -411,14 +416,14 @@ ONNX has no quant nodes and quant_params are complete. `meta` passes through via
 | ONNX export `aten::copy_` failure | `_ClipOnlyQuantizer.forward` used `.to()` | store bounds with `register_buffer`, no device conversion in forward |
 | QuantCat quantizers missed on replace | quantizers live in a `ModuleList` under a non-standard attribute name | recurse + duck-type `hasattr(child,'clip_bounds')` traversal |
 | bash resume never triggering | `already_ok` matched `[OK] task=` but log lines are `[OK] date task=` | regex anchored on dated `[OK]` lines |
-| seg/dorefa OOM | 640 resolution + tanh quantizer memory | seg and all-task dorefa QAT always batch=4 |
+| seg/dorefa OOM (**2026-10 fixed**) | 640 resolution + tanh quantizer memory | old: seg and all-task dorefa QAT always batch=4; new: tanh removed, all tasks unified batch=8 |
 | LSQ v1/pact all-zero dummy | all-zero input → scale=0 → NaN | dummy input `randn*0.1` |
 | seg/pose head quantizer missing keys | reusing det's set_quant_method across tasks | seg/pose each have their own set_quant_method |
-| dorefa unsigned activation collapse | unbounded activation in tanh domain | fixed by adding a learnable scale s |
+| dorefa unsigned activation collapse (**2026-10 fixed**) | v1 tanh-domain forced symmetry, no zero_point | old: temp fix with learnable scale s; new: activation uses lsqplus asymmetric formula, fully resolved |
 
 **Why duck typing over a registry/inheritance**: the 7 backends' quantizer
 internals differ a lot (pact learns α, lsqplus learns β, minmax has no params,
-dorefa uses the tanh domain). A forced common base class would constrain
+**new dorefa uses linear symmetric weights + asymmetric activations**). A forced common base class would constrain
 implementations. The `hasattr` contract (`weight_quantizer`/`clip_bounds`/
 `quant_inference`) gives a minimal cross-backend surface, and each backend
 implements the full op set independently in its own file.

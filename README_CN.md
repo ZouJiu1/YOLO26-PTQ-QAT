@@ -271,10 +271,10 @@ nohup bash script/run_mini_all_part2.sh > log/mini_sweep_part2.log 2>&1 &
 | minmax | per_channel + act_signed | 0.5404 | 0.5832 | +0.0018 |
 | minmax | per_tensor + act_signed | 0.5588 | 0.5818 | +0.0004 |
 | minmax | per_tensor + act_unsigned | 0.0000 | 0.3808 | −0.1831 |
-| dorefa | per_channel + act_unsigned | 0.0000 | 0.3629 | −0.2185 |
-| dorefa | per_tensor + act_unsigned | 0.0000 | 0.3749 | −0.2065 |
-| dorefa | per_channel + act_signed | 0.5750 | 0.5650 | −0.0164 |
-| dorefa | per_tensor + act_signed | 0.5664 | 0.5619 | −0.0195 |
+| dorefa | per_channel + act_unsigned | 0.5631 | 0.5723 | −0.0091 |
+| dorefa | per_tensor + act_unsigned | 0.5607 | 0.5779 | −0.0034 |
+| dorefa | per_channel + act_signed | 0.5753 | 0.5756 | −0.0058 |
+| dorefa | per_tensor + act_signed | 0.5609 | 0.5736 | −0.0078 |
 | pact | per_channel + act_unsigned | 0.5489 | **0.5940** | **+0.0126** |
 | pact | per_tensor + act_unsigned | 0.5736 | 0.5823 | +0.0184 |
 | pact | per_channel + act_signed | 0.5457 | 0.5770 | −0.0044 |
@@ -304,10 +304,10 @@ nohup bash script/run_mini_all_part2.sh > log/mini_sweep_part2.log 2>&1 &
 | minmax | per_tensor + act_unsigned | 0.0000 | 0.1291 | −0.3448 |
 | minmax | per_channel + act_signed | 0.4826 | 0.4908 | −0.0093 |
 | minmax | per_tensor + act_signed | 0.4078 | 0.4857 | +0.0118 |
-| dorefa | per_channel + act_unsigned | 0.0000 | 0.1695 | −0.3306 |
-| dorefa | per_tensor + act_unsigned | 0.0000 | 0.1972 | −0.2906 |
-| dorefa | per_channel + act_signed | 0.4601 | 0.4833 | −0.0029 |
-| dorefa | per_tensor + act_signed | 0.4444 | 0.4827 | −0.0174 |
+| dorefa | per_channel + act_unsigned | 0.4945 | 0.4942 | −0.0060 |
+| dorefa | per_tensor + act_unsigned | 0.4732 | 0.5073 | +0.0072 |
+| dorefa | per_channel + act_signed | 0.4871 | 0.5038 | +0.0037 |
+| dorefa | per_tensor + act_signed | 0.4722 | 0.4964 | −0.0037 |
 | pact | per_channel + act_unsigned | 0.4794 | **0.5112** | **+0.0111** |
 | pact | per_tensor + act_unsigned | 0.4785 | 0.4888 | −0.0113 |
 | pact | per_channel + act_signed | 0.4934 | 0.4751 | +0.0598 ¹ |
@@ -331,10 +331,10 @@ nohup bash script/run_mini_all_part2.sh > log/mini_sweep_part2.log 2>&1 &
 | lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1875 | −0.2964 |
 | minmax | per_channel + act_unsigned | 0.0000 | 0.1192 | −0.3647 |
 | minmax | per_tensor + act_unsigned | 0.0000 | 0.1136 | −0.3703 |
-| dorefa | per_channel + act_unsigned | 0.0000 | 0.1527 | −0.3312 |
-| dorefa | per_tensor + act_unsigned | 0.0000 | 0.1721 | −0.3118 |
-| dorefa | per_channel + act_signed | 0.4629 | 0.4755 | −0.0084 |
-| dorefa | per_tensor + act_signed | 0.4553 | 0.4733 | −0.0106 |
+| dorefa | per_channel + act_unsigned | 0.4942 | 0.4843 | +0.0004 |
+| dorefa | per_tensor + act_unsigned | 0.4856 | 0.4900 | +0.0061 |
+| dorefa | per_channel + act_signed | 0.4836 | 0.4792 | −0.0047 |
+| dorefa | per_tensor + act_signed | 0.4844 | 0.4758 | −0.0081 |
 | pact | per_channel + act_unsigned | 0.4845 | 0.4846 | +0.0007 |
 | pact | per_tensor + act_unsigned | 0.4807 | 0.4784 | −0.0055 |
 | pact | per_channel + act_signed | 0.4845 | 0.4773 | −0.0066 |
@@ -359,7 +359,8 @@ nohup bash script/run_mini_all_part2.sh > log/mini_sweep_part2.log 2>&1 &
 | lsqplus_v1 | 0.5780 | −0.0034 | 非对称混合，稳定 |
 | lsqplus_v2 | 0.5807 | −0.0007 | 非对称混合，稳定 |
 | pact | 0.5818 | +0.0004 | 稳定 |
-| lsq_v1 / lsq_v2 / minmax / dorefa | 0.3710–0.4254 | −0.156 ~ −0.210 | 对称后端 + unsigned 激活，掉点如预期 |
+| dorefa | 0.5778 | −0.0036 | 新版线性网格 dorefa，稳定 |
+| lsq_v1 / lsq_v2 / minmax | 0.3710–0.4254 | −0.156 ~ −0.210 | 对称后端 + unsigned 激活，掉点如预期 |
 
 **多种子稳定性**（seed=1，lsqplus_v1，对比 seed=42 主配置）：
 
@@ -377,7 +378,7 @@ seed 间波动 ≤ 0.012，结论方向不变（lsqplus_v1 + unsigned 无损）�
 **小结（小样本横向对比，不代表全量 COCO 精度）：**
 - **推荐配置（lsqplus_v1 + per_channel + act_unsigned）三任务全部无损或近无损**：detect −0.0007、seg −0.0021、pose +0.0037；
 - 非对称后端（lsqplus_v1/v2、pact）配 unsigned 激活全部稳定（Δ ≤ 0.039）；pact 在 detect/seg 上甚至反超 float（+0.011 ~ +0.013）；
-- **对称后端（lsq_v1/v2、minmax、dorefa）配 unsigned 激活严重掉点**（Δ −0.18 ~ −0.37，PTQ 直接 0.0000）；对称后端只能配 act_signed；
+- **对称后端（lsq_v1/v2、minmax）配 unsigned 激活严重掉点**（Δ −0.18 ~ −0.37，PTQ 直接 0.0000）；对称后端只能配 act_signed。（**2026-10**：dorefa 已从此列表移除——新版 dorefa 改用非对称激活，配 unsigned 现在稳定，详见 `docs/blog_beginner_guide_to_QAT.md` §10.4 的 v1→v2 迁移记录）；
 - weight_unsigned（负偏置权重配 [0,1] 量化域）全部崩塌为 0，与理论预期一致，作为错误配置示例保留；
 - QAT 普遍能追回 PTQ 的大部分损失，且在 unsigned+非对称组合下 PTQ 本身已接近 float。
 
@@ -487,6 +488,8 @@ QAT_training/
   导出自带 onnxsim 简化与 onnx 结构检查。
 - **JSON**：`*_quant_params.json` 记录每个量化张量的 scale / zero_point，
   供下游部署工具链（如地平线模型编译）消费；同名 `.pth` 为二进制形式。
+  **重要：JSON 中的 scale / zero_point 仅供交叉验证参考——嵌入式板子的 PTQ 工具
+  会用自己的校准数据重新计算 scale 与 zero_point，最终以板端重新算出的为准**。
 - **手动补发**：如果 QAT / PTQ checkpoint 还在但部署产物缺失（训练中断），
   用 `script/export_qat_outputs.py` 一键补齐全套。
 

@@ -296,10 +296,10 @@ Log naming: `log/mini_{task}_{backend}_{config}_{stage}.log`.
 | minmax | per_channel + act_signed | 0.5404 | 0.5832 | +0.0018 |
 | minmax | per_tensor + act_signed | 0.5588 | 0.5818 | +0.0004 |
 | minmax | per_tensor + act_unsigned | 0.0000 | 0.3808 | −0.1831 |
-| dorefa | per_channel + act_unsigned | 0.0000 | 0.3629 | −0.2185 |
-| dorefa | per_tensor + act_unsigned | 0.0000 | 0.3749 | −0.2065 |
-| dorefa | per_channel + act_signed | 0.5750 | 0.5650 | −0.0164 |
-| dorefa | per_tensor + act_signed | 0.5664 | 0.5619 | −0.0195 |
+| dorefa | per_channel + act_unsigned | 0.5631 | 0.5723 | −0.0091 |
+| dorefa | per_tensor + act_unsigned | 0.5607 | 0.5779 | −0.0034 |
+| dorefa | per_channel + act_signed | 0.5753 | 0.5756 | −0.0058 |
+| dorefa | per_tensor + act_signed | 0.5609 | 0.5736 | −0.0078 |
 | pact | per_channel + act_unsigned | 0.5489 | **0.5940** | **+0.0126** |
 | pact | per_tensor + act_unsigned | 0.5736 | 0.5823 | +0.0184 |
 | pact | per_channel + act_signed | 0.5457 | 0.5770 | −0.0044 |
@@ -329,10 +329,10 @@ Log naming: `log/mini_{task}_{backend}_{config}_{stage}.log`.
 | minmax | per_tensor + act_unsigned | 0.0000 | 0.1291 | −0.3448 |
 | minmax | per_channel + act_signed | 0.4826 | 0.4908 | −0.0093 |
 | minmax | per_tensor + act_signed | 0.4078 | 0.4857 | +0.0118 |
-| dorefa | per_channel + act_unsigned | 0.0000 | 0.1695 | −0.3306 |
-| dorefa | per_tensor + act_unsigned | 0.0000 | 0.1972 | −0.2906 |
-| dorefa | per_channel + act_signed | 0.4601 | 0.4833 | −0.0029 |
-| dorefa | per_tensor + act_signed | 0.4444 | 0.4827 | −0.0174 |
+| dorefa | per_channel + act_unsigned | 0.4945 | 0.4942 | −0.0060 |
+| dorefa | per_tensor + act_unsigned | 0.4732 | 0.5073 | +0.0072 |
+| dorefa | per_channel + act_signed | 0.4871 | 0.5038 | +0.0037 |
+| dorefa | per_tensor + act_signed | 0.4722 | 0.4964 | −0.0037 |
 | pact | per_channel + act_unsigned | 0.4794 | **0.5112** | **+0.0111** |
 | pact | per_tensor + act_unsigned | 0.4785 | 0.4888 | −0.0113 |
 | pact | per_channel + act_signed | 0.4934 | 0.4751 | +0.0598 ¹ |
@@ -356,10 +356,10 @@ Log naming: `log/mini_{task}_{backend}_{config}_{stage}.log`.
 | lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1875 | −0.2964 |
 | minmax | per_channel + act_unsigned | 0.0000 | 0.1192 | −0.3647 |
 | minmax | per_tensor + act_unsigned | 0.0000 | 0.1136 | −0.3703 |
-| dorefa | per_channel + act_unsigned | 0.0000 | 0.1527 | −0.3312 |
-| dorefa | per_tensor + act_unsigned | 0.0000 | 0.1721 | −0.3118 |
-| dorefa | per_channel + act_signed | 0.4629 | 0.4755 | −0.0084 |
-| dorefa | per_tensor + act_signed | 0.4553 | 0.4733 | −0.0106 |
+| dorefa | per_channel + act_unsigned | 0.4942 | 0.4843 | +0.0004 |
+| dorefa | per_tensor + act_unsigned | 0.4856 | 0.4900 | +0.0061 |
+| dorefa | per_channel + act_signed | 0.4836 | 0.4792 | −0.0047 |
+| dorefa | per_tensor + act_signed | 0.4844 | 0.4758 | −0.0081 |
 | pact | per_channel + act_unsigned | 0.4845 | 0.4846 | +0.0007 |
 | pact | per_tensor + act_unsigned | 0.4807 | 0.4784 | −0.0055 |
 | pact | per_channel + act_signed | 0.4845 | 0.4773 | −0.0066 |
@@ -384,7 +384,8 @@ Log naming: `log/mini_{task}_{backend}_{config}_{stage}.log`.
 | lsqplus_v1 | 0.5780 | −0.0034 | asymmetric mix, stable |
 | lsqplus_v2 | 0.5807 | −0.0007 | asymmetric mix, stable |
 | pact | 0.5818 | +0.0004 | stable |
-| lsq_v1 / lsq_v2 / minmax / dorefa | 0.3710–0.4254 | −0.156 ~ −0.210 | symmetric backends + unsigned act, expected drop |
+| dorefa | 0.5778 | −0.0036 | linear-grid dorefa (new), stable |
+| lsq_v1 / lsq_v2 / minmax | 0.3710–0.4254 | −0.156 ~ −0.210 | symmetric backends + unsigned act, expected drop |
 
 **Multi-seed stability** (seed=1, lsqplus_v1, vs seed=42 main config):
 
@@ -402,7 +403,7 @@ Seed-to-seed variation ≤ 0.012; the conclusion direction is unchanged (lsqplus
 **Takeaways (small-sample cross-backend comparison — not full-COCO accuracy):**
 - **Recommended config (lsqplus_v1 + per_channel + act_unsigned) is lossless or near-lossless on all three tasks**: detect −0.0007, seg −0.0021, pose +0.0037;
 - asymmetric backends (lsqplus_v1/v2, pact) are all stable with unsigned activations (Δ ≤ 0.039); pact even exceeds float on detect/seg (+0.011 ~ +0.013);
-- **symmetric backends (lsq_v1/v2, minmax, dorefa) degrade severely with unsigned activations** (Δ −0.18 ~ −0.37, PTQ collapses to 0.0000); symmetric backends must pair with act_signed;
+- **symmetric backends (lsq_v1/v2, minmax) degrade severely with unsigned activations** (Δ −0.18 ~ −0.37, PTQ collapses to 0.0000); symmetric backends must pair with act_signed. (**2026-10**: dorefa removed from this list — the new dorefa v2 uses asymmetric activations, now stable with unsigned; see v1→v2 migration notes in `docs/blog_beginner_guide_to_QAT.md` §10.4)
 - weight_unsigned (negative-biased weights in a [0,1] quantization domain) collapses to 0 across the board, as theory predicts — kept as a misconfiguration example;
 - QAT generally closes most of the PTQ gap, and for unsigned+asymmetric combos PTQ alone is already near float.
 
@@ -521,6 +522,10 @@ QAT_training/
 - **JSON**: `*_quant_params.json` records scale / zero_point for every
   quantized tensor, consumed by downstream deployment toolchains (e.g. the
   Horizon model compiler); the same-named `.pth` is the binary form.
+  **Important: the scale / zero_point values in the JSON are for
+  cross-validation reference only — the embedded board's PTQ tool
+  recalculates scale and zero_point from its own calibration data, and
+  the board-side recomputed values take precedence**.
 - **Manual re-export**: if a QAT / PTQ checkpoint exists but deployment
   artifacts are missing (interrupted training), use
   `script/export_qat_outputs.py` to regenerate the full set in one shot.

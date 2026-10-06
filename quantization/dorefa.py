@@ -1,5 +1,4 @@
 import copy
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,21 +40,21 @@ class DorefaActivationQuantizer(nn.Module):
         self.a_bits = a_bits
         self.all_positive = all_positive
         if self.all_positive:
-            # unsigned activation is quantized to [0, 2^b-1]
+            # 无符号激活量化到 [0, 2^b-1] / unsigned activation is quantized to [0, 2^b-1]
             self.Qn = 0
             self.Qp = 2 ** self.a_bits - 1
         else:
-            # signed activation is quantized to [-2^(b-1), 2^(b-1)-1]
+            # 有符号激活量化到 [-2^(b-1), 2^(b-1)-1] / signed activation is quantized to [-2^(b-1), 2^(b-1)-1]
             self.Qn = - 2 ** (self.a_bits - 1)
             self.Qp = 2 ** (self.a_bits - 1) - 1
-        # 可学习尺度 s：把无界激活映射到 DoReFa 的固定网格区间，再反量化回原尺度。
-        # 没有 s 的话，SiLU/ReLU 等 >1 的激活会全部被 clamp 到 ±1，信号坍缩。
-        # 与权重路径 tanh(weight)/maxvalue 的尺度归一设计保持一致。
-        # / Learnable scale s: maps unbounded activations into DoReFa's fixed grid interval,
-        #   then dequantizes back to original scale.
-        #   Without s, activations >1 (e.g. SiLU/ReLU) would all be clamped to ±1, collapsing the signal.
-        #   Consistent with the weight path's tanh(weight)/maxvalue scale-normalization design.
+        # scale (步长) 与 beta (零点偏移) 均可学习，遵循标准非对称量化公式：
+        #   q = round((x - beta) / s).clamp(Qn, Qp)
+        #   x_q = q * s + beta
+        # / Learnable scale s and zero-point beta following the standard asymmetric formula:
+        #   q = round((x - beta) / s).clamp(Qn, Qp)
+        #   x_q = q * s + beta
         self.s = nn.Parameter(torch.ones(1))
+        self.beta = nn.Parameter(torch.zeros(1))
         self.init_state = INIT_STATE_UNINIT  # UNINIT / TRAINING / FROZEN
 
     def _set_init_state(self, value):
@@ -69,39 +68,36 @@ class DorefaActivationQuantizer(nn.Module):
     # 量化/反量化 / quantize/dequantize
     def forward(self, activation):
         if self.init_state == INIT_STATE_UNINIT:
-            # 首批用真实激活幅度初始化尺度（对称：取绝对值最大；无符号：取最大值）
-            # / Initialize scale from real activation magnitude on first batch (symmetric: abs max; unsigned: max)
-            if self.all_positive:
-                cur_s = activation.detach().max()
-            else:
-                cur_s = activation.detach().abs().max()
+            # 首批用真实激活的 min/max 初始化 s 与 beta
+            # / Initialize s and beta from real activation min/max on first batch
+            x = activation.detach()
+            cur_min = x.min()
+            cur_max = x.max()
+            eps = torch.finfo(x.dtype).eps
+            cur_s = torch.clamp(cur_max - cur_min, min=eps) / (self.Qp - self.Qn)
+            cur_beta = cur_min - cur_s * self.Qn
             self.s.data.copy_(cur_s.reshape(1).clamp(min=1e-6))
+            self.beta.data.copy_(cur_beta.reshape(1))
             self._set_init_state(INIT_STATE_TRAINING)
         elif self.init_state != INIT_STATE_FROZEN:
-            # 训练阶段 EMA 平滑更新尺度 / EMA-smooth scale update during training
-            if self.all_positive:
-                cur_s = activation.detach().max()
-            else:
-                cur_s = activation.detach().abs().max()
-            self.s.data.mul_(0.9).add_(
-                cur_s.reshape(1).clamp(min=1e-6), alpha=0.1
-            )
+            # 训练阶段 EMA 平滑更新 s 与 beta / EMA-smooth update of s and beta during training
+            x = activation.detach()
+            cur_min = x.min()
+            cur_max = x.max()
+            eps = torch.finfo(x.dtype).eps
+            cur_s = torch.clamp(cur_max - cur_min, min=eps) / (self.Qp - self.Qn)
+            cur_beta = cur_min - cur_s * self.Qn
+            self.s.data.mul_(0.9).add_(cur_s.reshape(1).clamp(min=1e-6), alpha=0.1)
+            self.beta.data.mul_(0.9).add_(cur_beta.reshape(1), alpha=0.1)
 
-        # 归一化到固定网格区间 -> 量化 -> 反量化回原尺度
-        # / normalize to fixed grid interval → quantize → dequantize back to original scale
-        bounded = activation / self.s
-        if self.all_positive:
-            bounded = bounded.clamp(0.0, 1.0)
-        else:
-            bounded = bounded.clamp(-1.0, 1.0)
-        q_a = Round.apply(bounded * self.Qp).clamp(self.Qn, self.Qp) / self.Qp
-        return q_a * self.s
+        # 标准非对称量化 / standard asymmetric quantization
+        q_a = Round.apply((activation - self.beta) / self.s).clamp(self.Qn, self.Qp)
+        return q_a * self.s + self.beta
 
     def clip_bounds(self):
-        """激活空间内的截断边界：无符号 (0, s) / 有符号 (-s, s)；导出"截断保留、舍入去除"的纯浮点参考图时使用 /
-        Clip bounds in activation space: unsigned (0, s) / signed (-s, s); used when exporting a clip-only (rounding-free) float reference graph."""
-        lower = torch.zeros_like(self.s) if self.all_positive else -self.s
-        return lower.detach(), self.s.detach()
+        """激活空间内的截断边界 (Qn·s+beta, Qp·s+beta)；导出"截断保留、舍入去除"的纯浮点参考图时使用 /
+        Clip bounds in activation space (Qn·s+beta, Qp·s+beta): used when exporting a clip-only (rounding-free) float reference graph."""
+        return (self.Qn * self.s + self.beta).detach(), (self.Qp * self.s + self.beta).detach()
 
 # W(权重)量化 / W(weight) quantization
 class DorefaWeightQuantizer(nn.Module):
@@ -111,35 +107,35 @@ class DorefaWeightQuantizer(nn.Module):
         self.all_positive = all_positive
         self.per_channel = per_channel
         if self.all_positive:
-            # unsigned level range [0, 2^b-1]
+            # 无符号量化等级范围 [0, 2^b-1] / unsigned level range [0, 2^b-1]
             self.Qn = 0
             self.Qp = 2 ** w_bits - 1
         else:
-            # signed level range [-2^(b-1), 2^(b-1)-1]
+            # 有符号量化等级范围 [-2^(b-1), 2^(b-1)-1] / signed level range [-2^(b-1), 2^(b-1)-1]
             self.Qn = - 2 ** (w_bits - 1)
             self.Qp = 2 ** (w_bits - 1) - 1
 
     # 量化/反量化 / quantize/dequantize
     def forward(self, weight):
-        if self.per_channel:  # 按输出通道统计 tanh 域的幅度 / collect tanh-domain magnitude per output channel
-            maxvalue = torch.tanh(weight).abs().reshape(weight.size(0), -1).max(dim=1).values
+        # 标准对称量化：直接在权重域计算 scale，不再使用 tanh 非线性变换
+        # / Standard symmetric quantization: compute scale in weight domain directly, no tanh nonlinearity
+        if self.per_channel:
+            maxvalue = weight.detach().abs().reshape(weight.size(0), -1).max(dim=1).values
             maxvalue = maxvalue.view(-1, *([1] * (weight.dim() - 1)))
         else:
-            maxvalue = torch.tanh(weight).abs().max()
+            maxvalue = weight.detach().abs().max()
+        maxvalue = maxvalue.clamp(min=1e-8)
+
         if self.all_positive:
-            # [0,1] map, [0, 2^b-1] levels (原 dorefa 行为)
-            # / [0,1] map, [0, 2^b-1] levels (original dorefa behavior)
-            tmp = torch.tanh(weight) / maxvalue * 0.5 + 0.5
+            # 无符号：[0, maxvalue] 映射到 [0, Qp] / unsigned: [0, maxvalue] map to [0, Qp]
+            tmp = weight / maxvalue
             tmp = Round.apply(tmp * self.Qp).clamp(self.Qn, self.Qp) / self.Qp
-            tmp = 2 * tmp - 1
         else:
-            # [-1,1] map, [-2^(b-1), 2^(b-1)-1] levels
-            tmp = torch.tanh(weight) / maxvalue
+            # 有符号：[-maxvalue, maxvalue] 映射到 [Qn, Qp] / signed: [-maxvalue, maxvalue] map to [Qn, Qp]
+            tmp = weight / maxvalue
             tmp = Round.apply(tmp * self.Qp).clamp(self.Qn, self.Qp) / self.Qp
 
-        # for my opinion，need to restore the original weight range
-        tmp = maxvalue * tmp
-        q_w = torch.arctanh(tmp)
+        q_w = maxvalue * tmp
         return q_w
 
 class QuantConv2d(nn.Conv2d):

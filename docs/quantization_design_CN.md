@@ -155,14 +155,12 @@
 | lsq_v1 | `lsqquantize_V1.py` | 对称 | `LSQActivationQuantizer` / `LSQWeightQuantizer` | 轻量、对称硬件 |
 | lsq_v2 | `lsqquantize_V2.py` | 对称 | 同上（激活 s 初始化为常数 1） | 对照 |
 | minmax | `minmax.py` | 非对称 | `MinMaxActivationQuantizer` / `MinMaxWeightQuantizer` | baseline |
-| dorefa | `dorefa.py` | 对称 | `DorefaActivationQuantizer` / `DorefaWeightQuantizer` | 研究对比 |
+| dorefa | `dorefa.py` | 激活非对称 / 权重对称 | `DorefaActivationQuantizer` / `DorefaWeightQuantizer` | **2026-10 新版**稳定可用（见下方说明） |
 | pact | `pact.py` | 非对称（学 clip α） | `PactActivationQuantizer` + `build_weight_quantizer()` | 对比/部分部署 |
 
 ### 4.1 量化器 forward 数学差异
 
-- **dorefa**：激活量化器学一个尺度 `s`，量化到固定网格（signed `[-1,1]` /
-  unsigned `[0,1]`），`all_positive` 决定范围；权重用 `tanh(weight)` 域统计幅度，
-  `per_channel` 按输出通道统计。
+- **dorefa（新版，2026-10）**：激活量化器走标准非对称公式（`scale` + `beta`，zero_point 由 beta 隐式表示），与 lsqplus 的激活量化器公式完全一致；权重量化器为线性对称网格 `q_w = maxvalue × round(w/maxvalue × Qp) / Qp`，步长 `maxvalue/Qp`，`per_channel` 按输出通道统计。**v1 版本**使用 `tanh` 域非线性量化（权重）和 `clamp(±1)` 硬截断（激活），2026-10 已全部移除，详见 [dorefa.py 实现变更记录](../quantization/dorefa.py)。
 - **lsq_v1/v2**：学 scale `s`，`all_positive` 设定 `Qn/Qp`（负/正量化级数），
   前 20 批做尺度初始化/平滑（`batch_init` 状态机），之后固定。LSQ 经典 STE。
 - **lsqplus_v1/v2**：同时学 `s` 和零点偏移 `beta`（`beta` 初始化为 `-1e-9`），
@@ -236,6 +234,10 @@ freeze/reset/导出遍历。
 | `*_float.onnx` | 编译输入 | 干净浮点图（无 Q/DQ 节点），权重为量化后值 |
 | quant `.pth` | 训练/补发 | fake-quant 训练模型 checkpoint |
 
+> **重要提醒**：JSON 中的 scale / zero_point **仅供交叉验证参考**。嵌入式板端（地平线 NPU、
+> TPU 等）的 PTQ 工具会用自身校准数据**重新计算** scale 与 zero_point，最终部署以板端
+> 重新算出的值为准。JSON 方便你在编译前比对训练侧与板侧是否一致，不等于部署时直接套用。
+
 导出顺序：`collect_quant_params` 先存 JSON，再 `build_float_model` 出 ONNX，
 两者同一次保存、源自同一量化器状态，天然自洽。
 
@@ -243,7 +245,7 @@ freeze/reset/导出遍历。
 
 遍历量化模型，对每个量化器用 `activation_scale_zp` / `weight_scale_zp` 提取
 scale/zero_point（内部按后端差异处理 lsqplus 的 β、minmax 的 zp、pact 的 α、
-dorefa 的 s），打包成 `{layer: {scale, zero_point}}`。`required_quant_keys` 校验
+**新版 dorefa 激活走 lsqplus scale/beta 路径 + 权重线性对称（amax/Qp）**），打包成 `{layer: {scale, zero_point}}`。`required_quant_keys` 校验
 导出完整性（硬断言）。
 
 ### 7.3 `build_float_model` 与 clip 折叠
@@ -293,8 +295,10 @@ YOLO 主干大量用 **SiLU/ReLU**，激活值天然 ≥ 0。unsigned（[0,255]�
 （[-128,127]）能用满正半轴分辨率——int8 精度几乎无损的关键。
 
 - **非对称后端**（lsqplus_v1/v2、pact、minmax）：原生支持，稳定无损
-- **对称后端**（lsq_v1/v2、dorefa）：零点被迫在边界外，unsigned 激活严重截断 →
+- **对称后端**（lsq_v1/v2、minmax）：零点被迫在边界外，unsigned 激活严重截断 →
   **掉点 0.18~0.37，PTQ 崩塌**。对称后端必须配 `act_signed`
+  （**2026-10**：dorefa 已改为非对称激活，不再属于对称后端；minmax 激活可配置
+  zero_point，技术上能跑 unsigned，但量化损失因无动态缩放而偏大，实测 PTQ 接近 0）
 
 ### 8.2 权重 signed（`w_all_positive=False`，默认）
 
@@ -358,13 +362,13 @@ quant_params 完整。meta 通过 `**(meta or {})` 透传记录量化方法/配�
 | ONNX 导出 `aten::copy_` 失败 | `_ClipOnlyQuantizer.forward` 里用了 `.to()` | 边界用 `register_buffer`，forward 不做 device 转换 |
 | QuantCat 量化器漏替换 | 量化器装在 `ModuleList`，属性名非常规 | 递归 + `hasattr(child,'clip_bounds')` 鸭子类型遍历 |
 | bash 断点续跑失效 | `already_ok` 匹配 `[OK] task=` 但日志行是 `[OK] 日期 task=` | 正则锚定带日期的 `[OK]` 行 |
-| seg/dorefa OOM | 640 分辨率 + tanh 量化器显存大 | seg 与全任务 dorefa 的 QAT 一律 batch=4 |
+| seg/dorefa OOM（**2026-10 已修复**） | 640 分辨率 + tanh 量化器显存大 | 旧版 seg 与全任务 dorefa 的 QAT 一律 batch=4；新版移除 tanh 后全任务统一 batch=8 |
 | LSQ v1/pact dummy 全零 | 全零致 scale=0 → NaN | dummy 输入 `randn*0.1` |
 | seg/pose head 量化器缺 key | 用 det 的 set_quant_method 跨任务 | seg/pose 各自独立的 set_quant_method |
-| dorefa unsigned 激活坍缩 | tanh 域无界激活 | 加可学习尺度 s 修复 |
+| dorefa unsigned 激活坍缩（**2026-10 已修复**） | v1 tanh 域强制对称，无 zero_point | 旧版加可学习尺度 s 临时修复；新版激活改用 LSQ+ 非对称公式，彻底解决 |
 
 **为什么用鸭子类型而非注册表/继承**：7 个后端的量化器内部结构差异大（pact 学 α、
-lsqplus 学 β、minmax 无参数、dorefa tanh 域），强行统一基类束缚实现。`hasattr`
+lsqplus 学 β、minmax 无参数、dorefa 用线性对称网格权重 + 非对称激活），强行统一基类束缚实现。`hasattr`
 契约（`weight_quantizer`/`clip_bounds`/`quant_inference`）提供跨后端最小公共面，
 各后端在各自文件里独立实现全套算子、互不依赖。
 

@@ -393,12 +393,10 @@ def weight_scale_zp(module):
         zero_point = (wq.qmin - r_min / scale).round().clamp(wq.qmin, wq.qmax)
         return _pack(scale, zero_point)
 
-    # dorefa / pact（pact 权重量化器就是 DorefaWeightQuantizer）：
-    # tanh 域非线性网格没有严格统一的 weight 域 scale，
-    # 这里用反量化权重的幅度近似一个对称 scale，仅用于参数文件完整性。
+    # dorefa / pact（pact 权重量级化器就是 DorefaWeightQuantizer）：
+    # 新版 dorefa 权重为线性网格（无 tanh 非线性），scale = maxvalue / Qp。
     # / dorefa / pact (pact weight quantizer is DorefaWeightQuantizer):
-    #   tanh-domain non-linear grid has no strict uniform weight-domain scale.
-    #   We approximate a symmetric scale using the magnitude of dequantized weights, only for param-file completeness.
+    #   new dorefa weights use a linear grid (no tanh nonlinearity), scale = maxvalue / Qp.
     with torch.no_grad():
         w_dq = wq(module.weight).detach()
     qp = wq.Qp
@@ -408,10 +406,13 @@ def weight_scale_zp(module):
             amax = w_tmp.max(dim=1).values
         else:
             amax = w_tmp.abs().max(dim=1).values
-        scale = (amax if getattr(wq, "all_positive", False) else 2.0 * amax) / qp
     else:
         amax = w_dq.max() if getattr(wq, "all_positive", False) else w_dq.abs().max()
-        scale = (amax if getattr(wq, "all_positive", False) else 2.0 * amax) / qp
+    # 新版 dorefa 权重网格 q_w = maxvalue * round(w/maxvalue * Qp) / Qp 的精确步长为 maxvalue/Qp，
+    # 用反量化权重的幅度近似 maxvalue（边界落在网格上时恰好相等）/
+    # / new dorefa weight grid q_w = maxvalue * round(w/maxvalue * Qp) / Qp has exact step maxvalue/Qp;
+    #   approximate maxvalue with dequantized weight magnitude (equal when boundary lands on the grid).
+    scale = amax / qp
     scale = scale.to(torch.float64).flatten()
     return _pack(scale, torch.zeros_like(scale, dtype=torch.int64))
 

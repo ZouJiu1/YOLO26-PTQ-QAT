@@ -125,9 +125,9 @@ for task in "${TASKS[@]}"; do
   for q in ${TASK_QUANTS[$task]}; do
     for cfg in "${CONFIGS[@]}"; do
       echo "--- backend: ${q} | config: ${cfg} (${CFG_ARGS[$cfg]:-default}) ---"
-      qat_override=""
-      [ "$task" = "seg" ] && [ "$q" = "dorefa" ] && qat_override=4
-      [ -n "$qat_override" ] && export QAT_BATCH_OVERRIDE=$qat_override || unset QAT_BATCH_OVERRIDE
+      # 新版 dorefa 为线性网格（无 tanh），显存峰值与其他后端一致，无需降 batch /
+      # New dorefa uses a linear grid (no tanh); memory peak matches other backends, no batch downgrade needed.
+      unset QAT_BATCH_OVERRIDE
       export CFG_LABEL="$cfg"
 
       if ! run_stage "$task" "$q" "ptq" "$ROOT/log/mini_${task}_${q}_${cfg}_ptq.log" ${CFG_ARGS[$cfg]}; then

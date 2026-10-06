@@ -172,20 +172,15 @@ for task in "${TASKS[@]}"; do
   #    per backend × per config: PTQ → QAT → compare; if one stage fails, skip the rest.
   #    日志名 / Log naming: 所有配置均显式命名 mini_{task}_{q}_{cfg}_{stage}.log；
   #    模型目录由网络脚本按量化参数标签隔离，如 <q>_a8w8_per_channel_act_unsigned/。
-  #    dorefa（tanh 激活）QAT 显存峰值最高，8GB GPU 上 batch=8 会 OOM：
-  #    所有任务的 dorefa QAT 一律降到 batch=4（compare 仍 8）/
-  #    dorefa (tanh activations) has the highest QAT memory peak and OOMs at
-  #    batch=8 on the 8GB GPU: use batch=4 for dorefa QAT on ALL tasks (compare stays 8).
+  #    新版 dorefa 已去除 tanh 非线性（线性网格），QAT 显存峰值与其他后端一致，无需降 batch /
+  #    New dorefa removed the tanh nonlinearity (linear grid); its QAT memory peak matches other
+  #    backends, so no batch downgrade is needed.
   #    注：pact 后端的权重量级化默认走 lsqplus_v1（pact_w_quant，见 QUANT_CFG）/
   #    Note: the pact backend quantizes weights with lsqplus_v1 by default (pact_w_quant in QUANT_CFG).
   for q in "${QUANTS[@]}"; do
     for cfg in "${CONFIGS[@]}"; do
       echo "---------------- backend: ${q} | config: ${cfg} (${CFG_ARGS[$cfg]:-code default}) ----------------"
-      qat_override=""
-      if [ "$q" = "dorefa" ]; then
-        qat_override=4
-      fi
-      if [ -n "$qat_override" ]; then export QAT_BATCH_OVERRIDE=$qat_override; else unset QAT_BATCH_OVERRIDE; fi
+      unset QAT_BATCH_OVERRIDE
       export CFG_LABEL="$cfg"
       if ! run_stage "$task" "$q" "ptq" "$ROOT/log/mini_${task}_${q}_${cfg}_ptq.log" ${CFG_ARGS[$cfg]}; then
         echo "[SKIP]  task=${task} backend=${q} cfg=${cfg} PTQ 失败，跳过 QAT/compare / PTQ failed, skip QAT/compare"

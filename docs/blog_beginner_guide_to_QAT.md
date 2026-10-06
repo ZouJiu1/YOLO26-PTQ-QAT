@@ -1,4 +1,4 @@
-# YOLO26从零开始搞懂神经网络量化：一篇详细实战指南
+# YOLO26从零开始搞懂神经网络量化PTQ和QAT：一篇详细实战指南
 
 >本文撰写的部分内容来自人工智能大模型Kimi-K3
 
@@ -696,7 +696,9 @@ def save_quant_outputs(model, prefix):
 
 为什么？
 
-因为板端 NPU 有自己的 PTQ 工具链。你给它一个浮点 ONNX，它自己会用校准数据重新算 scale/zp。你导出的 JSON 量化参数是**参考值**，方便和板端结果对比。
+因为板端 NPU 有自己的 PTQ 工具链。你给它一个浮点 ONNX，它自己会用校准数据重新算 scale/zp。**你导出的 JSON 量化参数只是"参考值"**——板端最终部署时会**重新计算**，以板端 PTQ 工具算出的为准；JSON 只是方便你在编译前把"训练侧算出的"和"板端算出的"做一次交叉对比，看看差异是否在可接受范围。
+
+> **记住**：JSON 里的 scale / zero_point ≠ 部署最终用的参数；**嵌入式板子的 PTQ 工具会自动重新算 scale 和 zero_point**，导出的 JSON 仅供你交叉验证。
 
 如果你需要保留 QAT 训练时的截断行为（比如某些组合下权重依赖 clip），可以用 `build_float_model(..., use_clip=True)`，导出带 `Clip` 节点的 ONNX。
 
@@ -725,7 +727,7 @@ def save_quant_outputs(model, prefix):
   │  LSQ: 学一种"快速读数法"（学 scale）                       │
   │  LSQ+: 不仅学读数法，还学"怎么调整零点"（学 scale + beta） │
   │  PACT: 先用手摸额头判断发烧，再用体温计（先截断再量化）     │
-  │  DoReFa: 用一种特殊刻度尺（tanh 域）                       │
+  │  DoReFa: 新版改用线性对称刻度尺（权重） + 非对称标准公式（激活）│
   └─────────────────────────────────────────────────────────┘
 ```
 
@@ -736,7 +738,7 @@ def save_quant_outputs(model, prefix):
 | `lsq_v1` | LSQ | 对称 | 只学 scale | ⭐⭐ 轻量选择 |
 | `lsq_v2` | LSQ V2 | 对称 | 同上，s 初始化为 1 | ⭐⭐ 对照实验 |
 | `minmax` | MinMax | 非对称 | 直接统计 min/max | ⭐⭐⭐ baseline |
-| `dorefa` | DoReFa | 对称 | tanh 域固定网格 + 学激活尺度 | ⭐ 研究用 |
+| `dorefa` | DoReFa（新版） | 激活非对称 / 权重对称 | 激活走标准 scale+beta 公式，权重线性对称网格（maxvalue/Qp 步长） | ⭐⭐⭐ 稳定可用 |
 | `pact` | PACT | 非对称 | 学 clip 阈值 alpha | ⭐⭐ 部分场景好 |
 
 ### 10.1 LSQ / LSQ+：可学习的 Scale
@@ -789,13 +791,28 @@ x_clipped = x.clamp(0, alpha)  # 先截断
 q = round(x_clipped / scale)   # 再量化
 ```
 
-### 10.4 DoReFa：固定网格 + 可学习尺度
+### 10.4 DoReFa（新版）：线性权重网格 + 标准非对称激活
 
-DoReFa 比较特殊。它把权重先通过 `tanh` 压缩到 [-1, 1]，再量化到固定网格。
+**v1 版本 DoReFa 的问题**：原始论文把权重先通过 `tanh` 非线性压缩到 [-1,1] 再量化，反量化时用 `arctanh` 变换回来。这导致两个严重后果：
+1. **大权重被 tanh 压扁**：|w| 越大，tanh(w) 越接近 ±1，量化分辨率被严重压缩——对主导特征方向的大权重特别不利；
+2. **激活量化强制对称**：原始实现里激活只有一个对称网格，没有 zero_point，必须配合 act_signed 才能工作，act_unsigned 一上就 PTQ=0。
+3. **显存代价翻倍**：tanh/arctanh 是逐元素非线性运算，反向要保留中间张量，8GB 显存上 seg 任务被迫降 batch=4。
 
-激活量化器学一个尺度 `s`，把激活归一化后量化。
+**新版 DoReFa 修复**（2026-10）：
+- **权重量级化器**：去掉 tanh/arctanh，改为线性对称网格 `q_w = maxvalue × round(w/maxvalue × Qp) / Qp`。步长为 `maxvalue/Qp`，与 LSQ 对称权重公式一致。大权重不再被压扁。
+- **激活量化器**：去掉 `/s` 归一化 + `clamp(±1)` 硬截断，改为和 LSQ+ 完全相同的标准非对称公式——`scale` 可学习，`beta` 可学习（zero_point = round(-beta/scale) 隐式表示）。act_unsigned 现在可以正常工作了。
 
-原始 DoReFa 的激活是无界的，容易导致精度坍缩。本项目修复了这个问题：给激活加了一个可学习尺度 `s`。
+**实验结果**（yolo26n，COCO mini）：
+| 任务 | 配置 | 旧版 QAT Δ | 新版 QAT Δ |
+|------|------|-----------|-----------|
+| detect | per_channel + act_unsigned | −0.2185（PTQ=0） | **−0.0091** ✅ |
+| seg | per_tensor + act_unsigned | −0.2906（PTQ=0） | **+0.0072** ✅ |
+| pose | per_tensor + act_unsigned | −0.3118（PTQ=0） | **+0.0061** ✅ |
+| detect | per_channel + act_signed | −0.0164 | **−0.0058** ✅ |
+
+三任务全部稳定在 Δ ±0.01 以内，act_unsigned 不再是必崩配置。8GB 显存 QAT batch=8 全任务正常，不再需要单独降级。
+
+**设计取舍说明**：新版把 DoReFa 的"创新点"（tanh 域非线性）全部移除，保留了"可学习激活尺度"这一核心思想，但用了 LSQ+ 已经验证过更稳定的非对称公式实现。严格意义上这不再是"经典 DoReFa"，而是"用 DoReFa 名字的线性后端"。保留这个后端纯粹为了让 README 里原有的 7 后端对照矩阵仍然完整；如果只追求部署精度，**lsqplus_v1 仍然是首选推荐**。
 
 ### 10.5 后端切换有多简单？
 
@@ -1022,10 +1039,10 @@ QuantAdd = backend.QuantAdd
 
 | 后端类型 | 配 unsigned 激活 | 配 signed 激活 |
 |----------|------------------|----------------|
-| 非对称（lsqplus_v1/v2, pact） | ✅ 稳定，无损 | ✅ 也稳定 |
-| 对称（lsq_v1/v2, minmax, dorefa） | ❌ 严重掉点（-0.18 ~ -0.37） | ✅ 稳定 |
+| 非对称（lsqplus_v1/v2, pact, **新版 dorefa**） | ✅ 稳定，无损 | ✅ 也稳定 |
+| 对称（lsq_v1/v2, minmax） | ❌ 严重掉点（-0.18 ~ -0.37） | ✅ 稳定 |
 
-**原因**：对称后端的 zero_point 被迫在边界外，unsigned 激活会被严重截断。这是一个系统性的问题，换数据集也救不了。
+**原因**：对称后端的 zero_point 被迫在边界外，unsigned 激活会被严重截断。这是一个系统性的问题，换数据集也救不了。**2026-10 修复**：DoReFa 激活量化器已改为非对称公式，配 unsigned 激活现在稳定（三任务 QAT Δ ±0.01 以内）。
 
 ### 13.4 权重必须保持有符号
 
@@ -1078,13 +1095,15 @@ QuantAdd = backend.QuantAdd
 
 **修复**：dummy 输入改用 `torch.randn() * 0.1`。
 
-### 14.5 seg + dorefa 在 8GB 显存上 OOM
+### 14.5 seg + dorefa 在 8GB 显存上 OOM（**2026-10 已修复**）
 
-**现象**：segmentation 任务用 dorefa 后端时显存溢出。
+**现象**：segmentation 任务用旧版 dorefa 后端时显存溢出。
 
-**根因**：dorefa 的 tanh 量化器 + single_mask_loss 的 einsum 操作，显存峰值太高。
+**根因**：dorefa 的 tanh/arctanh 非线性量化器 + single_mask_loss 的 einsum 操作，显存峰值太高。
 
-**修复**：seg 和 dorefa 的 QAT batch size 降为 4（其他任务保持 8）。
+**旧修复**：seg 和 dorefa 的 QAT batch size 降为 4（其他任务保持 8）。
+
+**新修复**（2026-10）：新版 dorefa 完全移除了 tanh/arctanh 非线性，权重改为线性对称网格，激活改为标准非对称公式。显存峰值与 lsqplus_v1 一致，**所有任务统一 batch=8，不再需要单独降级**。
 
 ### 14.6 路径里有空格导致日志写错
 
@@ -1101,7 +1120,7 @@ QuantAdd = backend.QuantAdd
 1. **量化是什么**：把 FP32 换成 int8，让模型能在嵌入式设备上跑。
 2. **完整流水线**：Float → PTQ → QAT → Compare → Deploy。
 3. **数据准备**：采集、标注、校准集的选择。
-4. **7 个后端**：LSQ+（推荐）、MinMax（baseline）、PACT/DoReFa（研究用）。
+4. **7 个后端**：LSQ+（推荐）、MinMax（baseline）、PACT（部分场景好）、DoReFa（新版线性网格，稳定可用，三任务 QAT Δ ±0.01 以内）。
 5. **全算子量化**：不只是 Conv，Add、Concat、SiLU 都要量化。
 6. **关键配置**：非对称后端配 unsigned 激活、权重必须有符号、per_channel 精度更高。
 

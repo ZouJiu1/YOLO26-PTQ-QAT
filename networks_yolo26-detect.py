@@ -1722,7 +1722,7 @@ def _apply_minmax_to_quantizer(q, cur_min, cur_max, eps=1e-8):
     各后端的 scale 语义不同，按各自原生公式赋值 / Each backend has different scale semantics, assigned by its native formula:
       - minmax:  写 r_min/r_max 并按其 forward 公式重算 scale/zero_point / write r_min/r_max and recompute scale/zero_point per its forward formula;
       - pact:    alpha = 绝对值最大（与其原生自初始化一致） / alpha = max abs value (consistent with its native self-init);
-      - dorefa:  s = 激活幅度上界（归一化尺度，不是网格 scale） / s = activation magnitude upper bound (normalization scale, not grid scale);
+      - dorefa:  新版与 lsqplus 同公式（s + beta 非对称），走 beta 分支 / new dorefa shares lsqplus formula (asymmetric s + beta), handled by the beta branch;
       - lsqplus: s = (max-min)/(Qp-Qn)，beta = min - s*Qn（非对称精确覆盖） / s = (max-min)/(Qp-Qn), beta = min - s*Qn (asymmetric exact coverage);
       - lsq:     对称网格，取能覆盖 [min, max] 的最小 scale / symmetric grid, take smallest scale covering [min, max].
     """
@@ -1760,15 +1760,17 @@ def _apply_minmax_to_quantizer(q, cur_min, cur_max, eps=1e-8):
     Qn = getattr(q, "Qn", None)
     Qp = getattr(q, "Qp", None)
     if hasattr(q, "s") and Qn is not None:
-        if hasattr(q, "_set_init_state"):
-            # dorefa：s 是激活幅度上界（x/s 归一化到 [-1,1] 再量化） / dorefa: s is activation magnitude upper bound (x/s normalize to [-1,1] then quantize)
+        if hasattr(q, "_set_init_state") and not hasattr(q, "beta"):
+            # 旧版 dorefa（tanh 域归一化）已废弃；保留此分支仅为兼容旧 checkpoint /
+            # Legacy dorefa (tanh-domain normalization) is deprecated; kept only for old checkpoints
             if getattr(q, "all_positive", False):
                 cur_s = cur_max.clamp(min=1e-6)
             else:
                 cur_s = torch.maximum(cur_min.abs(), cur_max.abs()).clamp(min=1e-6)
             q.s.data.copy_(cur_s.reshape(q.s.shape).to(q.s.device))
         elif hasattr(q, "beta"):
-            # lsqplus：非对称 scale + beta 精确覆盖 [min, max] / lsqplus: asymmetric scale + beta exact coverage of [min, max]
+            # lsqplus / 新版 dorefa：非对称 scale + beta 精确覆盖 [min, max] /
+            # lsqplus / new dorefa: asymmetric scale + beta exact coverage of [min, max]
             cur_s = torch.clamp(cur_max - cur_min, min=eps) / (Qp - Qn)
             q.s.data.copy_(cur_s.reshape(q.s.shape).to(q.s.device))
             cur_beta = cur_min - cur_s * Qn

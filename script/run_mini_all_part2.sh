@@ -147,12 +147,9 @@ for task in "${MAIN_TASKS[@]}"; do
   for q in ${MAIN_TASK_QUANTS[$task]}; do
     for cfg in "${MAIN_CONFIGS[@]}"; do
       echo "--- backend: ${q} | config: ${cfg} (${MAIN_CFG_ARGS[$cfg]:-default}) ---"
-      qat_override=""
-      # 双脚本并行共用 8GB 显存：dorefa（tanh 激活）QAT 显存峰值最高，所有任务一律降 batch=4 /
-      # Two scripts share one 8GB GPU in parallel: dorefa (tanh activations) has the highest QAT
-      # memory peak, so use batch=4 for dorefa QAT on ALL tasks (avoids CUDA OOM).
-      [ "$q" = "dorefa" ] && qat_override=4
-      [ -n "$qat_override" ] && export QAT_BATCH_OVERRIDE=$qat_override || unset QAT_BATCH_OVERRIDE
+      # 新版 dorefa 为线性网格（无 tanh），显存峰值与其他后端一致，无需降 batch /
+      # New dorefa uses a linear grid (no tanh); memory peak matches other backends, no batch downgrade needed.
+      unset QAT_BATCH_OVERRIDE
       export CFG_LABEL="$cfg"
 
       if ! run_stage "$task" "$q" "ptq" "$ROOT/log/mini_${task}_${q}_${cfg}_ptq.log" ${MAIN_CFG_ARGS[$cfg]}; then
@@ -192,9 +189,9 @@ for task in "${TASKS[@]}"; do
   for q in "${QUANTS[@]}"; do
     for cfg in "${CONFIGS[@]}"; do
       echo "--- backend: ${q} | config: ${cfg} (${CFG_ARGS[$cfg]}) ---"
-      qat_override=""
-      [ "$task" = "seg" ] && [ "$q" = "dorefa" ] && qat_override=4
-      [ -n "$qat_override" ] && export QAT_BATCH_OVERRIDE=$qat_override || unset QAT_BATCH_OVERRIDE
+      # 新版 dorefa 为线性网格（无 tanh），显存峰值与其他后端一致，无需降 batch /
+      # New dorefa uses a linear grid (no tanh); memory peak matches other backends, no batch downgrade needed.
+      unset QAT_BATCH_OVERRIDE
       export CFG_LABEL="$cfg"
 
       if ! run_stage "$task" "$q" "ptq" "$ROOT/log/mini_${task}_${q}_${cfg}_ptq.log" ${CFG_ARGS[$cfg]}; then
@@ -205,7 +202,6 @@ for task in "${TASKS[@]}"; do
         echo "[SKIP] QAT failed"
         continue
       fi
-      unset QAT_BATCH_OVERRIDE
       run_stage "$task" "$q" "compare" "$ROOT/log/mini_${task}_${q}_${cfg}_compare.log" ${CFG_ARGS[$cfg]}
     done
   done

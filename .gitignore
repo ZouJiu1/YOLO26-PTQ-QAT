@@ -14,7 +14,9 @@ fvisualize
 */fvisualize/*
 model/*/*/fvisualize
 dataset/depth8-png
+model_archive
 model
+.vscode
 dataset/detect
 datas
 tmp
