@@ -258,10 +258,17 @@ nohup bash script/run_mini_all_part2.sh > log/mini_sweep_part2.log 2>&1 &
 
 #### 主矩阵：detect（val 50 张，80 类）— Float 基线 mAP50 **0.5814** / mAP50-95 0.4321
 
-每行对应三个连续阶段。把 `{BACKEND}` 和 `{FLAGS}` 从下表填入即可：
+每行对应四个连续阶段。**Float 训练每个任务只跑一次**（所有量化后端共享的基线），然后把 `{BACKEND}` 和 `{FLAGS}` 从下表填入即可跑 ②③④：
 
 ```bash
-# PTQ 校准（20 个 batch，不训练，每个配置跑一次）
+# ① Float 基线训练（50 epoch，每个任务只跑一次，所有量化后端共享）
+python3 networks_yolo26-detect.py \
+  --model yolo26n --stage float \
+  --data dataset/coco_mini_detect.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0
+
+# ② PTQ 校准（20 个 batch，不训练，每个后端每个配置跑一次）
 python3 networks_yolo26-detect.py \
   --model yolo26n --stage ptq --quant {BACKEND} \
   --data dataset/coco_mini_detect.yaml \
@@ -269,7 +276,7 @@ python3 networks_yolo26-detect.py \
   --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
   {FLAGS}
 
-# QAT 微调（10 epoch，加载 model/yolo26-detect/n/{dir}/ 下的 PTQ checkpoint）
+# ③ QAT 微调（10 epoch，加载 model/yolo26-detect/n/{dir}/ 下的 PTQ checkpoint）
 python3 networks_yolo26-detect.py \
   --model yolo26n --stage qat --quant {BACKEND} \
   --data dataset/coco_mini_detect.yaml \
@@ -277,7 +284,7 @@ python3 networks_yolo26-detect.py \
   --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
   {FLAGS}
 
-# 对比 float vs QAT（加载 float best 和 QAT checkpoint，分别评估）
+# ④ 对比 float vs QAT（加载 float best 和 QAT checkpoint，分别评估）
 python3 networks_yolo26-detect.py \
   --model yolo26n --stage compare --quant {BACKEND} \
   --data dataset/coco_mini_detect.yaml \
@@ -310,10 +317,16 @@ python3 networks_yolo26-detect.py \
 
 #### 主矩阵：seg（val 50 张；指标为 mask mAP50）— Float 基线 mask mAP50 **0.5001**（部分单元 0.4739/0.4878，见注）
 
-每行对应三个连续阶段（与 detect 模板相同，换脚本名和 --data）：
+每行对应四个连续阶段（float 每个任务只跑一次，所有量化后端共享；把 `{BACKEND}` 和 `{FLAGS}` 填入 ②③④）：
 
 ```bash
-# PTQ → QAT → Compare for seg：把 {BACKEND} 和 {FLAGS} 从下表填入
+# ① Float 基线训练（50 epoch，每个任务只跑一次）
+python3 networks_yolo26-seg.py --model yolo26n --stage float \
+  --data dataset/coco_mini_seg.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0
+
+# ② PTQ → ③ QAT → ④ Compare（同 detect，换 seg 脚本和 yaml）
 python3 networks_yolo26-seg.py --model yolo26n --stage ptq --quant {BACKEND} \
   --data dataset/coco_mini_seg.yaml \
   --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
@@ -355,10 +368,16 @@ python3 networks_yolo26-seg.py --model yolo26n --stage ptq --quant {BACKEND} \
 
 #### 主矩阵：pose（val 27 张，person 单类；指标为 pose 关键点 mAP50）— Float 基线 pose mAP50 **0.4839**
 
-每行对应三个连续阶段（换脚本名和 --data）：
+每行对应四个连续阶段（float 每个任务只跑一次，所有量化后端共享；把 `{BACKEND}` 和 `{FLAGS}` 填入 ②③④）：
 
 ```bash
-# PTQ → QAT → Compare for pose：把 {BACKEND} 和 {FLAGS} 从下表填入
+# ① Float 基线训练（50 epoch，每个任务只跑一次）
+python3 networks_yolo26-pose.py --model yolo26n --stage float \
+  --data dataset/coco_mini_pose.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0
+
+# ② PTQ → ③ QAT → ④ Compare（同 detect，换 pose 脚本和 yaml）
 python3 networks_yolo26-pose.py --model yolo26n --stage ptq --quant {BACKEND} \
   --data dataset/coco_mini_pose.yaml \
   --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \

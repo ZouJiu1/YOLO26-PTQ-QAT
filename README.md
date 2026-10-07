@@ -283,10 +283,17 @@ Log naming: `log/mini_{task}_{backend}_{config}_{stage}.log`.
 
 #### Main matrix: detect (50 val images, 80 classes) — Float baseline mAP50 **0.5814** / mAP50-95 0.4321
 
-Each row corresponds to three consecutive stages. Replace `{BACKEND}` and `{FLAGS}` from the table below:
+Each row corresponds to four consecutive stages. **Float stage runs once for the whole task** (not per config — it is the baseline that all quantization backends share). Then replace `{BACKEND}` and `{FLAGS}` from the table below for the remaining three stages:
 
 ```bash
-# PTQ calibration (20 batches, no training — run once per config)
+# ① Float baseline training (50 epochs — run ONCE per task, shared by all quant backends)
+python3 networks_yolo26-detect.py \
+  --model yolo26n --stage float \
+  --data dataset/coco_mini_detect.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0
+
+# ② PTQ calibration (20 batches, no training — run once per config per backend)
 python3 networks_yolo26-detect.py \
   --model yolo26n --stage ptq --quant {BACKEND} \
   --data dataset/coco_mini_detect.yaml \
@@ -294,7 +301,7 @@ python3 networks_yolo26-detect.py \
   --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
   {FLAGS}
 
-# QAT fine-tuning (10 epochs, loads PTQ checkpoint from model/yolo26-detect/n/{dir}/)
+# ③ QAT fine-tuning (10 epochs, loads PTQ checkpoint from model/yolo26-detect/n/{dir}/)
 python3 networks_yolo26-detect.py \
   --model yolo26n --stage qat --quant {BACKEND} \
   --data dataset/coco_mini_detect.yaml \
@@ -302,7 +309,7 @@ python3 networks_yolo26-detect.py \
   --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
   {FLAGS}
 
-# Compare float vs QAT (loads float best and QAT checkpoint, evaluates both)
+# ④ Compare float vs QAT (loads float best and QAT checkpoint, evaluates both)
 python3 networks_yolo26-detect.py \
   --model yolo26n --stage compare --quant {BACKEND} \
   --data dataset/coco_mini_detect.yaml \
@@ -335,10 +342,16 @@ python3 networks_yolo26-detect.py \
 
 #### Main matrix: seg (50 val images; metric = mask mAP50) — Float baseline mask mAP50 **0.5001** (some cells 0.4739/0.4878, see notes)
 
-Three stages per row (same template as detect above, change `--data` and script name):
+Four stages per row (float runs ONCE per task, shared by all quant backends; replace `{BACKEND}` and `{FLAGS}` in stages ②③④):
 
 ```bash
-# PTQ → QAT → Compare for seg: replace {BACKEND} and {FLAGS} from the table
+# ① Float baseline (50 epochs — run ONCE)
+python3 networks_yolo26-seg.py --model yolo26n --stage float \
+  --data dataset/coco_mini_seg.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0
+
+# ② PTQ → ③ QAT → ④ Compare (same as detect, use seg script + yaml above)
 python3 networks_yolo26-seg.py --model yolo26n --stage ptq --quant {BACKEND} \
   --data dataset/coco_mini_seg.yaml \
   --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
@@ -380,10 +393,16 @@ python3 networks_yolo26-seg.py --model yolo26n --stage ptq --quant {BACKEND} \
 
 #### Main matrix: pose (27 val images, single person class; metric = keypoint pose mAP50) — Float baseline pose mAP50 **0.4839**
 
-Three stages per row (same template, change `--data` and script name):
+Four stages per row (float runs ONCE per task, shared by all quant backends; replace `{BACKEND}` and `{FLAGS}` in stages ②③④):
 
 ```bash
-# PTQ → QAT → Compare for pose: replace {BACKEND} and {FLAGS} from the table
+# ① Float baseline (50 epochs — run ONCE)
+python3 networks_yolo26-pose.py --model yolo26n --stage float \
+  --data dataset/coco_mini_pose.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0
+
+# ② PTQ → ③ QAT → ④ Compare (same as detect, use pose script + yaml above)
 python3 networks_yolo26-pose.py --model yolo26n --stage ptq --quant {BACKEND} \
   --data dataset/coco_mini_pose.yaml \
   --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
