@@ -243,7 +243,7 @@ nohup bash script/run_mini_all_part2.sh > log/mini_sweep_part2.log 2>&1 &
 保留为单脚本串行全量版（8 配置 × 3 任务 × 7 后端，不拆并行）。
 日志命名：`log/mini_{task}_{backend}_{config}_{stage}.log`。
 
-### 全后端横评结果（1/100 COCO mini，float 50ep / QAT 10ep，batch=8；seg/dorefa QAT batch=4）
+### 全后端横评结果（1/100 COCO mini，float 50ep / QAT 10ep，全任务全后端统一 batch=8；seg 少数组合 loss 异常——mask bce 初始化问题，非显存）
 
 > 评估集仅 50 张（pose 27 张），mAP/P/R 为小样本结果，主要用于**横向对比与回归验证**，
 > 不代表 COCO 全量精度。结果由 `script/run_mini_all_part1.sh` / `run_mini_all_part2.sh` 自动产出。
@@ -258,90 +258,142 @@ nohup bash script/run_mini_all_part2.sh > log/mini_sweep_part2.log 2>&1 &
 
 #### 主矩阵：detect（val 50 张，80 类）— Float 基线 mAP50 **0.5814** / mAP50-95 0.4321
 
-| 后端 | 配置 | PTQ mAP50 | QAT mAP50 | Δ mAP50 |
-|---|---|---|---|---|
-| **lsqplus_v1** | **per_channel + act_unsigned（推荐）** | 0.5663 | 0.5807 | **−0.0007** |
-| lsqplus_v1 | per_tensor + act_unsigned | 0.5663 | 0.5865 | +0.0052 |
-| lsqplus_v1 | per_channel + act_signed | 0.5663 | 0.5783 | −0.0031 |
-| lsqplus_v1 | per_tensor + act_signed | 0.5663 | 0.5876 | +0.0062 |
-| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.4028 | −0.1786 |
-| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.3805 | −0.2009 |
-| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.3745 | −0.2069 |
-| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.3740 | −0.2074 |
-| minmax | per_channel + act_signed | 0.5404 | 0.5832 | +0.0018 |
-| minmax | per_tensor + act_signed | 0.5588 | 0.5818 | +0.0004 |
-| minmax | per_tensor + act_unsigned | 0.0000 | 0.3808 | −0.1831 |
-| dorefa | per_channel + act_unsigned | 0.5631 | 0.5723 | −0.0091 |
-| dorefa | per_tensor + act_unsigned | 0.5607 | 0.5779 | −0.0034 |
-| dorefa | per_channel + act_signed | 0.5753 | 0.5756 | −0.0058 |
-| dorefa | per_tensor + act_signed | 0.5609 | 0.5736 | −0.0078 |
-| pact | per_channel + act_unsigned | 0.5489 | **0.5940** | **+0.0126** |
-| pact | per_tensor + act_unsigned | 0.5736 | 0.5823 | +0.0184 |
-| pact | per_channel + act_signed | 0.5457 | 0.5770 | −0.0044 |
-| pact | per_tensor + act_signed | 0.5736 | 0.5862 | +0.0048 |
+每行对应三个连续阶段。把 `{BACKEND}` 和 `{FLAGS}` 从下表填入即可：
+
+```bash
+# PTQ 校准（20 个 batch，不训练，每个配置跑一次）
+python3 networks_yolo26-detect.py \
+  --model yolo26n --stage ptq --quant {BACKEND} \
+  --data dataset/coco_mini_detect.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  {FLAGS}
+
+# QAT 微调（10 epoch，加载 model/yolo26-detect/n/{dir}/ 下的 PTQ checkpoint）
+python3 networks_yolo26-detect.py \
+  --model yolo26n --stage qat --quant {BACKEND} \
+  --data dataset/coco_mini_detect.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  {FLAGS}
+
+# 对比 float vs QAT（加载 float best 和 QAT checkpoint，分别评估）
+python3 networks_yolo26-detect.py \
+  --model yolo26n --stage compare --quant {BACKEND} \
+  --data dataset/coco_mini_detect.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  {FLAGS}
+```
+
+| 后端 | 配置 | PTQ mAP50 | QAT mAP50 | Δ mAP50 | CLI Flags |
+|---|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned（推荐）** | 0.5663 | 0.5807 | **−0.0007** | *(默认)* |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.5663 | 0.5865 | +0.0052 | `--no-per-channel` |
+| lsqplus_v1 | per_channel + act_signed | 0.5663 | 0.5783 | −0.0031 | `--no-all-positive` |
+| lsqplus_v1 | per_tensor + act_signed | 0.5663 | 0.5876 | +0.0062 | `--no-per-channel --no-all-positive` |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.4028 | −0.1786 | *(默认)* |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.3805 | −0.2009 | `--no-per-channel` |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.3745 | −0.2069 | *(默认)* |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.3740 | −0.2074 | `--no-per-channel` |
+| minmax | per_channel + act_signed | 0.5404 | 0.5832 | +0.0018 | `--no-all-positive` |
+| minmax | per_tensor + act_signed | 0.5588 | 0.5818 | +0.0004 | `--no-per-channel --no-all-positive` |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.3808 | −0.1831 | `--no-per-channel` |
+| dorefa | per_channel + act_unsigned | 0.5631 | 0.5723 | −0.0091 | *(默认)* |
+| dorefa | per_tensor + act_unsigned | 0.5607 | 0.5779 | −0.0034 | `--no-per-channel` |
+| dorefa | per_channel + act_signed | 0.5753 | 0.5756 | −0.0058 | `--no-all-positive` |
+| dorefa | per_tensor + act_signed | 0.5609 | 0.5736 | −0.0078 | `--no-per-channel --no-all-positive` |
+| pact | per_channel + act_unsigned | 0.5489 | **0.5940** | **+0.0126** | *(默认)* |
+| pact | per_tensor + act_unsigned | 0.5736 | 0.5823 | +0.0184 | `--no-per-channel` |
+| pact | per_channel + act_signed | 0.5457 | 0.5770 | −0.0044 | `--no-all-positive` |
+| pact | per_tensor + act_signed | 0.5736 | 0.5862 | +0.0048 | `--no-per-channel --no-all-positive` |
 
 #### 主矩阵：seg（val 50 张；指标为 mask mAP50）— Float 基线 mask mAP50 **0.5001**（部分单元 0.4739/0.4878，见注）
 
-| 后端 | 配置 | PTQ mask | QAT mask | Δ mask |
-|---|---|---|---|---|
-| **lsqplus_v1** | **per_channel + act_unsigned（推荐）** | 0.4709 | 0.4980 | **−0.0021** |
-| lsqplus_v1 | per_tensor + act_unsigned | 0.4891 | 0.4993 | −0.0008 |
-| lsqplus_v1 | per_channel + act_signed | 0.4715 | 0.4921 | −0.0080 |
-| lsqplus_v1 | per_tensor + act_signed | 0.4834 | 0.4873 | +0.0134 |
-| lsqplus_v2 | per_channel + act_unsigned | 0.4577 | 0.4652 | −0.0087 |
-| lsqplus_v2 | per_tensor + act_unsigned | 0.4613 | 0.4349 | −0.0390 |
-| lsqplus_v2 | per_channel + act_signed | 0.4436 | 0.4725 | −0.0014 |
-| lsqplus_v2 | per_tensor + act_signed | 0.4545 | 0.4913 | −0.0088 |
-| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.1815 | −0.2924 |
-| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.1671 | −0.3068 |
-| lsq_v1 | per_channel + act_signed | 0.4439 | 0.4847 | −0.0154 |
-| lsq_v1 | per_tensor + act_signed | 0.4451 | 0.4735 | −0.0266 |
-| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.1953 | −0.2925 |
-| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1826 | −0.3052 |
-| lsq_v2 | per_channel + act_signed | 0.4332 | 0.4699 | −0.0302 |
-| lsq_v2 | per_tensor + act_signed | 0.4517 | 0.4856 | −0.0145 |
-| minmax | per_channel + act_unsigned | 0.0000 | 0.1434 | −0.3305 |
-| minmax | per_tensor + act_unsigned | 0.0000 | 0.1291 | −0.3448 |
-| minmax | per_channel + act_signed | 0.4826 | 0.4908 | −0.0093 |
-| minmax | per_tensor + act_signed | 0.4078 | 0.4857 | +0.0118 |
-| dorefa | per_channel + act_unsigned | 0.4945 | 0.4942 | −0.0060 |
-| dorefa | per_tensor + act_unsigned | 0.4732 | 0.5073 | +0.0072 |
-| dorefa | per_channel + act_signed | 0.4871 | 0.5038 | +0.0037 |
-| dorefa | per_tensor + act_signed | 0.4722 | 0.4964 | −0.0037 |
-| pact | per_channel + act_unsigned | 0.4794 | **0.5112** | **+0.0111** |
-| pact | per_tensor + act_unsigned | 0.4785 | 0.4888 | −0.0113 |
-| pact | per_channel + act_signed | 0.4934 | 0.4751 | +0.0598 ¹ |
-| pact | per_tensor + act_signed | 0.4659 | 0.4984 | −0.0017 |
+每行对应三个连续阶段（与 detect 模板相同，换脚本名和 --data）：
+
+```bash
+# PTQ → QAT → Compare for seg：把 {BACKEND} 和 {FLAGS} 从下表填入
+python3 networks_yolo26-seg.py --model yolo26n --stage ptq --quant {BACKEND} \
+  --data dataset/coco_mini_seg.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  {FLAGS}
+# 然后同样 --stage qat，再 --stage compare
+```
+
+| 后端 | 配置 | PTQ mask | QAT mask | Δ mask | CLI Flags |
+|---|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned（推荐）** | 0.4709 | 0.4980 | **−0.0021** | *(默认)* |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.4891 | 0.4993 | −0.0008 | `--no-per-channel` |
+| lsqplus_v1 | per_channel + act_signed | 0.4715 | 0.4921 | −0.0080 | `--no-all-positive` |
+| lsqplus_v1 | per_tensor + act_signed | 0.4834 | 0.4873 | +0.0134 | `--no-per-channel --no-all-positive` |
+| lsqplus_v2 | per_channel + act_unsigned | 0.4577 | 0.4652 | −0.0087 | *(默认)* |
+| lsqplus_v2 | per_tensor + act_unsigned | 0.4613 | 0.4349 | −0.0390 | `--no-per-channel` |
+| lsqplus_v2 | per_channel + act_signed | 0.4436 | 0.4725 | −0.0014 | `--no-all-positive` |
+| lsqplus_v2 | per_tensor + act_signed | 0.4545 | 0.4913 | −0.0088 | `--no-per-channel --no-all-positive` |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.1815 | −0.2924 | *(默认)* |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.1671 | −0.3068 | `--no-per-channel` |
+| lsq_v1 | per_channel + act_signed | 0.4439 | 0.4847 | −0.0154 | `--no-all-positive` |
+| lsq_v1 | per_tensor + act_signed | 0.4451 | 0.4735 | −0.0266 | `--no-per-channel --no-all-positive` |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.1953 | −0.2925 | *(默认)* |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1826 | −0.3052 | `--no-per-channel` |
+| lsq_v2 | per_channel + act_signed | 0.4332 | 0.4699 | −0.0302 | `--no-all-positive` |
+| lsq_v2 | per_tensor + act_signed | 0.4517 | 0.4856 | −0.0145 | `--no-per-channel --no-all-positive` |
+| minmax | per_channel + act_unsigned | 0.0000 | 0.1434 | −0.3305 | *(默认)* |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.1291 | −0.3448 | `--no-per-channel` |
+| minmax | per_channel + act_signed | 0.4826 | 0.4908 | −0.0093 | `--no-all-positive` |
+| minmax | per_tensor + act_signed | 0.4078 | 0.4857 | +0.0118 | `--no-per-channel --no-all-positive` |
+| dorefa | per_channel + act_unsigned | 0.4945 | 0.4942 | −0.0060 | *(默认)* |
+| dorefa | per_tensor + act_unsigned | 0.4732 | 0.5073 | +0.0072 | `--no-per-channel` |
+| dorefa | per_channel + act_signed | 0.4871 | 0.5038 | +0.0037 | `--no-all-positive` |
+| dorefa | per_tensor + act_signed | 0.4722 | 0.4964 | −0.0037 | `--no-per-channel --no-all-positive` |
+| pact | per_channel + act_unsigned | 0.4794 | **0.5112** | **+0.0111** | *(默认)* |
+| pact | per_tensor + act_unsigned | 0.4785 | 0.4888 | −0.0113 | `--no-per-channel` |
+| pact | per_channel + act_signed | 0.4934 | 0.4751 | +0.0598 ¹ | `--no-all-positive` |
+| pact | per_tensor + act_signed | 0.4659 | 0.4984 | −0.0017 | `--no-per-channel --no-all-positive` |
 
 #### 主矩阵：pose（val 27 张，person 单类；指标为 pose 关键点 mAP50）— Float 基线 pose mAP50 **0.4839**
 
-| 后端 | 配置 | PTQ pose | QAT pose | Δ pose |
-|---|---|---|---|---|
-| **lsqplus_v1** | **per_channel + act_unsigned（推荐）** | 0.4823 | 0.4876 | **+0.0037** |
-| lsqplus_v1 | per_tensor + act_unsigned | 0.4823 | 0.4874 | +0.0035 |
-| lsqplus_v1 | per_channel + act_signed | 0.4823 | 0.4827 | −0.0012 |
-| lsqplus_v1 | per_tensor + act_signed | 0.4823 | 0.4849 | +0.0010 |
-| lsqplus_v2 | per_channel + act_unsigned | 0.4823 | 0.4806 | −0.0033 |
-| lsqplus_v2 | per_tensor + act_unsigned | 0.4823 | 0.4895 | +0.0056 |
-| lsqplus_v2 | per_channel + act_signed | 0.4823 | 0.4875 | +0.0037 |
-| lsqplus_v2 | per_tensor + act_signed | 0.4823 | 0.4783 | −0.0056 |
-| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.2388 | −0.2451 |
-| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.2100 | −0.2739 |
-| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.2415 | −0.2424 |
-| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1875 | −0.2964 |
-| minmax | per_channel + act_unsigned | 0.0000 | 0.1192 | −0.3647 |
-| minmax | per_tensor + act_unsigned | 0.0000 | 0.1136 | −0.3703 |
-| dorefa | per_channel + act_unsigned | 0.4942 | 0.4843 | +0.0004 |
-| dorefa | per_tensor + act_unsigned | 0.4856 | 0.4900 | +0.0061 |
-| dorefa | per_channel + act_signed | 0.4836 | 0.4792 | −0.0047 |
-| dorefa | per_tensor + act_signed | 0.4844 | 0.4758 | −0.0081 |
-| pact | per_channel + act_unsigned | 0.4845 | 0.4846 | +0.0007 |
-| pact | per_tensor + act_unsigned | 0.4807 | 0.4784 | −0.0055 |
-| pact | per_channel + act_signed | 0.4845 | 0.4773 | −0.0066 |
-| pact | per_tensor + act_signed | 0.4807 | 0.4858 | +0.0019 |
+每行对应三个连续阶段（换脚本名和 --data）：
+
+```bash
+# PTQ → QAT → Compare for pose：把 {BACKEND} 和 {FLAGS} 从下表填入
+python3 networks_yolo26-pose.py --model yolo26n --stage ptq --quant {BACKEND} \
+  --data dataset/coco_mini_pose.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  {FLAGS}
+# 然后同样 --stage qat，再 --stage compare
+```
+
+| 后端 | 配置 | PTQ pose | QAT pose | Δ pose | CLI Flags |
+|---|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned（推荐）** | 0.4823 | 0.4876 | **+0.0037** | *(默认)* |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.4823 | 0.4874 | +0.0035 | `--no-per-channel` |
+| lsqplus_v1 | per_channel + act_signed | 0.4823 | 0.4827 | −0.0012 | `--no-all-positive` |
+| lsqplus_v1 | per_tensor + act_signed | 0.4823 | 0.4849 | +0.0010 | `--no-per-channel --no-all-positive` |
+| lsqplus_v2 | per_channel + act_unsigned | 0.4823 | 0.4806 | −0.0033 | *(默认)* |
+| lsqplus_v2 | per_tensor + act_unsigned | 0.4823 | 0.4895 | +0.0056 | `--no-per-channel` |
+| lsqplus_v2 | per_channel + act_signed | 0.4823 | 0.4875 | +0.0037 | `--no-all-positive` |
+| lsqplus_v2 | per_tensor + act_signed | 0.4823 | 0.4783 | −0.0056 | `--no-per-channel --no-all-positive` |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.2388 | −0.2451 | *(默认)* |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.2100 | −0.2739 | `--no-per-channel` |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.2415 | −0.2424 | *(默认)* |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1875 | −0.2964 | `--no-per-channel` |
+| minmax | per_channel + act_unsigned | 0.0000 | 0.1192 | −0.3647 | *(默认)* |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.1136 | −0.3703 | `--no-per-channel` |
+| dorefa | per_channel + act_unsigned | 0.4942 | 0.4843 | +0.0004 | *(默认)* |
+| dorefa | per_tensor + act_unsigned | 0.4856 | 0.4900 | +0.0061 | `--no-per-channel` |
+| dorefa | per_channel + act_signed | 0.4836 | 0.4792 | −0.0047 | `--no-all-positive` |
+| dorefa | per_tensor + act_signed | 0.4844 | 0.4758 | −0.0081 | `--no-per-channel --no-all-positive` |
+| pact | per_channel + act_unsigned | 0.4845 | 0.4846 | +0.0007 | *(默认)* |
+| pact | per_tensor + act_unsigned | 0.4807 | 0.4784 | −0.0055 | `--no-per-channel` |
+| pact | per_channel + act_signed | 0.4845 | 0.4773 | −0.0066 | `--no-all-positive` |
+| pact | per_tensor + act_signed | 0.4807 | 0.4858 | +0.0019 | `--no-per-channel --no-all-positive` |
 
 ¹ seg/pact/per_channel_act_signed 的 float 基线为独立训练（0.4153，低于同任务其余单元 0.5001），Δ 失真偏大，仅作参考。
-² seg 与 dorefa 全任务 QAT 在 8GB GPU 上以 batch=4 训练（PTQ/compare 仍 batch=8），detect/pose 全为 batch=8。
+² seg 在 lsqplus_v2/per_tensor/act_unsigned 等少数组合上 loss 异常（可能与 mask bce 初始化有关）；新版 dorefa（2026-10）已移除 tanh 非线性，全任务 QAT 统一 batch=8，无需单独降级。
 
 #### 补充实验（detect）
 
@@ -353,6 +405,15 @@ nohup bash script/run_mini_all_part2.sh > log/mini_sweep_part2.log 2>&1 &
 | minmax | per_channel/tensor × act_unsigned/signed | **0.0000** | 4/4 全部崩塌，符合预期 |
 
 **mixed_quant**（权重 per_channel + 激活 per_tensor，其余同主配置）：
+
+```bash
+# Mixed quant for detect：把 {BACKEND} 从下表填入
+python3 networks_yolo26-detect.py --model yolo26n --stage compare --quant {BACKEND} \
+  --data dataset/coco_mini_detect.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  --mixed-quant
+```
 
 | 后端 | QAT mAP50 | Δ | 备注 |
 |---|---|---|---|

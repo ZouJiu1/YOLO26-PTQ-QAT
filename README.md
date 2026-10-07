@@ -266,7 +266,7 @@ A failed stage is retried up to 3 times and never blocks the remaining combos;
 (8 configs × 3 tasks × 7 backends, no parallel split).
 Log naming: `log/mini_{task}_{backend}_{config}_{stage}.log`.
 
-### Cross-backend results (1/100 COCO mini, float 50ep / QAT 10ep, batch=8; seg/dorefa QAT batch=4)
+### Cross-backend results (1/100 COCO mini, float 50ep / QAT 10ep, batch=8 unified across all tasks and backends; seg shows anomalous loss on a few combos — mask bce init issue, not memory)
 
 > The val set has only 50 images (27 for pose), so mAP/P/R are small-sample
 > numbers meant for cross-backend comparison and regression checks, not full-COCO
@@ -283,90 +283,142 @@ Log naming: `log/mini_{task}_{backend}_{config}_{stage}.log`.
 
 #### Main matrix: detect (50 val images, 80 classes) — Float baseline mAP50 **0.5814** / mAP50-95 0.4321
 
-| Backend | Config | PTQ mAP50 | QAT mAP50 | Δ mAP50 |
-|---|---|---|---|---|
-| **lsqplus_v1** | **per_channel + act_unsigned (recommended)** | 0.5663 | 0.5807 | **−0.0007** |
-| lsqplus_v1 | per_tensor + act_unsigned | 0.5663 | 0.5865 | +0.0052 |
-| lsqplus_v1 | per_channel + act_signed | 0.5663 | 0.5783 | −0.0031 |
-| lsqplus_v1 | per_tensor + act_signed | 0.5663 | 0.5876 | +0.0062 |
-| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.4028 | −0.1786 |
-| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.3805 | −0.2009 |
-| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.3745 | −0.2069 |
-| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.3740 | −0.2074 |
-| minmax | per_channel + act_signed | 0.5404 | 0.5832 | +0.0018 |
-| minmax | per_tensor + act_signed | 0.5588 | 0.5818 | +0.0004 |
-| minmax | per_tensor + act_unsigned | 0.0000 | 0.3808 | −0.1831 |
-| dorefa | per_channel + act_unsigned | 0.5631 | 0.5723 | −0.0091 |
-| dorefa | per_tensor + act_unsigned | 0.5607 | 0.5779 | −0.0034 |
-| dorefa | per_channel + act_signed | 0.5753 | 0.5756 | −0.0058 |
-| dorefa | per_tensor + act_signed | 0.5609 | 0.5736 | −0.0078 |
-| pact | per_channel + act_unsigned | 0.5489 | **0.5940** | **+0.0126** |
-| pact | per_tensor + act_unsigned | 0.5736 | 0.5823 | +0.0184 |
-| pact | per_channel + act_signed | 0.5457 | 0.5770 | −0.0044 |
-| pact | per_tensor + act_signed | 0.5736 | 0.5862 | +0.0048 |
+Each row corresponds to three consecutive stages. Replace `{BACKEND}` and `{FLAGS}` from the table below:
+
+```bash
+# PTQ calibration (20 batches, no training — run once per config)
+python3 networks_yolo26-detect.py \
+  --model yolo26n --stage ptq --quant {BACKEND} \
+  --data dataset/coco_mini_detect.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  {FLAGS}
+
+# QAT fine-tuning (10 epochs, loads PTQ checkpoint from model/yolo26-detect/n/{dir}/)
+python3 networks_yolo26-detect.py \
+  --model yolo26n --stage qat --quant {BACKEND} \
+  --data dataset/coco_mini_detect.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  {FLAGS}
+
+# Compare float vs QAT (loads float best and QAT checkpoint, evaluates both)
+python3 networks_yolo26-detect.py \
+  --model yolo26n --stage compare --quant {BACKEND} \
+  --data dataset/coco_mini_detect.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  {FLAGS}
+```
+
+| Backend | Config | PTQ mAP50 | QAT mAP50 | Δ mAP50 | CLI Flags |
+|---|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned (recommended)** | 0.5663 | 0.5807 | **−0.0007** | *(default)* |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.5663 | 0.5865 | +0.0052 | `--no-per-channel` |
+| lsqplus_v1 | per_channel + act_signed | 0.5663 | 0.5783 | −0.0031 | `--no-all-positive` |
+| lsqplus_v1 | per_tensor + act_signed | 0.5663 | 0.5876 | +0.0062 | `--no-per-channel --no-all-positive` |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.4028 | −0.1786 | *(default)* |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.3805 | −0.2009 | `--no-per-channel` |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.3745 | −0.2069 | *(default)* |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.3740 | −0.2074 | `--no-per-channel` |
+| minmax | per_channel + act_signed | 0.5404 | 0.5832 | +0.0018 | `--no-all-positive` |
+| minmax | per_tensor + act_signed | 0.5588 | 0.5818 | +0.0004 | `--no-per-channel --no-all-positive` |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.3808 | −0.1831 | `--no-per-channel` |
+| dorefa | per_channel + act_unsigned | 0.5631 | 0.5723 | −0.0091 | *(default)* |
+| dorefa | per_tensor + act_unsigned | 0.5607 | 0.5779 | −0.0034 | `--no-per-channel` |
+| dorefa | per_channel + act_signed | 0.5753 | 0.5756 | −0.0058 | `--no-all-positive` |
+| dorefa | per_tensor + act_signed | 0.5609 | 0.5736 | −0.0078 | `--no-per-channel --no-all-positive` |
+| pact | per_channel + act_unsigned | 0.5489 | **0.5940** | **+0.0126** | *(default)* |
+| pact | per_tensor + act_unsigned | 0.5736 | 0.5823 | +0.0184 | `--no-per-channel` |
+| pact | per_channel + act_signed | 0.5457 | 0.5770 | −0.0044 | `--no-all-positive` |
+| pact | per_tensor + act_signed | 0.5736 | 0.5862 | +0.0048 | `--no-per-channel --no-all-positive` |
 
 #### Main matrix: seg (50 val images; metric = mask mAP50) — Float baseline mask mAP50 **0.5001** (some cells 0.4739/0.4878, see notes)
 
-| Backend | Config | PTQ mask | QAT mask | Δ mask |
-|---|---|---|---|---|
-| **lsqplus_v1** | **per_channel + act_unsigned (recommended)** | 0.4709 | 0.4980 | **−0.0021** |
-| lsqplus_v1 | per_tensor + act_unsigned | 0.4891 | 0.4993 | −0.0008 |
-| lsqplus_v1 | per_channel + act_signed | 0.4715 | 0.4921 | −0.0080 |
-| lsqplus_v1 | per_tensor + act_signed | 0.4834 | 0.4873 | +0.0134 |
-| lsqplus_v2 | per_channel + act_unsigned | 0.4577 | 0.4652 | −0.0087 |
-| lsqplus_v2 | per_tensor + act_unsigned | 0.4613 | 0.4349 | −0.0390 |
-| lsqplus_v2 | per_channel + act_signed | 0.4436 | 0.4725 | −0.0014 |
-| lsqplus_v2 | per_tensor + act_signed | 0.4545 | 0.4913 | −0.0088 |
-| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.1815 | −0.2924 |
-| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.1671 | −0.3068 |
-| lsq_v1 | per_channel + act_signed | 0.4439 | 0.4847 | −0.0154 |
-| lsq_v1 | per_tensor + act_signed | 0.4451 | 0.4735 | −0.0266 |
-| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.1953 | −0.2925 |
-| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1826 | −0.3052 |
-| lsq_v2 | per_channel + act_signed | 0.4332 | 0.4699 | −0.0302 |
-| lsq_v2 | per_tensor + act_signed | 0.4517 | 0.4856 | −0.0145 |
-| minmax | per_channel + act_unsigned | 0.0000 | 0.1434 | −0.3305 |
-| minmax | per_tensor + act_unsigned | 0.0000 | 0.1291 | −0.3448 |
-| minmax | per_channel + act_signed | 0.4826 | 0.4908 | −0.0093 |
-| minmax | per_tensor + act_signed | 0.4078 | 0.4857 | +0.0118 |
-| dorefa | per_channel + act_unsigned | 0.4945 | 0.4942 | −0.0060 |
-| dorefa | per_tensor + act_unsigned | 0.4732 | 0.5073 | +0.0072 |
-| dorefa | per_channel + act_signed | 0.4871 | 0.5038 | +0.0037 |
-| dorefa | per_tensor + act_signed | 0.4722 | 0.4964 | −0.0037 |
-| pact | per_channel + act_unsigned | 0.4794 | **0.5112** | **+0.0111** |
-| pact | per_tensor + act_unsigned | 0.4785 | 0.4888 | −0.0113 |
-| pact | per_channel + act_signed | 0.4934 | 0.4751 | +0.0598 ¹ |
-| pact | per_tensor + act_signed | 0.4659 | 0.4984 | −0.0017 |
+Three stages per row (same template as detect above, change `--data` and script name):
+
+```bash
+# PTQ → QAT → Compare for seg: replace {BACKEND} and {FLAGS} from the table
+python3 networks_yolo26-seg.py --model yolo26n --stage ptq --quant {BACKEND} \
+  --data dataset/coco_mini_seg.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  {FLAGS}
+# then same with --stage qat, then --stage compare
+```
+
+| Backend | Config | PTQ mask | QAT mask | Δ mask | CLI Flags |
+|---|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned (recommended)** | 0.4709 | 0.4980 | **−0.0021** | *(default)* |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.4891 | 0.4993 | −0.0008 | `--no-per-channel` |
+| lsqplus_v1 | per_channel + act_signed | 0.4715 | 0.4921 | −0.0080 | `--no-all-positive` |
+| lsqplus_v1 | per_tensor + act_signed | 0.4834 | 0.4873 | +0.0134 | `--no-per-channel --no-all-positive` |
+| lsqplus_v2 | per_channel + act_unsigned | 0.4577 | 0.4652 | −0.0087 | *(default)* |
+| lsqplus_v2 | per_tensor + act_unsigned | 0.4613 | 0.4349 | −0.0390 | `--no-per-channel` |
+| lsqplus_v2 | per_channel + act_signed | 0.4436 | 0.4725 | −0.0014 | `--no-all-positive` |
+| lsqplus_v2 | per_tensor + act_signed | 0.4545 | 0.4913 | −0.0088 | `--no-per-channel --no-all-positive` |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.1815 | −0.2924 | *(default)* |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.1671 | −0.3068 | `--no-per-channel` |
+| lsq_v1 | per_channel + act_signed | 0.4439 | 0.4847 | −0.0154 | `--no-all-positive` |
+| lsq_v1 | per_tensor + act_signed | 0.4451 | 0.4735 | −0.0266 | `--no-per-channel --no-all-positive` |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.1953 | −0.2925 | *(default)* |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1826 | −0.3052 | `--no-per-channel` |
+| lsq_v2 | per_channel + act_signed | 0.4332 | 0.4699 | −0.0302 | `--no-all-positive` |
+| lsq_v2 | per_tensor + act_signed | 0.4517 | 0.4856 | −0.0145 | `--no-per-channel --no-all-positive` |
+| minmax | per_channel + act_unsigned | 0.0000 | 0.1434 | −0.3305 | *(default)* |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.1291 | −0.3448 | `--no-per-channel` |
+| minmax | per_channel + act_signed | 0.4826 | 0.4908 | −0.0093 | `--no-all-positive` |
+| minmax | per_tensor + act_signed | 0.4078 | 0.4857 | +0.0118 | `--no-per-channel --no-all-positive` |
+| dorefa | per_channel + act_unsigned | 0.4945 | 0.4942 | −0.0060 | *(default)* |
+| dorefa | per_tensor + act_unsigned | 0.4732 | 0.5073 | +0.0072 | `--no-per-channel` |
+| dorefa | per_channel + act_signed | 0.4871 | 0.5038 | +0.0037 | `--no-all-positive` |
+| dorefa | per_tensor + act_signed | 0.4722 | 0.4964 | −0.0037 | `--no-per-channel --no-all-positive` |
+| pact | per_channel + act_unsigned | 0.4794 | **0.5112** | **+0.0111** | *(default)* |
+| pact | per_tensor + act_unsigned | 0.4785 | 0.4888 | −0.0113 | `--no-per-channel` |
+| pact | per_channel + act_signed | 0.4934 | 0.4751 | +0.0598 ¹ | `--no-all-positive` |
+| pact | per_tensor + act_signed | 0.4659 | 0.4984 | −0.0017 | `--no-per-channel --no-all-positive` |
 
 #### Main matrix: pose (27 val images, single person class; metric = keypoint pose mAP50) — Float baseline pose mAP50 **0.4839**
 
-| Backend | Config | PTQ pose | QAT pose | Δ pose |
-|---|---|---|---|---|
-| **lsqplus_v1** | **per_channel + act_unsigned (recommended)** | 0.4823 | 0.4876 | **+0.0037** |
-| lsqplus_v1 | per_tensor + act_unsigned | 0.4823 | 0.4874 | +0.0035 |
-| lsqplus_v1 | per_channel + act_signed | 0.4823 | 0.4827 | −0.0012 |
-| lsqplus_v1 | per_tensor + act_signed | 0.4823 | 0.4849 | +0.0010 |
-| lsqplus_v2 | per_channel + act_unsigned | 0.4823 | 0.4806 | −0.0033 |
-| lsqplus_v2 | per_tensor + act_unsigned | 0.4823 | 0.4895 | +0.0056 |
-| lsqplus_v2 | per_channel + act_signed | 0.4823 | 0.4875 | +0.0037 |
-| lsqplus_v2 | per_tensor + act_signed | 0.4823 | 0.4783 | −0.0056 |
-| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.2388 | −0.2451 |
-| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.2100 | −0.2739 |
-| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.2415 | −0.2424 |
-| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1875 | −0.2964 |
-| minmax | per_channel + act_unsigned | 0.0000 | 0.1192 | −0.3647 |
-| minmax | per_tensor + act_unsigned | 0.0000 | 0.1136 | −0.3703 |
-| dorefa | per_channel + act_unsigned | 0.4942 | 0.4843 | +0.0004 |
-| dorefa | per_tensor + act_unsigned | 0.4856 | 0.4900 | +0.0061 |
-| dorefa | per_channel + act_signed | 0.4836 | 0.4792 | −0.0047 |
-| dorefa | per_tensor + act_signed | 0.4844 | 0.4758 | −0.0081 |
-| pact | per_channel + act_unsigned | 0.4845 | 0.4846 | +0.0007 |
-| pact | per_tensor + act_unsigned | 0.4807 | 0.4784 | −0.0055 |
-| pact | per_channel + act_signed | 0.4845 | 0.4773 | −0.0066 |
-| pact | per_tensor + act_signed | 0.4807 | 0.4858 | +0.0019 |
+Three stages per row (same template, change `--data` and script name):
+
+```bash
+# PTQ → QAT → Compare for pose: replace {BACKEND} and {FLAGS} from the table
+python3 networks_yolo26-pose.py --model yolo26n --stage ptq --quant {BACKEND} \
+  --data dataset/coco_mini_pose.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  {FLAGS}
+# then same with --stage qat, then --stage compare
+```
+
+| Backend | Config | PTQ pose | QAT pose | Δ pose | CLI Flags |
+|---|---|---|---|---|---|
+| **lsqplus_v1** | **per_channel + act_unsigned (recommended)** | 0.4823 | 0.4876 | **+0.0037** | *(default)* |
+| lsqplus_v1 | per_tensor + act_unsigned | 0.4823 | 0.4874 | +0.0035 | `--no-per-channel` |
+| lsqplus_v1 | per_channel + act_signed | 0.4823 | 0.4827 | −0.0012 | `--no-all-positive` |
+| lsqplus_v1 | per_tensor + act_signed | 0.4823 | 0.4849 | +0.0010 | `--no-per-channel --no-all-positive` |
+| lsqplus_v2 | per_channel + act_unsigned | 0.4823 | 0.4806 | −0.0033 | *(default)* |
+| lsqplus_v2 | per_tensor + act_unsigned | 0.4823 | 0.4895 | +0.0056 | `--no-per-channel` |
+| lsqplus_v2 | per_channel + act_signed | 0.4823 | 0.4875 | +0.0037 | `--no-all-positive` |
+| lsqplus_v2 | per_tensor + act_signed | 0.4823 | 0.4783 | −0.0056 | `--no-per-channel --no-all-positive` |
+| lsq_v1 | per_channel + act_unsigned | 0.0000 | 0.2388 | −0.2451 | *(default)* |
+| lsq_v1 | per_tensor + act_unsigned | 0.0000 | 0.2100 | −0.2739 | `--no-per-channel` |
+| lsq_v2 | per_channel + act_unsigned | 0.0000 | 0.2415 | −0.2424 | *(default)* |
+| lsq_v2 | per_tensor + act_unsigned | 0.0000 | 0.1875 | −0.2964 | `--no-per-channel` |
+| minmax | per_channel + act_unsigned | 0.0000 | 0.1192 | −0.3647 | *(default)* |
+| minmax | per_tensor + act_unsigned | 0.0000 | 0.1136 | −0.3703 | `--no-per-channel` |
+| dorefa | per_channel + act_unsigned | 0.4942 | 0.4843 | +0.0004 | *(default)* |
+| dorefa | per_tensor + act_unsigned | 0.4856 | 0.4900 | +0.0061 | `--no-per-channel` |
+| dorefa | per_channel + act_signed | 0.4836 | 0.4792 | −0.0047 | `--no-all-positive` |
+| dorefa | per_tensor + act_signed | 0.4844 | 0.4758 | −0.0081 | `--no-per-channel --no-all-positive` |
+| pact | per_channel + act_unsigned | 0.4845 | 0.4846 | +0.0007 | *(default)* |
+| pact | per_tensor + act_unsigned | 0.4807 | 0.4784 | −0.0055 | `--no-per-channel` |
+| pact | per_channel + act_signed | 0.4845 | 0.4773 | −0.0066 | `--no-all-positive` |
+| pact | per_tensor + act_signed | 0.4807 | 0.4858 | +0.0019 | `--no-per-channel --no-all-positive` |
 
 ¹ seg/pact/per_channel_act_signed uses an independently-trained float baseline (0.4153, lower than the other seg cells' 0.5001); its Δ is skewed and for reference only.
-² seg and all-task dorefa QAT trained at batch=4 on the 8 GB GPU (PTQ/compare stayed at batch=8); detect/pose all at batch=8.
+² seg shows anomalous loss on a few combos (e.g. lsqplus_v2/per_tensor/act_unsigned, possibly a mask-bce init issue); the new dorefa (2026-10) removed the tanh nonlinearity and all tasks now run at batch=8 uniformly — no more per-task downgrades.
 
 #### Supplementary experiments (detect)
 
@@ -378,6 +430,15 @@ Log naming: `log/mini_{task}_{backend}_{config}_{stage}.log`.
 | minmax | per_channel/tensor × act_unsigned/signed | **0.0000** | 4/4 all collapse, as expected |
 
 **mixed_quant** (weights per_channel + activations per_tensor, rest same as main config):
+
+```bash
+# Mixed quant for detect: replace {BACKEND} from the table
+python3 networks_yolo26-detect.py --model yolo26n --stage compare --quant {BACKEND} \
+  --data dataset/coco_mini_detect.yaml \
+  --float-epochs 50 --qat-epochs 10 --calibration-batches 20 \
+  --float-batch-size 8 --ptq-batch-size 8 --qat-batch-size 8 --num-workers 0 \
+  --mixed-quant
+```
 
 | Backend | QAT mAP50 | Δ | Note |
 |---|---|---|---|
