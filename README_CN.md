@@ -67,12 +67,15 @@ float_train -> PTQ_calibration -> QAT_training -> compare_precision
 | `model/{prefix}_quant_params.pth` | 同上参数的 .pth 二进制形式 |
 | `model/{prefix}_{name}_float.pth` | 量化参数回灌后的干净浮点权重 |
 | `model/{prefix}_{name}_float.onnx` | 上述浮点权重的 ONNX（opset=16，静态 shape `[1, C, H, W]`，无 dynamic_axes；C=3，多光谱 OBB 网络为 C=10） |
+| `model/{prefix}_{name}_quant.onnx` | 额外导出的量化算子链 ONNX：从量化模型直接 trace，每个被量化的层前后都有 `Round`/`Clip`/`Mul`/`Add` 原子算子链；用 Netron 打开可快速排查哪些算子被量化、哪些跳过了 |
 
 ## 统一特性（所有 networks_*.py 一致）
 
 - **best 后缀**：训练期间最优 checkpoint 保存为 `*_best.pth`，同时维护 `*_last.pth`；
   float 老权重（无后缀）仍被 compare 阶段兼容（优先 `_best`，找不到再回退）。
-- **保存 best .pth 的同时同步导出同名 .onnx**（`_try_export_onnx`）；
+- **保存 best .pth 时同步导出两份 ONNX**（`_try_export_onnx`）：
+  一份干净浮点 ONNX（`*_float.onnx`，板端 PTQ 工具自校准 scale/zp）；
+  一份带量化算子链 ONNX（`*_quant.onnx`，Netron 可视化排查哪些层被量化）。
   导出失败仅告警，绝不影响训练。
 - **ONNX 输入形状完全固定**（`[1, C, H, W]`，无 `dynamic_axes`；C=3，
   多光谱 OBB 网络为 C=10），可视化工具直接显示精确尺寸，不会出现符号维度。

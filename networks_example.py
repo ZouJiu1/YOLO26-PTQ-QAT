@@ -736,11 +736,19 @@ def save_quant_outputs(quant_model, prefix, num_classes=10, meta=None, model_dir
 
     onnx_path = os.path.join(model_dir, f"{prefix}_cifar10_cnn_float.onnx")
     export_onnx(float_model, onnx_path, opset=16)
-    print(f"[4/5] 干净浮点 ONNX 已写出: {onnx_path}")
+    print(f"[4/6] 干净浮点 ONNX 已写出: {onnx_path}")
+
+    # 额外导出带量化算子链的 ONNX（用于 Netron 可视化排查哪些层被量化） /
+    # Additionally export ONNX with quant-op chains (for Netron visualization to check
+    # which layers are quantized). Contrasts with the clean float ONNX above.
+    quant_onnx_path = os.path.join(model_dir, f"{prefix}_cifar10_cnn_quant.onnx")
+    with torch.no_grad():
+        quant_pkg.export_quant_onnx(quant_model, quant_onnx_path, opset=16)
+    print(f"[5/6] 带量化算子链 ONNX 已写出: {quant_onnx_path}")
 
     verify(float_model, quant_model, onnx_path, quant_params)
-    print("[5/5] 完成。")
-    return quant_checkpoint, json_path, pth_path, float_checkpoint, onnx_path
+    print("[6/6] 完成。")
+    return quant_checkpoint, json_path, pth_path, float_checkpoint, onnx_path, quant_onnx_path
 
 
 def float_train(batch_size=128, lr=1e-3, epochs=100, num_classes=10, num_workers=2,

@@ -71,14 +71,17 @@ Each PTQ / QAT stage writes five artifacts (`save_quant_outputs`):
 | `model/{prefix}_quant_params.pth` | same params in binary .pth form |
 | `model/{prefix}_{name}_float.pth` | clean float weights with quant params folded back |
 | `model/{prefix}_{name}_float.onnx` | ONNX export of the above (opset=16, static shape `[1, C, H, W]`, no dynamic_axes; C=3, C=10 for the multispectral OBB net) |
+| `model/{prefix}_{name}_quant.onnx` | additional ONNX traced from the quantized model — contains `Round`/`Clip`/`Mul`/`Add` op chains around every quantized layer; open in Netron to inspect which ops are quantized vs. skipped |
 
 ## Unified features (all networks_*.py)
 
 - **best suffix**: the best checkpoint is saved as `*_best.pth` alongside
   `*_last.pth`; legacy unsuffixed float weights are still accepted by the
   compare stage (prefers `_best`, falls back otherwise).
-- **ONNX is exported alongside the best .pth** (`_try_export_onnx`); export
-  failures only warn and never interrupt training.
+- **Two ONNX files are exported alongside the best .pth** (`_try_export_onnx`):
+  a clean float ONNX (`*_float.onnx`, board-side PTQ tools calibrate scale/zp);
+  a quant-op-chain ONNX (`*_quant.onnx`, open in Netron to inspect which layers are quantized).
+  Export failures only warn and never interrupt training.
 - **ONNX input shape is fully static** (`[1, C, H, W]`, no `dynamic_axes`; C=3,
   or C=10 for the multispectral OBB net); visualization tools display exact
   dimensions without symbolic axes.

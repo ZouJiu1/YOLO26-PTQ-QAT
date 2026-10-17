@@ -671,7 +671,7 @@ Delta（差值）就是量化带来的精度损失。理想情况下希望 Delta
 
 ONNX 是一个通用的神经网络交换格式，几乎所有推理框架都支持。
 
-### 9.2 导出流程
+### 9.2 导出流程（两份 ONNX）
 
 ```python
 # 伪代码
@@ -680,27 +680,45 @@ def save_quant_outputs(model, prefix):
     quant_params = collect_quant_params(model)
     save_json(f"{prefix}_quant_params.json", quant_params)
 
-    # 2. 构建干净的浮点参考模型
+    # 2. 构建干净的浮点参考模型（去掉伪量化）
     float_model = build_float_model(model)
 
-    # 3. 导出 ONNX
+    # 3. 导出干净浮点 ONNX（板端 PTQ 工具的编译输入）
     torch.onnx.export(float_model, dummy_input, f"{prefix}_float.onnx")
 
-    # 4. 可选：用 onnxsim 简化 ONNX
-    onnxsim.simplify("model.onnx")
+    # 4. 额外导出带量化算子链 ONNX（Netron 可视化排查用）
+    torch.onnx.export(model, dummy_input, f"{prefix}_quant.onnx")
+    # ↑ 直接 trace 量化模型本身，每个量化器的 round+clamp+mul+add 都会被展开成标准 ONNX 原子算子
+
+    # 5. 可选：用 onnxsim 简化两份 ONNX
+    onnxsim.simplify(f"{prefix}_float.onnx")
+    onnxsim.simplify(f"{prefix}_quant.onnx")
 ```
 
-### 9.3 为什么 ONNX 里不含量化节点？
+两份 ONNX 的区别：
 
-注意：本项目导出的 ONNX 是**纯浮点图**，不含 `QuantizeLinear` / `DequantizeLinear` 节点。
+| 对比项 | `_float.onnx`（干净） | `_quant.onnx`（量化算子链） |
+|--------|----------------------|---------------------------|
+| 输入给谁 | 板端 NPU/TPU 的 PTQ 工具 | Netron 可视化排查 |
+| 里面有什么算子 | 只有 Conv/Linear/Add/Concat 等正常算子 | Conv 前后多了 Round → Clip → Mul → Add/Sub 算子链 |
+| scale/zero_point | 无（板端 PTQ 工具自算） | 也无（但 Round/Clip 位置能看出哪里有量化） |
+| 权重 | 已烘焙反量化值 | 已烘焙反量化值（跟 float 那份一样） |
 
-为什么？
+### 9.3 为什么有两份 ONNX？
+
+**干净那份**（`_float.onnx`）里不含 `QuantizeLinear` / `DequantizeLinear` 节点。为什么？
 
 因为板端 NPU 有自己的 PTQ 工具链。你给它一个浮点 ONNX，它自己会用校准数据重新算 scale/zp。**你导出的 JSON 量化参数只是"参考值"**——板端最终部署时会**重新计算**，以板端 PTQ 工具算出的为准；JSON 只是方便你在编译前把"训练侧算出的"和"板端算出的"做一次交叉对比，看看差异是否在可接受范围。
 
 > **记住**：JSON 里的 scale / zero_point ≠ 部署最终用的参数；**嵌入式板子的 PTQ 工具会自动重新算 scale 和 zero_point**，导出的 JSON 仅供你交叉验证。
 
-如果你需要保留 QAT 训练时的截断行为（比如某些组合下权重依赖 clip），可以用 `build_float_model(..., use_clip=True)`，导出带 `Clip` 节点的 ONNX。
+**带量化算子链那份**（`_quant.onnx`）是**直接 trace 量化模型本身**得到的。量化器里的 `Round.apply()`、`.clamp()`、`torch.div/mul/add` 这些操作会被 ONNX tracing 展开成一串原子算子。Netron 里打开它，你一眼就能看到：
+- Conv 前后有 Round → Clip → Mul → Add/Sub → 这层**被量化了**
+- 只有 Conv → 没有 Round/Clip → 这层**跳过了量化**（比如某些 Concat、Add、MaxPool 等我们故意不量化的算子）
+
+这份 ONNX **不是给板端编译用的**（板端编译还是用 `_float.onnx`），它是给你**查 bug 用的**——如果你发现某层精度掉得特别厉害，打开 `_quant.onnx` 看看是不是周围算子链不完整；如果你想在某个漏量化的算子周围也加上量化，打开 `_quant.onnx` 确认它目前没被量化。
+
+如果你需要保留 QAT 训练时的截断行为（比如某些组合下权重依赖 clip），可以用 `build_float_model(..., use_clip=True)` 让 `_float.onnx` 也带 `Clip` 节点（不带 Round），数值上更接近真实量化部署。
 
 ### 9.4 输入形状固定
 

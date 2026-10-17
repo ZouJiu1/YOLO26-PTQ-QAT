@@ -474,3 +474,94 @@ def required_quant_keys(quant_model):
             else:
                 keys.extend(f"{name}.input{suffix}" for suffix in ("0", "1"))
     return keys
+
+
+def export_quant_onnx(quant_model, onnx_path, opset=16, imgsz=None,
+                      simplify=True, dynamic_axes=None):
+    """导出带量化算子链的 ONNX（用于 Netron 可视化排查哪些层被量化） /
+    Export ONNX with quant-op chains (for Netron visualization to inspect which
+    layers are quantized).
+
+    与 build_float_model → export_onnx 导出的"干净浮点 ONNX"形成对照：
+    干净 ONNX 无 Round/Clip 等算子，板端 PTQ 工具会重新校准 scale/zero_point；
+    本函数直接 trace 量化模型 eval 前向，量化器的 round + clamp + mul + add/sub
+    会被展开成标准 ONNX 原子算子链，Netron 里一眼能看出哪些层前后有量化。
+    / Contrasts with build_float_model → export_onnx (clean float ONNX, no Round/Clip,
+    board-side PTQ calibrates scale/zero_point): this function directly traces the
+    quantized model's eval forward, where each quantizer's round + clamp + mul + add/sub
+    unfolds into standard ONNX atomic ops — easy to see quantized layers in Netron.
+
+    前置条件 / Preconditions:
+        quant_model 已 freeze_batch_init + eval + torch.no_grad() 下调用 /
+        quant_model is freeze_batch_init'd + eval'd; call under torch.no_grad().
+        minmax 后端建议 PTQ 校准后立即导出（running min/max 收集逻辑会产生额外的
+        Sort/Min/Max 节点，round/clip 仍清晰可见但图更复杂）。
+        / MinMax backend: export right after PTQ calibration (running min/max collection
+        emits extra Sort/Min/Max nodes — round/clip still visible, just more cluttered).
+
+    Args / 参数:
+        quant_model: 量化模型（PTQ/QAT 后的 quant_model，不是 build_float_model 的产物） /
+                     Quantized model (post-PTQ/QAT quant_model, NOT build_float_model output)
+        onnx_path: 输出 .onnx 路径 / Output .onnx path
+        opset: ONNX opset 版本，默认 16 / ONNX opset version, default 16
+        imgsz: 输入图像尺寸 H=W；默认 640 / Input image size H=W; default 640
+        simplify: 是否用 onnxsim 简化（保留 round/clip，消掉无关算子） /
+                  onnxsim simplification (keeps round/clip, removes noise); default True
+        dynamic_axes: 动态轴字典，默认 None（输入形状完全固定 [1, 3, H, W]） /
+                      dynamic axes dict; default None (input fully fixed [1, 3, H, W])
+    """
+    import os
+
+    model_device = next(quant_model.parameters()).device
+    H = W = imgsz if imgsz is not None else 640
+    os.makedirs(os.path.dirname(onnx_path) or ".", exist_ok=True)
+
+    dummy = torch.randn(1, 3, H, W, device=model_device)
+
+    torch.onnx.export(
+        quant_model,
+        dummy,
+        onnx_path,
+        export_params=True,
+        opset_version=opset,
+        do_constant_folding=True,
+        dynamo=False,
+        input_names=["images"],
+        output_names=["preds"],
+        dynamic_axes=dynamic_axes,
+    )
+
+    if simplify:
+        try:
+            import onnx
+            from onnxsim import simplify as onnxsim_simplify
+
+            model = onnx.load(onnx_path)
+            # onnxsim 不会消掉 round/clip 等非恒等算子，量化算子链得以保留 /
+            # onnxsim won't remove non-identity ops like round/clip; quant-op chain preserved
+            model_simplified, check = onnxsim_simplify(model)
+            if check:
+                onnx.save(model_simplified, onnx_path)
+                print(f"      quant ONNX simplify 成功: {len(model.graph.node)} → {len(model_simplified.graph.node)} nodes")
+            else:
+                print("      quant ONNX simplify check 失败，保留原图")
+        except ImportError:
+            print("      [skip] 未安装 onnxsim，跳过 simplify")
+        except Exception as exc:
+            print(f"      [skip] quant ONNX simplify 失败: {exc}")
+
+    # 统计 Round/Clip 节点数，验证量化算子链存在 /
+    # Count Round/Clip nodes to confirm quant-op chain presence
+    try:
+        import onnx
+        model = onnx.load(onnx_path)
+        from collections import Counter
+        ops = Counter(n.op_type for n in model.graph.node)
+        round_count = ops.get("Round", 0)
+        clip_count = ops.get("Clip", 0)
+        total = len(model.graph.node)
+        print(f"      quant ONNX 节点数: {total} (Round={round_count}, Clip={clip_count})")
+        if round_count == 0:
+            print("      [warn] quant ONNX 中未发现 Round 节点，量化算子链可能未被正确 trace")
+    except Exception:
+        pass

@@ -13,9 +13,11 @@ from .constants import INIT_STATE_UNINIT
 class Round(Function):
     @staticmethod
     def forward(self, input):
-        sign = torch.sign(input)
-        output = sign * torch.floor(torch.abs(input) + 0.5)
-        return output
+        # sign = torch.sign(input)
+        # output = sign * torch.floor(torch.abs(input) + 0.5)
+        # return output
+
+        return torch.round(input)
 
     @staticmethod
     def backward(self, grad_output):

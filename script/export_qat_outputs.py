@@ -39,7 +39,9 @@
     {prefix}_quant_params.json      —— 量化参数（scale / zero_point，可读版） / Quant params (scale / zero_point, human-readable)
     {prefix}_quant_params.pth       —— 量化参数（torch.save 格式，可再灌） / Quant params (torch.save format, reloadable)
     {prefix}_{base}_float.pth       —— 反量化后的干净浮点权重 / Dequantized clean float weights
-    {prefix}_{base}_float.onnx      —— 干净浮点 ONNX（含 onnxsim） / Clean float ONNX (with onnxsim)
+    {prefix}_{base}_float.onnx      —— 干净浮点 ONNX（含 onnxsim，无 Round/Clip） / Clean float ONNX (with onnxsim, no Round/Clip)
+    {prefix}_{base}_quant.onnx      —— 带量化算子链 ONNX（含 Round/Clip，Netron 可视化排查用） /
+                                       ONNX with quant-op chain (Round/Clip present, for Netron visualization)
 
     prefix 默认取 checkpoint 文件名去掉 _best / _last / .pth 后的主干，例如 /
     prefix defaults to checkpoint filename stripped of _best / _last / .pth, e.g.
@@ -186,7 +188,7 @@ def main():
           f" fitness={load_meta.get('fitness')}")
 
     # --- 复用 save_quant_outputs 一键导出全部产物 + onnxruntime 验证 / Reuse save_quant_outputs ---
-    quant_ckpt, json_path, pth_path, float_ckpt, onnx_path = module.save_quant_outputs(
+    quant_ckpt, json_path, pth_path, float_ckpt, onnx_path, quant_onnx_path = module.save_quant_outputs(
         quant_model, prefix,
         nc=nc,
         meta=load_meta,
@@ -200,6 +202,7 @@ def main():
     print(f"  量化参数 PTH    : {pth_path}")
     print(f"  干净浮点权重    : {float_ckpt}")
     print(f"  干净浮点 ONNX   : {onnx_path}")
+    print(f"  量化算子链 ONNX : {quant_onnx_path}")
 
 
 if __name__ == "__main__":

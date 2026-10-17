@@ -20,7 +20,7 @@
 4. [7 个量化后端与量化器数学](#4-7-个量化后端与量化器数学)
 5. [激活量化算子的 forward 精确行为](#5-激活量化算子的-forward-精确行为)
 6. [PTQ 与 QAT 的生命周期（freeze/reset 状态机）](#6-ptq-与-qat-的生命周期)
-7. [部署产物：三件套与 clip 折叠](#7-部署产物三件套与-clip-折叠)
+7. [部署产物：四件套与 clip 折叠](#7-部署产物四件套与-clip-折叠)
 8. [unsigned/signed 与 per_channel/per_tensor 设计](#8-unsignedsigned-与-per_channelper_tensor-设计)
 9. [网络脚本接入机制](#9-网络脚本接入机制)
 10. [关键工程决策与踩坑记录](#10-关键工程决策与踩坑记录)
@@ -124,7 +124,7 @@
 │ quantization/__init__.py（跨后端公共层）           │
 │  · _BACKEND_MODULES / QUANT_METHODS             │
 │  · freeze_batch_init / reset_quantizer_states   │
-│  · collect_quant_params（导出 scale/zp 三件套）   │
+│  · collect_quant_params（导出 scale/zp 四件套）   │
 │  · build_float_model（部署用干净浮点图，含 clip 折叠）│
 └──────────────────┬──────────────────────────────┘
                    │ importlib 动态加载
@@ -224,22 +224,23 @@ freeze/reset/导出遍历。
 
 ---
 
-## 7. 部署产物：三件套与 clip 折叠
+## 7. 部署产物：四件套与 clip 折叠
 
-### 7.1 三件套
+### 7.1 四件套
 
 | 产物 | 消费者 | 内容 |
 |---|---|---|
 | `*_quant_params.json/.pth` | 工具链编译器 | 每层激活/权重的 scale + zero_point |
-| `*_float.onnx` | 编译输入 | 干净浮点图（无 Q/DQ 节点），权重为量化后值 |
+| `*_float.onnx` | 编译输入 | 干净浮点图（无 Round/Clip 节点），权重为量化后值；板端 PTQ 工具自校准 scale/zp |
+| `*_quant.onnx` | Netron 可视化 | 从量化模型直接 trace，每个被量化层前后都有 `Round`/`Clip`/`Mul`/`Add` 原子算子链；快速排查哪些算子被量化、哪些跳过了 |
 | quant `.pth` | 训练/补发 | fake-quant 训练模型 checkpoint |
 
 > **重要提醒**：JSON 中的 scale / zero_point **仅供交叉验证参考**。嵌入式板端（地平线 NPU、
 > TPU 等）的 PTQ 工具会用自身校准数据**重新计算** scale 与 zero_point，最终部署以板端
 > 重新算出的值为准。JSON 方便你在编译前比对训练侧与板侧是否一致，不等于部署时直接套用。
 
-导出顺序：`collect_quant_params` 先存 JSON，再 `build_float_model` 出 ONNX，
-两者同一次保存、源自同一量化器状态，天然自洽。
+导出顺序：`collect_quant_params` 先存 JSON，再 `build_float_model` 出干净 ONNX，
+再 `export_quant_onnx` 出量化算子链 ONNX，三者同一次保存、源自同一量化器状态，天然自洽。
 
 ### 7.2 `collect_quant_params`（`__init__.py`）
 
@@ -348,7 +349,7 @@ mixed_quant=False / pact_w_quant='lsqplus_v1'`。CLI `--a-bits/--w-bits/--per-ch
 `load_checkpoint()`/`save_checkpoint()` 保存/加载 `.pth`；best.pth 用
 `ck['state_dict']`，PTQ 的 `.pth` 可能是裸 state_dict 或 `ck['model']`（需兼容）。
 `save_quant_outputs()`（L1323-1331）调 `freeze_batch_init()` 后保存量化模型并导出
-三件套；`build_float_model()`（L1216-1230）与 `collect_quant_params()`（L1233-1235）
+四件套；`build_float_model()`（L1216-1230）与 `collect_quant_params()`（L1233-1235）
 都委托 `quant_pkg`；`verify()`（L1297-1320）硬断言导出 ONNX 无量化节点 +
 quant_params 完整。meta 通过 `**(meta or {})` 透传记录量化方法/配置/seed。
 

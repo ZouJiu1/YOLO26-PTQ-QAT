@@ -23,7 +23,7 @@
 4. [The 7 quantization backends and quantizer math](#4-the-7-quantization-backends-and-quantizer-math)
 5. [Exact forward behavior of activation-quantized ops](#5-exact-forward-behavior-of-activation-quantized-ops)
 6. [PTQ and QAT lifecycle (freeze/reset state machine)](#6-ptq-and-qat-lifecycle-freezereset-state-machine)
-7. [Deployment artifacts: the three outputs and clip folding](#7-deployment-artifacts-the-three-outputs-and-clip-folding)
+7. [Deployment artifacts: four outputs and clip folding](#7-deployment-artifacts-four-outputs-and-clip-folding)
 8. [unsigned/signed and per_channel/per_tensor design](#8-unsignedsigned-and-per_channelper_tensor-design)
 9. [Network-script integration](#9-network-script-integration)
 10. [Key engineering decisions and pitfalls](#10-key-engineering-decisions-and-pitfalls)
@@ -255,14 +255,15 @@ clean float graph (see §7.3).
 
 ---
 
-## 7. Deployment artifacts: the three outputs and clip folding
+## 7. Deployment artifacts: four outputs and clip folding
 
-### 7.1 Three outputs
+### 7.1 Four outputs
 
 | Artifact | Consumer | Content |
 |---|---|---|
 | `*_quant_params.json/.pth` | toolchain compiler | per-layer activation/weight scale + zero_point |
-| `*_float.onnx` | compiler input | clean float graph (no Q/DQ nodes), weights are post-quantization values |
+| `*_float.onnx` | compiler input | clean float graph (no Round/Clip nodes), weights are post-quantization values; board-side PTQ tools calibrate scale/zp |
+| `*_quant.onnx` | Netron visualization | traced directly from the quantized model — each quantized layer has a `Round`/`Clip`/`Mul`/`Add` atomic-op chain around it; quick way to see which ops are quantized vs. skipped |
 | quant `.pth` | training/re-export | fake-quant trained model checkpoint |
 
 > **Important note**: the scale / zero_point values in the JSON are **for
@@ -273,7 +274,8 @@ clean float graph (see §7.3).
 > not to be applied directly during deployment.
 
 Export order: `collect_quant_params` saves the JSON first, then
-`build_float_model` produces the ONNX. Both come from the same quantizer state in
+`build_float_model` produces the clean float ONNX, then `export_quant_onnx`
+produces the quant-op-chain ONNX. All three come from the same quantizer state in
 one save, so they are consistent by construction.
 
 ### 7.2 `collect_quant_params` (`__init__.py`)
@@ -400,7 +402,7 @@ abbreviations).
 `load_checkpoint()`/`save_checkpoint()` load/save `.pth`; best.pth uses
 `ck['state_dict']`, while PTQ `.pth` may be a bare state_dict or `ck['model']`
 (handle both). `save_quant_outputs()` (L1323-1331) calls `freeze_batch_init()`
-then saves the quantized model and exports the three artifacts;
+then saves the quantized model and exports the four artifacts;
 `build_float_model()` (L1216-1230) and `collect_quant_params()` (L1233-1235)
 both delegate to `quant_pkg`; `verify()` (L1297-1320) hard-asserts the exported
 ONNX has no quant nodes and quant_params are complete. `meta` passes through via
