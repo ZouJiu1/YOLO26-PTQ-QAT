@@ -670,6 +670,7 @@ if __name__ == "__main__":
     '''
     # 单张图片 / Single image
     python3 script/single_visualize.py --task detect --ckpt model/yolo26-detect/n/yolo26n_best.pth --image ultralytics/ultralytics/data/datasets/coco128-seg/images/train2017/000000000009.jpg
+    python3 script/single_visualize.py --task seg --ckpt /home/zoujiu/Desktop/projects/aLSQplus/QAT_training/ultralytics/ultralytics/yolo26n-seg.pt --image /home/zoujiu/Desktop/projects/aLSQplus/QAT_training/ultralytics/ultralytics/assets/bus.jpg
 
     # 目录批量 / Directory batch
     python3 script/single_visualize.py --task seg --ckpt model/yolo26-seg/n/lsqplus_v1/qat_lsqplus_v1_yolo26n-seg_best.pth --image ultralytics/ultralytics/data/datasets/coco128-seg/images/train2017 --out results/seg

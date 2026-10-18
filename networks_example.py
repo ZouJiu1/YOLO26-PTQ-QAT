@@ -451,17 +451,40 @@ def evaluate(model, loader, criterion, max_batches=None, viz_dir=None, viz_max=3
 
 
 def load_checkpoint(model, path, return_meta=False):
-    checkpoint = torch.load(path, map_location=device)
+    """加载 checkpoint，兼容三种格式 / Load checkpoint, three formats supported.
+
+    1) 本项目训练产物: {"state_dict": {...}, "meta": {...}}
+    2) 官方 ultralytics 预训练: {"model": nn.Module, ...}
+    3) 纯 state_dict: {...}
+    """
+    import torch.nn as _nn
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    # 兼容三种 checkpoint 格式 / Three checkpoint formats
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
-        meta = checkpoint.get("meta", {})
+    elif isinstance(checkpoint, dict) and "model" in checkpoint and hasattr(checkpoint["model"], "state_dict"):
+        # 官方 ultralytics / Official ultralytics
+        state_dict = checkpoint["model"].float().state_dict()
+    elif isinstance(checkpoint, _nn.Module):
+        state_dict = checkpoint.float().state_dict()
     else:
         state_dict = checkpoint
-        meta = {}
-    model.load_state_dict(state_dict)
-    if return_meta:
-        return model, meta
-    return model
+    meta = checkpoint.get("meta", {}) if isinstance(checkpoint, dict) else {}
+
+    # 过滤 shape mismatch（不同数据集 nc 变化时 head 分类层）/ Filter shape mismatch (head class layer when nc changes)
+    model_sd = model.state_dict()
+    filtered = {k: v for k, v in state_dict.items()
+                if k in model_sd and model_sd[k].shape == v.shape}
+    if len(filtered) < len(state_dict):
+        skipped = [k for k, v in state_dict.items()
+                   if k in model_sd and model_sd[k].shape != v.shape]
+        print(f"[load_checkpoint] 跳过 {len(skipped)} 个 shape mismatch 参数")
+    if len(filtered) < len(model_sd):
+        missing = set(model_sd.keys()) - set(filtered.keys())
+        if missing:
+            print(f"[load_checkpoint] missing {len(missing)} 参数")
+    model.load_state_dict(filtered, strict=False)
+    return (model, meta) if return_meta else model
 
 
 def save_checkpoint(model, path, **metadata):

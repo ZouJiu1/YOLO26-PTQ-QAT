@@ -1094,12 +1094,20 @@ def evaluate(model, val_loader, data, batch_size=8, max_batches=None, conf_thres
 
 def load_checkpoint(model, path, return_meta=False):
     checkpoint = torch.load(path, map_location=device, weights_only=False)
+    # 兼容三种 checkpoint 格式 / Three checkpoint formats supported:
+    #   1) 我们的训练产物: {"state_dict": {...}, "meta": {...}}
+    #   2) 官方 ultralytics: {"model": nn.Module, ...}（model 是 ultralytics 类的实例）
+    #   3) 纯 state_dict: 直接就是 {...}
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
-        meta = checkpoint.get("meta", {})
+    elif isinstance(checkpoint, dict) and "model" in checkpoint and hasattr(checkpoint["model"], "state_dict"):
+        # 官方 ultralytics 预训练权重 / Official ultralytics pretrained weights
+        state_dict = checkpoint["model"].float().state_dict()
+    elif isinstance(checkpoint, nn.Module):
+        state_dict = checkpoint.float().state_dict()
     else:
         state_dict = checkpoint
-        meta = {}
+    meta = checkpoint.get("meta", {}) if isinstance(checkpoint, dict) else {}
 
     # 过滤 shape mismatch（不同数据集 nc 变化时 Detect head） / Filter shape mismatch (Detect head when nc changes across datasets)
     model_sd = model.state_dict()
